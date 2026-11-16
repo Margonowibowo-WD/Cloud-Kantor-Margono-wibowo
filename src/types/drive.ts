@@ -1,0 +1,109 @@
+export type ItemType = 'folder' | 'file';
+
+export type FileCategory =
+  | 'image'
+  | 'video'
+  | 'audio'
+  | 'document'
+  | 'archive'
+  | 'code'
+  | 'other';
+
+export type StorageBackend = 'telegram' | 'local';
+
+export interface FileChunk {
+  index: number;
+  size: number;
+  telegramFileId?: string;
+  telegramUniqueId?: string;
+  telegramMessageId?: number;
+  localPath?: string;
+}
+
+export interface DriveItem {
+  id: string;
+  name: string;
+  type: ItemType;
+  parentId: string | null;
+  size: number;
+  mimeType: string;
+  starred: boolean;
+  trashed: boolean;
+  trashedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  storageBackend: StorageBackend;
+  thumbnailUrl?: string;
+  demoTextContent?: string;
+  localBlobKey?: string;
+  chunks: FileChunk[];
+  description?: string;
+}
+
+export interface TelegramConfigState {
+  connected: boolean;
+  botToken: string;
+  chatId: string;
+  botUsername?: string;
+  botName?: string;
+  chatTitle?: string;
+  chatType?: string;
+  autoSync: boolean;
+  pinnedIndexMessageId?: number;
+  lastSyncedAt?: string;
+}
+
+export interface TelegramPublicStatus {
+  connected: boolean;
+  botUsername?: string;
+  botName?: string;
+  chatId?: string;
+  chatTitle?: string;
+  chatType?: string;
+  maskedToken?: string;
+  chunkSizeMb: number;
+  concurrency: number;
+  autoSync: boolean;
+  pinnedIndexMessageId?: number;
+  lastCheckedAt?: string;
+}
+
+export interface StorageSummary {
+  totalBytes: number;
+  activeBytes: number;
+  trashedBytes: number;
+  fileCount: number;
+  folderCount: number;
+  telegramSyncedCount: number;
+  telegramSyncedBytes: number;
+}
+
+export type NavSection =
+  | 'my-drive'
+  | 'recent'
+  | 'starred'
+  | 'media'
+  | 'documents'
+  | 'trash';
+
+export type TypeFilter = 'all' | 'image' | 'video' | 'document' | 'archive';
+
+export type SortField = 'name' | 'updatedAt' | 'size';
+export type SortDirection = 'asc' | 'desc';
+export type ViewMode = 'grid' | 'list';
+
+export interface TransferTask {
+  id: string;
+  kind: 'upload' | 'download';
+  filename: string;
+  totalBytes: number;
+  loadedBytes: number;
+  speedBytesPerSec: number;
+  etaSeconds: number;
+  completedChunks: number;
+  totalChunks: number;
+  status: 'queued' | 'active' | 'completed' | 'error' | 'cancelled';
+  errorMessage?: string;
+  targetBackend?: StorageBackend;
+  createdAt: number;
+}

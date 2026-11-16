@@ -1,0 +1,6 @@
+{
+  "name": "TeleDrive",
+  "description": "Cloud storage cepat bergaya Google Drive dengan integrasi penyimpanan Telegram Bot tanpa batas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
