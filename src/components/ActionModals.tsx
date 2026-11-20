@@ -55,12 +55,12 @@ export function FolderNameModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="name-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-xs"
+      className="td-animate-fade fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-xs"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+      <div className="td-animate-pop w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
         <div className="flex items-center justify-between">
           <h2
             id="name-modal-title"
@@ -154,12 +154,12 @@ export function MoveModal({ open, movingIds, items, onClose, onMove }: MoveModal
       role="dialog"
       aria-modal="true"
       aria-labelledby="move-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-xs"
+      className="td-animate-fade fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-xs"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+      <div className="td-animate-pop w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
         <div className="flex items-center justify-between">
           <h2
             id="move-modal-title"
@@ -232,30 +232,50 @@ export function MoveModal({ open, movingIds, items, onClose, onMove }: MoveModal
 
 interface ConfirmDeleteModalProps {
   open: boolean;
+  variant?: 'trash' | 'permanent';
   count: number;
   label?: string;
   onClose: () => void;
   onConfirm: () => Promise<void>;
+  onConfirmPermanent?: () => Promise<void>;
 }
 
 export function ConfirmDeleteModal({
   open,
+  variant = 'permanent',
   count,
   label,
   onClose,
   onConfirm,
+  onConfirmPermanent,
 }: ConfirmDeleteModalProps) {
-  const [deleting, setDeleting] = useState(false);
+  const [deleting, setDeleting] = useState<'trash' | 'permanent' | null>(null);
 
   if (!open) return null;
 
-  const handleConfirm = async () => {
-    setDeleting(true);
+  const isTrashAction = variant === 'trash';
+
+  const handleConfirmTrash = async () => {
+    setDeleting('trash');
     try {
       await onConfirm();
       onClose();
     } finally {
-      setDeleting(false);
+      setDeleting(null);
+    }
+  };
+
+  const handleConfirmPermanent = async () => {
+    setDeleting('permanent');
+    try {
+      if (isTrashAction && onConfirmPermanent) {
+        await onConfirmPermanent();
+      } else {
+        await onConfirm();
+      }
+      onClose();
+    } finally {
+      setDeleting(null);
     }
   };
 
@@ -264,39 +284,58 @@ export function ConfirmDeleteModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="delete-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-xs"
+      className="td-animate-fade fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-xs"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+      <div className="td-animate-pop w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
         <h2
           id="delete-modal-title"
           className="font-display text-base font-semibold text-slate-900 dark:text-slate-100"
         >
-          Hapus Permanen?
+          {isTrashAction ? 'Anda yakin ingin menghapus?' : 'Anda yakin hapus permanen?'}
         </h2>
         <p className="mt-2 text-xs leading-relaxed text-slate-600 dark:text-slate-400">
-          {label
-            ? `Item "${label}" akan dihapus permanen beserta seluruh potongannya dan tidak dapat dipulihkan.`
-            : `${count} item terpilih akan dihapus permanen beserta seluruh potongannya dan tidak dapat dipulihkan.`}
+          {isTrashAction
+            ? label
+              ? `Item "${label}" bisa disimpan sementara di Sampah, atau langsung dihapus permanen dari Cloud & channel Telegram.`
+              : `${count} item terpilih bisa disimpan sementara di Sampah, atau langsung dihapus permanen dari Cloud & channel Telegram.`
+            : label
+              ? `Item "${label}" akan dihapus permanen dari Drive dan channel Telegram, dan tidak dapat dipulihkan.`
+              : `${count} item terpilih akan dihapus permanen dari Drive dan channel Telegram, dan tidak dapat dipulihkan.`}
         </p>
 
-        <div className="mt-5 flex justify-end gap-2">
+        <div className="mt-5 flex flex-wrap justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
-            className="h-9 rounded-lg px-3.5 text-xs font-medium text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+            disabled={deleting !== null}
+            className="td-press h-9 rounded-lg px-3.5 text-xs font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-50 dark:text-slate-300 dark:hover:bg-slate-800"
           >
             Batal
           </button>
+          {isTrashAction && (
+            <button
+              type="button"
+              onClick={handleConfirmTrash}
+              disabled={deleting !== null}
+              className="td-press h-9 rounded-lg border border-slate-200 bg-slate-50 px-3.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+            >
+              {deleting === 'trash' ? 'Memindahkan...' : 'Ke Sampah'}
+            </button>
+          )}
           <button
             type="button"
-            onClick={handleConfirm}
-            disabled={deleting}
-            className="h-9 rounded-lg bg-rose-600 px-4 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-50"
+            onClick={handleConfirmPermanent}
+            disabled={deleting !== null}
+            className="td-press h-9 rounded-lg bg-rose-600 px-4 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-50"
           >
-            {deleting ? 'Menghapus...' : 'Hapus Permanen'}
+            {deleting === 'permanent'
+              ? 'Menghapus...'
+              : isTrashAction
+                ? 'Hapus Permanen (+ Telegram)'
+                : 'Ya, Hapus Permanen'}
           </button>
         </div>
       </div>

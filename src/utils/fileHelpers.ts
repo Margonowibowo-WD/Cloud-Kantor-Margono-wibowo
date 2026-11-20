@@ -285,10 +285,17 @@ export function filterAndSortItems(
         return item.starred;
       case 'recent':
         return item.type === 'file';
-      case 'media': {
+      case 'photos': {
         if (item.type !== 'file') return false;
-        const cat = getFileCategory(item.mimeType, item.name);
-        return cat === 'image' || cat === 'video' || cat === 'audio';
+        return getFileCategory(item.mimeType, item.name) === 'image';
+      }
+      case 'videos': {
+        if (item.type !== 'file') return false;
+        return getFileCategory(item.mimeType, item.name) === 'video';
+      }
+      case 'music': {
+        if (item.type !== 'file') return false;
+        return getFileCategory(item.mimeType, item.name) === 'audio';
       }
       case 'documents': {
         if (item.type !== 'file') return false;
@@ -371,4 +378,199 @@ export function isTextPreviewable(mimeType: string, filename: string): boolean {
     return true;
   }
   return ['md', 'txt', 'csv', 'json', 'ts', 'tsx', 'js', 'jsx', 'py', 'yaml', 'yml', 'toml', 'sql', 'sh', 'html', 'css', 'log', 'env'].includes(ext);
+}
+
+export function isPdfFile(mimeType: string, filename: string): boolean {
+  const mime = (mimeType || '').toLowerCase();
+  return mime === 'application/pdf' || mime.includes('pdf') || getFileExtension(filename) === 'pdf';
+}
+
+export type OfficePreviewType = 'docx' | 'excel' | 'pptx' | 'legacy-office' | null;
+
+export function getOfficePreviewType(mimeType: string, filename: string): OfficePreviewType {
+  const mime = (mimeType || '').toLowerCase();
+  const ext = getFileExtension(filename);
+
+  if (ext === 'docx' || mime.includes('wordprocessingml')) {
+    return 'docx';
+  }
+  if (
+    ext === 'xlsx' ||
+    ext === 'xls' ||
+    ext === 'xlsm' ||
+    ext === 'ods' ||
+    mime.includes('spreadsheetml') ||
+    mime.includes('ms-excel')
+  ) {
+    return 'excel';
+  }
+  if (ext === 'pptx' || mime.includes('presentationml')) {
+    return 'pptx';
+  }
+  if (ext === 'doc' || ext === 'ppt' || mime === 'application/msword' || mime === 'application/vnd.ms-powerpoint') {
+    return 'legacy-office';
+  }
+  return null;
+}
+
+export function makeUniqueCopyName(
+  baseName: string,
+  isFolder: boolean,
+  siblingNames: Set<string>,
+): string {
+  if (!siblingNames.has(baseName)) {
+    return baseName;
+  }
+
+  let stem = baseName;
+  let ext = '';
+  if (!isFolder) {
+    const dotIdx = baseName.lastIndexOf('.');
+    if (dotIdx > 0 && dotIdx < baseName.length - 1) {
+      stem = baseName.slice(0, dotIdx);
+      ext = baseName.slice(dotIdx);
+    }
+  }
+
+  let counter = 1;
+  while (counter < 500) {
+    const suffix = counter === 1 ? ' (Salinan)' : ` (Salinan ${counter})`;
+    const candidate = `${stem}${suffix}${ext}`;
+    if (!siblingNames.has(candidate)) {
+      return candidate;
+    }
+    counter += 1;
+  }
+  return `${stem} (${Date.now()})${ext}`;
+}
+
+export function cloneDriveItemsForPaste(
+  sourceIds: string[],
+  allItems: DriveItem[],
+  targetParentId: string | null,
+  nowIso: string,
+  makeId: (type: 'file' | 'folder') => string,
+): DriveItem[] {
+  const byId = new Map<string, DriveItem>();
+  for (const item of allItems) {
+    if (!item.trashed) byId.set(item.id, item);
+  }
+
+  const selectedSet = new Set(sourceIds.filter((id) => byId.has(id)));
+  if (selectedSet.size === 0) return [];
+
+  // Exclude items whose ancestor is also selected so nested selections aren't duplicated
+  const topLevelSources: DriveItem[] = [];
+  for (const id of selectedSet) {
+    const item = byId.get(id)!;
+    let hasSelectedAncestor = false;
+    let cursor = item.parentId;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      if (selectedSet.has(cursor)) {
+        hasSelectedAncestor = true;
+        break;
+      }
+      cursor = byId.get(cursor)?.parentId ?? null;
+    }
+    if (!hasSelectedAncestor) {
+      topLevelSources.push(item);
+    }
+  }
+
+  // Track existing names at target folder to prevent collisions
+  const targetSiblingNames = new Set(
+    allItems
+      .filter((i) => !i.trashed && i.parentId === targetParentId)
+      .map((i) => i.name),
+  );
+
+  const created: DriveItem[] = [];
+
+  const cloneRecursive = (src: DriveItem, newParentId: string | null, isTopLevel: boolean) => {
+    const newId = makeId(src.type);
+    const clonedName = isTopLevel
+      ? makeUniqueCopyName(src.name, src.type === 'folder', targetSiblingNames)
+      : src.name;
+    if (isTopLevel) {
+      targetSiblingNames.add(clonedName);
+    }
+
+    created.push({
+      ...src,
+      id: newId,
+      name: clonedName,
+      parentId: newParentId,
+      trashed: false,
+      trashedAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      chunks: src.chunks.map((c) => ({ ...c })),
+    });
+
+    if (src.type === 'folder') {
+      const children = allItems.filter((i) => !i.trashed && i.parentId === src.id);
+      for (const child of children) {
+        cloneRecursive(child, newId, false);
+      }
+    }
+  };
+
+  for (const root of topLevelSources) {
+    // Prevent pasting a folder directly inside itself or its descendant
+    if (root.type === 'folder' && isDescendantOrSelf(targetParentId, root.id, allItems)) {
+      continue;
+    }
+    cloneRecursive(root, targetParentId, true);
+  }
+
+  return created;
+}
+
+export function canMoveItemsToFolder(
+  movingIds: string[],
+  targetFolderId: string | null,
+  allItems: DriveItem[],
+): boolean {
+  if (movingIds.length === 0) return false;
+  const byId = new Map(allItems.map((i) => [i.id, i]));
+  let anyMovable = false;
+
+  for (const id of movingIds) {
+    const item = byId.get(id);
+    if (!item || item.trashed) continue;
+    if (item.type === 'folder' && isDescendantOrSelf(targetFolderId, item.id, allItems)) {
+      return false;
+    }
+    if (item.parentId !== targetFolderId) {
+      anyMovable = true;
+    }
+  }
+  return anyMovable;
+}
+
+export function applyMoveItems(
+  movingIds: string[],
+  targetFolderId: string | null,
+  allItems: DriveItem[],
+  nowIso: string,
+): { nextItems: DriveItem[]; movedCount: number } {
+  if (!canMoveItemsToFolder(movingIds, targetFolderId, allItems)) {
+    return { nextItems: allItems, movedCount: 0 };
+  }
+
+  const moveSet = new Set(movingIds);
+  let movedCount = 0;
+  const nextItems = allItems.map((item) => {
+    if (!moveSet.has(item.id) || item.trashed) return item;
+    if (item.type === 'folder' && isDescendantOrSelf(targetFolderId, item.id, allItems)) {
+      return item;
+    }
+    if (item.parentId === targetFolderId) return item;
+    movedCount += 1;
+    return { ...item, parentId: targetFolderId, updatedAt: nowIso };
+  });
+
+  return { nextItems, movedCount };
 }

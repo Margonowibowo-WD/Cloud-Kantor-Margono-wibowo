@@ -82,11 +82,13 @@ export type NavSection =
   | 'my-drive'
   | 'recent'
   | 'starred'
-  | 'media'
+  | 'photos'
+  | 'videos'
+  | 'music'
   | 'documents'
   | 'trash';
 
-export type TypeFilter = 'all' | 'image' | 'video' | 'document' | 'archive';
+export type TypeFilter = 'all' | 'image' | 'video' | 'audio' | 'document' | 'archive';
 
 export type SortField = 'name' | 'updatedAt' | 'size';
 export type SortDirection = 'asc' | 'desc';

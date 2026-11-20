@@ -22,7 +22,11 @@ export function FileIcon({ type, mimeType, filename, size = 'md' }: FileIconProp
   const dim = size === 'sm' ? 'h-4 w-4' : size === 'lg' ? 'h-8 w-8' : 'h-5 w-5';
 
   if (type === 'folder') {
-    return <Folder className={`${dim} fill-blue-500/20 text-blue-600 dark:fill-blue-400/20 dark:text-blue-400`} />;
+    return (
+      <Folder
+        className={`${dim} fill-amber-400/25 text-amber-500 dark:fill-amber-400/20 dark:text-amber-400`}
+      />
+    );
   }
 
   const category = getFileCategory(mimeType, filename);

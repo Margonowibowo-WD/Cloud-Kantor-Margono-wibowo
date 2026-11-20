@@ -1,17 +1,40 @@
-import { useRef } from 'react';
-import { LayoutGrid, List, Menu, Moon, Search, Sun, Upload, X } from 'lucide-react';
-import type { ViewMode } from '../types/drive';
+import { useEffect, useRef, useState } from 'react';
+import {
+  KeyRound,
+  LayoutGrid,
+  List,
+  Menu,
+  Moon,
+  RefreshCw,
+  Search,
+  Settings2,
+  Sun,
+  SunMoon,
+  Upload,
+  User,
+  X,
+} from 'lucide-react';
+import type { TelegramPublicStatus, ViewMode } from '../types/drive';
+
+export type ThemeMode = 'auto' | 'light' | 'dark';
 
 interface TopBarProps {
   searchQuery: string;
   onSearchChange: (q: string) => void;
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
-  darkMode: boolean;
-  onToggleDarkMode: () => void;
+  themeMode: ThemeMode;
+  effectiveDark: boolean;
+  onCycleThemeMode: () => void;
   onOpenMobileMenu: () => void;
   onQuickUploadClick: () => void;
   searchInputRef?: React.RefObject<HTMLInputElement | null>;
+  telegram: TelegramPublicStatus;
+  syncingTelegram?: boolean;
+  vaultAvailable?: boolean;
+  onSyncNow: () => void;
+  onOpenTelegramModal: () => void;
+  onOpenVaultUnlock?: () => void;
 }
 
 export function TopBar({
@@ -19,14 +42,33 @@ export function TopBar({
   onSearchChange,
   viewMode,
   onViewModeChange,
-  darkMode,
-  onToggleDarkMode,
+  themeMode,
+  effectiveDark,
+  onCycleThemeMode,
   onOpenMobileMenu,
   onQuickUploadClick,
   searchInputRef,
+  telegram,
+  syncingTelegram = false,
+  vaultAvailable = false,
+  onSyncNow,
+  onOpenTelegramModal,
+  onOpenVaultUnlock,
 }: TopBarProps) {
   const localRef = useRef<HTMLInputElement>(null);
   const inputRef = searchInputRef ?? localRef;
+  const [profileOpen, setProfileOpen] = useState(false);
+  const profileRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleOutside = (e: MouseEvent) => {
+      if (profileRef.current && !profileRef.current.contains(e.target as Node)) {
+        setProfileOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, []);
 
   return (
     <header className="flex h-16 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 sm:gap-4 sm:px-6 dark:border-slate-800 dark:bg-slate-900">
@@ -64,7 +106,7 @@ export function TopBar({
         </div>
       </div>
 
-      <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+      <div className="flex shrink-0 items-center gap-1.5 sm:gap-2.5">
         {/* Segmented View Switcher */}
         <div
           role="group"
@@ -99,25 +141,122 @@ export function TopBar({
           </button>
         </div>
 
-        {/* Theme Switch */}
+        {/* Theme Mode Switch (Auto Siang/Malam -> Terang -> Gelap) */}
         <button
           type="button"
-          onClick={onToggleDarkMode}
-          aria-label={darkMode ? 'Aktifkan mode terang' : 'Aktifkan mode gelap'}
-          className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+          onClick={onCycleThemeMode}
+          aria-label={
+            themeMode === 'auto'
+              ? `Tema otomatis (${effectiveDark ? 'malam gelap' : 'siang terang'})`
+              : themeMode === 'light'
+                ? 'Tema terang aktif (klik untuk mode gelap)'
+                : 'Tema gelap aktif (klik untuk mode otomatis)'
+          }
+          title={
+            themeMode === 'auto'
+              ? `Otomatis Siang/Malam (${effectiveDark ? 'Malam: Gelap' : 'Siang: Terang'})`
+              : themeMode === 'light'
+                ? 'Mode Terang'
+                : 'Mode Gelap'
+          }
+          className="td-press flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
         >
-          {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+          {themeMode === 'auto' ? (
+            <SunMoon className="h-4 w-4 text-blue-600 dark:text-blue-400" />
+          ) : themeMode === 'dark' ? (
+            <Moon className="h-4 w-4" />
+          ) : (
+            <Sun className="h-4 w-4" />
+          )}
         </button>
 
         {/* Quick Upload Primary Action */}
         <button
           type="button"
           onClick={onQuickUploadClick}
-          className="flex h-9 items-center gap-2 rounded-lg bg-blue-600 px-3.5 text-sm font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
+          className="td-press flex h-9 items-center gap-2 rounded-lg bg-blue-600 px-3 text-sm font-medium text-white hover:bg-blue-700 whitespace-nowrap shrink-0 sm:px-3.5"
         >
           <Upload className="h-4 w-4" />
           <span className="hidden sm:inline">Unggah Cepat</span>
         </button>
+
+        {/* Profile Menu (Discreet Telegram Connection & Sync Controls) */}
+        <div className="relative" ref={profileRef}>
+          <button
+            type="button"
+            onClick={() => setProfileOpen((v) => !v)}
+            aria-label="Profil Kantor Margono"
+            aria-expanded={profileOpen}
+            className="td-press flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-slate-100 text-xs font-bold text-slate-700 hover:bg-slate-200 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+          >
+            {telegram.connected ? 'KM' : <User className="h-4 w-4" />}
+          </button>
+
+          {profileOpen && (
+            <div
+              role="menu"
+              aria-label="Menu profil dan koneksi"
+              className="td-animate-pop absolute right-0 top-full z-40 mt-2 w-64 rounded-xl border border-slate-200 bg-white p-2 shadow-xl dark:border-slate-800 dark:bg-slate-900"
+            >
+              <div className="border-b border-slate-100 px-2.5 py-2 dark:border-slate-800">
+                <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                  Cloud Kantor Margono
+                </p>
+                <p className="mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400">
+                  {telegram.connected
+                    ? `Terhubung · @${telegram.botUsername || 'Bot'}`
+                    : 'Cloud Belum Terhubung'}
+                </p>
+              </div>
+
+              <div className="mt-1.5 space-y-1">
+                {telegram.connected && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={syncingTelegram}
+                    onClick={() => {
+                      setProfileOpen(false);
+                      onSyncNow();
+                    }}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${syncingTelegram ? 'animate-spin' : ''}`} />
+                    <span>{syncingTelegram ? 'Menyinkronkan...' : 'Sinkronkan Telegram'}</span>
+                  </button>
+                )}
+
+                {!telegram.connected && vaultAvailable && onOpenVaultUnlock && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setProfileOpen(false);
+                      onOpenVaultUnlock();
+                    }}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950/50"
+                  >
+                    <KeyRound className="h-3.5 w-3.5" />
+                    <span>Buka Pakai PIN Brankas</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setProfileOpen(false);
+                    onOpenTelegramModal();
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+                >
+                  <Settings2 className="h-3.5 w-3.5" />
+                  <span>Pengaturan Koneksi</span>
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </header>
   );

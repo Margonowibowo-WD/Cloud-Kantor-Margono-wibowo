@@ -1,19 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyMoveItems,
   buildBreadcrumbs,
+  canMoveItemsToFolder,
+  cloneDriveItemsForPaste,
   computeByteSlices,
   computeStorageSummary,
   filterAndSortItems,
   formatBytes,
   formatEta,
   getFileCategory,
+  getOfficePreviewType,
   isDescendantOrSelf,
+  isPdfFile,
 } from './fileHelpers';
 import {
   decodeTelegramIndex,
   encodeTelegramIndex,
   mergeDriveItems,
+  reconcileRemoteDriveItems,
 } from './telegramIndex';
 import type { DriveItem } from '../types/drive';
 
@@ -226,3 +232,191 @@ test('mergeDriveItems preserves local blobs while adopting newer remote records'
   assert.equal(updatedHero?.name, 'Hero_Banner_Renamed.jpg');
   assert.equal(updatedHero?.localBlobKey, 'blob-hero');
 });
+
+import {
+  decryptTelegramVault,
+  encryptTelegramVault,
+  isVaultConfigured,
+} from './cryptoVault';
+
+test('encryptTelegramVault and decryptTelegramVault round-trip securely without leaking secrets', async () => {
+  const secretToken = '7412345678:AAH_SecretToken_Example_12345';
+  const secretChat = '-1001987654321';
+  const pin = '842100';
+
+  const vault = await encryptTelegramVault(
+    { botToken: secretToken, chatId: secretChat },
+    pin,
+  );
+
+  assert.equal(isVaultConfigured(vault), true);
+  assert.equal(isVaultConfigured(''), false);
+  assert.ok(!vault.includes(secretToken));
+  assert.ok(!vault.includes(secretChat));
+
+  const decoded = await decryptTelegramVault(vault, pin);
+  assert.equal(decoded.botToken, secretToken);
+  assert.equal(decoded.chatId, secretChat);
+
+  await assert.rejects(
+    () => decryptTelegramVault(vault, '000000'),
+    /PIN salah/,
+  );
+
+  await assert.rejects(
+    () => encryptTelegramVault({ botToken: secretToken, chatId: secretChat }, '12'),
+    /minimal 4/,
+  );
+});
+
+test('cloneDriveItemsForPaste clones files and nested folders with collision-free names', () => {
+  let seq = 0;
+  const makeId = (type: 'file' | 'folder') => `${type === 'folder' ? 'fld' : 'file'}-copy-${++seq}`;
+  const now = '2026-11-16T16:00:00.000Z';
+
+  // Copy Hero_Banner.jpg into root -> becomes Hero_Banner (Salinan).jpg
+  const fileCopy = cloneDriveItemsForPaste(['file-1'], sampleItems, null, now, makeId);
+  assert.equal(fileCopy.length, 1);
+  assert.equal(fileCopy[0].name, 'Hero_Banner (Salinan).jpg');
+  assert.equal(fileCopy[0].parentId, null);
+  assert.equal(fileCopy[0].chunks[0]?.telegramFileId, 'tg_1');
+
+  // Copy folder f-root-1 (which contains f-sub-1 -> file-2) into root
+  const folderCopy = cloneDriveItemsForPaste(['f-root-1', 'f-sub-1'], sampleItems, null, now, makeId);
+  assert.equal(folderCopy.length, 3);
+  const clonedRoot = folderCopy.find((i) => i.name === 'Desain Produk (Salinan)');
+  assert.ok(clonedRoot);
+  const clonedSub = folderCopy.find((i) => i.name === 'Mockup Final');
+  assert.equal(clonedSub?.parentId, clonedRoot?.id);
+  const clonedFile2 = folderCopy.find((i) => i.name === 'Laporan_Q4.pdf');
+  assert.equal(clonedFile2?.parentId, clonedSub?.id);
+});
+
+test('canMoveItemsToFolder and applyMoveItems prevent circular moves and update parentId', () => {
+  assert.equal(canMoveItemsToFolder(['f-root-1'], 'f-sub-1', sampleItems), false);
+  assert.equal(canMoveItemsToFolder(['file-1'], 'f-root-1', sampleItems), true);
+  assert.equal(canMoveItemsToFolder(['file-1'], null, sampleItems), false);
+
+  const res = applyMoveItems(['file-1', 'file-2'], 'f-root-1', sampleItems, '2026-11-16T16:05:00.000Z');
+  assert.equal(res.movedCount, 2);
+  assert.equal(res.nextItems.find((i) => i.id === 'file-1')?.parentId, 'f-root-1');
+  assert.equal(res.nextItems.find((i) => i.id === 'file-2')?.parentId, 'f-root-1');
+});
+
+test('reconcileRemoteDriveItems prunes items deleted remotely from authoritative pinned index', () => {
+  const syncStart = Date.parse('2026-11-19T14:00:00.000Z');
+  const local: DriveItem[] = [
+    sampleItems[0], // older than syncStart, deleted remotely -> should be pruned
+    sampleItems[2], // present in remote -> should remain
+    {
+      ...sampleItems[3],
+      id: 'file-just-created',
+      updatedAt: '2026-11-19T14:00:02.000Z', // created right at syncStart -> kept
+    },
+  ];
+  const pinnedRemote: DriveItem[] = [sampleItems[2]];
+  const channelMedia: DriveItem[] = [];
+
+  const reconciled = reconcileRemoteDriveItems(local, pinnedRemote, channelMedia, true, syncStart);
+  assert.deepEqual(
+    reconciled.map((i) => i.id).sort(),
+    ['file-1', 'file-just-created'],
+  );
+});
+
+test('filterAndSortItems separates photos, videos, and music cleanly', () => {
+  const mediaDataset: DriveItem[] = [
+    ...sampleItems,
+    {
+      id: 'vid-1',
+      name: 'Company_Profile.mp4',
+      type: 'file',
+      parentId: null,
+      size: 4_000_000,
+      mimeType: 'video/mp4',
+      starred: false,
+      trashed: false,
+      createdAt: '2026-11-16T10:00:00.000Z',
+      updatedAt: '2026-11-16T10:00:00.000Z',
+      storageBackend: 'telegram',
+      chunks: [{ index: 0, size: 4_000_000, telegramFileId: 'tg_vid' }],
+    },
+    {
+      id: 'aud-1',
+      name: 'Jingle_Kantor.mp3',
+      type: 'file',
+      parentId: null,
+      size: 1_500_000,
+      mimeType: 'audio/mpeg',
+      starred: false,
+      trashed: false,
+      createdAt: '2026-11-16T11:00:00.000Z',
+      updatedAt: '2026-11-16T11:00:00.000Z',
+      storageBackend: 'telegram',
+      chunks: [{ index: 0, size: 1_500_000, telegramFileId: 'tg_aud' }],
+    },
+  ];
+
+  const photos = filterAndSortItems(mediaDataset, {
+    section: 'photos',
+    currentFolderId: null,
+    searchQuery: '',
+    typeFilter: 'all',
+    sortField: 'name',
+    sortDirection: 'asc',
+  });
+  assert.deepEqual(
+    photos.map((i) => i.id),
+    ['file-1'],
+  );
+
+  const videos = filterAndSortItems(mediaDataset, {
+    section: 'videos',
+    currentFolderId: null,
+    searchQuery: '',
+    typeFilter: 'all',
+    sortField: 'name',
+    sortDirection: 'asc',
+  });
+  assert.deepEqual(
+    videos.map((i) => i.id),
+    ['vid-1'],
+  );
+
+  const music = filterAndSortItems(mediaDataset, {
+    section: 'music',
+    currentFolderId: null,
+    searchQuery: '',
+    typeFilter: 'all',
+    sortField: 'name',
+    sortDirection: 'asc',
+  });
+  assert.deepEqual(
+    music.map((i) => i.id),
+    ['aud-1'],
+  );
+});
+
+test('isPdfFile detects PDF by mimeType or .pdf extension', () => {
+  assert.equal(isPdfFile('application/pdf', 'dokumen'), true);
+  assert.equal(isPdfFile('application/octet-stream', 'Surat_Kontrak.PDF'), true);
+  assert.equal(isPdfFile('image/png', 'foto.png'), false);
+});
+
+test('getOfficePreviewType classifies Word, Excel, PowerPoint, and legacy formats accurately', () => {
+  assert.equal(getOfficePreviewType('application/octet-stream', 'Proposal.docx'), 'docx');
+  assert.equal(
+    getOfficePreviewType(
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Laporan',
+    ),
+    'excel',
+  );
+  assert.equal(getOfficePreviewType('application/vnd.ms-excel', 'Rekap.xls'), 'excel');
+  assert.equal(getOfficePreviewType('application/octet-stream', 'Deck.pptx'), 'pptx');
+  assert.equal(getOfficePreviewType('application/msword', 'Surat_Lama.doc'), 'legacy-office');
+  assert.equal(getOfficePreviewType('application/octet-stream', 'Slide_Lama.ppt'), 'legacy-office');
+  assert.equal(getOfficePreviewType('application/pdf', 'Kontrak.pdf'), null);
+});
+
+

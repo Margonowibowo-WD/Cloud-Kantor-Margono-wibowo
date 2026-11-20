@@ -2,6 +2,7 @@ import type { DriveItem, TelegramConfigState, TelegramPublicStatus } from '../ty
 import { decodeTelegramIndex, encodeTelegramIndex } from './telegramIndex';
 
 export const DIRECT_TELEGRAM_MAX_BYTES = 20 * 1024 * 1024; // 20 MB Telegram getFile limit
+export const UPLOAD_CONCURRENCY = 3;
 
 export interface DetectedChat {
   id: string;
@@ -45,7 +46,7 @@ export function toPublicStatus(cfg: TelegramConfigState): TelegramPublicStatus {
     chatType: cfg.chatType,
     maskedToken: maskTelegramToken(cfg.botToken),
     chunkSizeMb: 20,
-    concurrency: 1,
+    concurrency: UPLOAD_CONCURRENCY,
     autoSync: cfg.autoSync,
     pinnedIndexMessageId: cfg.pinnedIndexMessageId,
     lastCheckedAt: cfg.lastSyncedAt,
@@ -222,7 +223,9 @@ export function uploadFileDirectToTelegram(
         try {
           const data = JSON.parse(xhr.responseText) as {
             ok: boolean;
+            error_code?: number;
             description?: string;
+            parameters?: { retry_after?: number };
             result?: {
               message_id: number;
               document?: { file_id: string; file_unique_id: string };
@@ -232,7 +235,13 @@ export function uploadFileDirectToTelegram(
             };
           };
           if (xhr.status < 200 || xhr.status >= 300 || !data.ok || !data.result) {
-            reject(new Error(data.description || 'Telegram menolak unggahan file ini.'));
+            const err = new Error(data.description || 'Telegram menolak unggahan file ini.') as Error & {
+              retryAfterSeconds?: number;
+            };
+            if (xhr.status === 429 || data.error_code === 429) {
+              err.retryAfterSeconds = Math.max(1, Number(data.parameters?.retry_after) || 5);
+            }
+            reject(err);
             return;
           }
           const doc =
@@ -295,15 +304,65 @@ export async function deleteTelegramMessageDirect(
   botToken: string,
   chatId: string,
   messageId: number,
-): Promise<void> {
+): Promise<{ ok: boolean; error?: string }> {
   try {
-    await fetch(tgApi(botToken, 'deleteMessage'), {
+    const res = await fetch(tgApi(botToken, 'deleteMessage'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId.trim(), message_id: messageId }),
     });
+    const data = (await res.json()) as { ok: boolean; description?: string };
+    if (data.ok) return { ok: true };
+    const desc = data.description || '';
+    if (
+      desc.toLowerCase().includes('message to delete not found') ||
+      desc.toLowerCase().includes('message_id_invalid')
+    ) {
+      return { ok: true };
+    }
+    return { ok: false, error: desc || 'Telegram menolak penghapusan pesan.' };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Gagal menghubungi Telegram API.',
+    };
+  }
+}
+
+export async function checkTelegramMessageExists(
+  botToken: string,
+  chatId: string,
+  messageId: number,
+): Promise<'exists' | 'deleted' | 'unknown'> {
+  try {
+    const res = await fetch(tgApi(botToken, 'editMessageReplyMarkup'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId.trim(),
+        message_id: messageId,
+        reply_markup: { inline_keyboard: [] },
+      }),
+    });
+    const data = (await res.json()) as { ok: boolean; description?: string; error_code?: number };
+    if (data.ok) return 'exists';
+    const desc = (data.description || '').toLowerCase();
+    if (
+      desc.includes('message to edit not found') ||
+      desc.includes('message_id_invalid') ||
+      desc.includes('message not found')
+    ) {
+      return 'deleted';
+    }
+    if (
+      desc.includes('message is not modified') ||
+      desc.includes("message can't be edited")
+    ) {
+      return 'exists';
+    }
+    return 'unknown';
   } catch {
-    // Ignore non-fatal Telegram deletion limits
+    return 'unknown';
   }
 }
 
@@ -368,17 +427,183 @@ export async function pushIndexToTelegramPinnedMessage(
   }
 }
 
+export function buildTelegramMessageLink(
+  chatId: string | undefined,
+  messageId: number | undefined,
+): string | null {
+  if (!chatId || !messageId) return null;
+  const clean = chatId.trim();
+  if (clean.startsWith('-100')) {
+    return `https://t.me/c/${clean.slice(4)}/${messageId}`;
+  }
+  return null;
+}
+
+interface TgChannelPostFile {
+  message_id: number;
+  date?: number;
+  caption?: string;
+  text?: string;
+  chat?: { id: number | string };
+  document?: { file_id: string; file_unique_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  video?: { file_id: string; file_unique_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  audio?: { file_id: string; file_unique_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  photo?: Array<{ file_id: string; file_unique_id: string; file_size?: number }>;
+}
+
+export async function fetchChannelMediaUpdates(
+  botToken: string,
+  chatId: string,
+  knownMessageIds: Set<number>,
+  dismissedMessageIds: Set<number>,
+): Promise<DriveItem[]> {
+  const token = botToken.trim();
+  const targetChat = chatId.trim();
+  if (!token || !targetChat) return [];
+
+  try {
+    const res = await fetch(`${tgApi(token, 'getUpdates')}?limit=100`);
+    const data = (await res.json()) as {
+      ok: boolean;
+      result?: Array<{ channel_post?: TgChannelPostFile; message?: TgChannelPostFile }>;
+    };
+    if (!data.ok || !Array.isArray(data.result)) return [];
+
+    const discovered: DriveItem[] = [];
+
+    for (const u of data.result) {
+      const post = u.channel_post || u.message;
+      if (!post || !post.chat) continue;
+      if (String(post.chat.id) !== targetChat) continue;
+      if (post.text?.startsWith('TELEDRIVE_IDX_V1:')) continue;
+      if (knownMessageIds.has(post.message_id) || dismissedMessageIds.has(post.message_id)) continue;
+
+      const timestamp = post.date ? new Date(post.date * 1000).toISOString() : new Date().toISOString();
+      const captionName = post.caption?.replace(/^TeleDrive:\s*/i, '').trim();
+
+      if (post.document) {
+        discovered.push({
+          id: `tg-msg-${post.message_id}`,
+          name: post.document.file_name || captionName || `Dokumen_TG_${post.message_id}`,
+          type: 'file',
+          parentId: null,
+          size: post.document.file_size || 0,
+          mimeType: post.document.mime_type || 'application/octet-stream',
+          starred: false,
+          trashed: false,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          storageBackend: 'telegram',
+          chunks: [
+            {
+              index: 0,
+              size: post.document.file_size || 0,
+              telegramFileId: post.document.file_id,
+              telegramUniqueId: post.document.file_unique_id,
+              telegramMessageId: post.message_id,
+            },
+          ],
+        });
+      } else if (post.video) {
+        discovered.push({
+          id: `tg-msg-${post.message_id}`,
+          name: post.video.file_name || captionName || `Video_TG_${post.message_id}.mp4`,
+          type: 'file',
+          parentId: null,
+          size: post.video.file_size || 0,
+          mimeType: post.video.mime_type || 'video/mp4',
+          starred: false,
+          trashed: false,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          storageBackend: 'telegram',
+          chunks: [
+            {
+              index: 0,
+              size: post.video.file_size || 0,
+              telegramFileId: post.video.file_id,
+              telegramUniqueId: post.video.file_unique_id,
+              telegramMessageId: post.message_id,
+            },
+          ],
+        });
+      } else if (post.audio) {
+        discovered.push({
+          id: `tg-msg-${post.message_id}`,
+          name: post.audio.file_name || captionName || `Audio_TG_${post.message_id}.mp3`,
+          type: 'file',
+          parentId: null,
+          size: post.audio.file_size || 0,
+          mimeType: post.audio.mime_type || 'audio/mpeg',
+          starred: false,
+          trashed: false,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          storageBackend: 'telegram',
+          chunks: [
+            {
+              index: 0,
+              size: post.audio.file_size || 0,
+              telegramFileId: post.audio.file_id,
+              telegramUniqueId: post.audio.file_unique_id,
+              telegramMessageId: post.message_id,
+            },
+          ],
+        });
+      } else if (post.photo && post.photo.length > 0) {
+        const bestPhoto = post.photo[post.photo.length - 1];
+        discovered.push({
+          id: `tg-msg-${post.message_id}`,
+          name: captionName || `Foto_TG_${post.message_id}.jpg`,
+          type: 'file',
+          parentId: null,
+          size: bestPhoto.file_size || 0,
+          mimeType: 'image/jpeg',
+          starred: false,
+          trashed: false,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          storageBackend: 'telegram',
+          chunks: [
+            {
+              index: 0,
+              size: bestPhoto.file_size || 0,
+              telegramFileId: bestPhoto.file_id,
+              telegramUniqueId: bestPhoto.file_unique_id,
+              telegramMessageId: post.message_id,
+            },
+          ],
+        });
+      }
+    }
+
+    return discovered;
+  } catch {
+    return [];
+  }
+}
+
 export async function pullIndexFromTelegramPinnedMessage(
   botToken: string,
   chatId: string,
-): Promise<{ items: DriveItem[]; pinnedMessageId?: number; error?: string }> {
+): Promise<{
+  items: DriveItem[];
+  pinnedMessageId?: number;
+  hasIndex: boolean;
+  rawLength: number;
+  error?: string;
+}> {
   const verification = await verifyTelegramDirect(botToken, chatId);
   if (!verification.ok) {
-    return { items: [], error: verification.error };
+    return { items: [], hasIndex: false, rawLength: 0, error: verification.error };
   }
+  const rawText = verification.pinnedIndexText || '';
+  const hasIndex = rawText.startsWith('TELEDRIVE_IDX_V1:');
   const items = decodeTelegramIndex(verification.pinnedIndexText);
   return {
     items,
     pinnedMessageId: verification.pinnedMessageId,
+    hasIndex,
+    rawLength: rawText.length,
   };
 }

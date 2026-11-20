@@ -74,7 +74,7 @@ export function decodeTelegramIndex(text: string | undefined | null): DriveItem[
         trashed: rec.tr === 1,
         createdAt: rec.u,
         updatedAt: rec.u,
-        storageBackend: hasTg ? 'telegram' : 'local',
+        storageBackend: hasTg || isFolder ? 'telegram' : 'local',
         chunks: hasTg
           ? [
               {
@@ -119,4 +119,27 @@ export function mergeDriveItems(localItems: DriveItem[], remoteItems: DriveItem[
   }
 
   return Array.from(byId.values());
+}
+
+export function reconcileRemoteDriveItems(
+  localItems: DriveItem[],
+  pinnedRemoteItems: DriveItem[],
+  channelMediaItems: DriveItem[],
+  isAuthoritativeCompleteIndex: boolean,
+  syncStartedAtMs: number,
+): DriveItem[] {
+  const merged = mergeDriveItems(localItems, [...pinnedRemoteItems, ...channelMediaItems]);
+  if (!isAuthoritativeCompleteIndex) return merged;
+
+  const remoteIdSet = new Set<string>([
+    ...pinnedRemoteItems.map((i) => i.id),
+    ...channelMediaItems.map((i) => i.id),
+  ]);
+
+  return merged.filter((item) => {
+    if (remoteIdSet.has(item.id)) return true;
+    // Keep very recently modified/created local items that might be racing with this sync
+    const updatedMs = Date.parse(item.updatedAt) || 0;
+    return updatedMs >= syncStartedAtMs - 5000;
+  });
 }

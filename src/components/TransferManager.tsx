@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Clock,
   Download,
   Upload,
   X,
@@ -26,19 +27,23 @@ export function TransferManager({
 
   if (tasks.length === 0) return null;
 
-  const activeCount = tasks.filter((t) => t.status === 'active' || t.status === 'queued').length;
+  const activeRunningCount = tasks.filter((t) => t.status === 'active').length;
+  const queuedCount = tasks.filter((t) => t.status === 'queued').length;
+  const activeCount = activeRunningCount + queuedCount;
   const completedCount = tasks.filter((t) => t.status === 'completed').length;
 
   return (
     <aside
       aria-label="Manajer transfer file"
-      className="fixed bottom-4 right-4 z-40 w-[340px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900"
+      className="w-full overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900"
     >
       <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-2.5 dark:border-slate-800 dark:bg-slate-800/80">
         <div className="min-w-0">
           <p className="text-xs font-semibold text-slate-900 truncate dark:text-slate-100">
             {activeCount > 0
-              ? `Memproses ${activeCount} transfer paralel`
+              ? queuedCount > 0
+                ? `Memproses ${activeRunningCount} aktif · ${queuedCount} antrean`
+                : `Memproses ${activeRunningCount} transfer paralel`
               : `${completedCount} transfer selesai`}
           </p>
         </div>
@@ -114,15 +119,29 @@ export function TransferManager({
                 )}
 
                 <div className="mt-1.5 flex items-center justify-between font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
-                  {task.status === 'active' ? (
+                  {task.status === 'queued' ? (
                     <>
-                      <span>
-                        {formatBytes(task.loadedBytes)} / {formatBytes(task.totalBytes)} ({pct}%)
-                      </span>
-                      <span>
-                        {formatSpeed(task.speedBytesPerSec)} · {formatEta(task.etaSeconds)}
+                      <span>{formatBytes(task.totalBytes)}</span>
+                      <span className="inline-flex items-center gap-1 font-sans text-slate-500 dark:text-slate-400">
+                        <Clock className="h-3 w-3" />
+                        <span>Menunggu antrean...</span>
                       </span>
                     </>
+                  ) : task.status === 'active' ? (
+                    task.errorMessage ? (
+                      <span className="font-sans text-amber-600 dark:text-amber-400">
+                        {task.errorMessage}
+                      </span>
+                    ) : (
+                      <>
+                        <span>
+                          {formatBytes(task.loadedBytes)} / {formatBytes(task.totalBytes)} ({pct}%)
+                        </span>
+                        <span>
+                          {formatSpeed(task.speedBytesPerSec)} · {formatEta(task.etaSeconds)}
+                        </span>
+                      </>
+                    )
                   ) : task.status === 'completed' ? (
                     <>
                       <span>

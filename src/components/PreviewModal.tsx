@@ -4,6 +4,7 @@ import {
   CloudUpload,
   Copy,
   Download,
+  ExternalLink,
   Star,
   X,
 } from 'lucide-react';
@@ -12,11 +13,19 @@ import {
   formatBytes,
   formatRelativeDateId,
   getFileCategory,
+  getOfficePreviewType,
+  isPdfFile,
   isTextPreviewable,
 } from '../utils/fileHelpers';
-import { getLocalBlob } from '../utils/localVault';
-import { resolveItemPlayableUrl } from '../utils/uploadClient';
+import { buildTelegramMessageLink, DIRECT_TELEGRAM_MAX_BYTES } from '../utils/telegramDirect';
+import {
+  resolveItemArrayBuffer,
+  resolveItemPlayableUrl,
+  resolveItemTextContent,
+} from '../utils/uploadClient';
 import { FileIcon } from './FileIcon';
+import { OfficePreview } from './OfficePreview';
+import { PdfCanvasPreview } from './PdfCanvasPreview';
 
 interface PreviewModalProps {
   item: DriveItem | null;
@@ -38,6 +47,8 @@ export function PreviewModal({
   const [mediaUrl, setMediaUrl] = useState<string | null>(null);
   const [textContent, setTextContent] = useState<string | null>(null);
   const [textLoading, setTextLoading] = useState(false);
+  const [officeBuffer, setOfficeBuffer] = useState<ArrayBuffer | null>(null);
+  const [officeLoading, setOfficeLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -49,27 +60,46 @@ export function PreviewModal({
 
     setMediaUrl(null);
     setTextContent(null);
+    setOfficeBuffer(null);
+    setOfficeLoading(false);
     setSyncError(null);
 
     const loadPreview = async () => {
+      const officeType = getOfficePreviewType(item.mimeType, item.name);
+      if (officeType && officeType !== 'legacy-office') {
+        setOfficeLoading(true);
+        try {
+          const buf = await resolveItemArrayBuffer(item, tgConfig);
+          if (active) setOfficeBuffer(buf);
+        } catch {
+          // fallback
+        } finally {
+          if (active) setOfficeLoading(false);
+        }
+        return;
+      }
+
       if (isTextPreviewable(item.mimeType, item.name) && item.size <= 2 * 1024 * 1024) {
-        if (item.demoTextContent !== undefined) {
-          setTextContent(item.demoTextContent);
-          return;
-        }
-        if (item.localBlobKey) {
-          setTextLoading(true);
-          const blob = await getLocalBlob(item.localBlobKey);
-          if (blob && active) {
-            setTextContent(await blob.text());
+        setTextLoading(true);
+        try {
+          const text = await resolveItemTextContent(item, tgConfig);
+          if (active && text !== null) {
+            setTextContent(text);
           }
+        } catch {
+          // fallback
+        } finally {
           if (active) setTextLoading(false);
-          return;
         }
+        return;
       }
 
       try {
-        const resolved = await resolveItemPlayableUrl(item, tgConfig);
+        const pdf = isPdfFile(item.mimeType, item.name);
+        const resolved = await resolveItemPlayableUrl(item, tgConfig, {
+          forceTypedBlob: pdf,
+          mimeOverride: pdf ? 'application/pdf' : undefined,
+        });
         if (resolved && active) {
           if (resolved.isObjectUrl) revokeUrl = resolved.url;
           setMediaUrl(resolved.url);
@@ -83,13 +113,18 @@ export function PreviewModal({
 
     return () => {
       active = false;
-      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
+      if (revokeUrl) {
+        const urlToRevoke = revokeUrl;
+        window.setTimeout(() => URL.revokeObjectURL(urlToRevoke), 600);
+      }
     };
   }, [item, tgConfig]);
 
   if (!item) return null;
 
   const category = getFileCategory(item.mimeType, item.name);
+  const pdfFile = isPdfFile(item.mimeType, item.name);
+  const officeType = getOfficePreviewType(item.mimeType, item.name);
 
   const handleCopyFileId = async () => {
     const val = item.chunks[0]?.telegramFileId || item.name;
@@ -119,12 +154,12 @@ export function PreviewModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="preview-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-xs"
+      className="td-animate-fade fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-xs"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+      <div className="td-animate-pop flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-900">
         {/* Top Modal Header */}
         <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-3.5 dark:border-slate-800">
           <div className="flex min-w-0 items-center gap-3">
@@ -137,10 +172,7 @@ export function PreviewModal({
                 {item.name}
               </h2>
               <p className="text-xs tabular-nums text-slate-500 dark:text-slate-400">
-                {formatBytes(item.size)} · {formatRelativeDateId(item.updatedAt)} ·{' '}
-                {item.storageBackend === 'telegram'
-                  ? 'Tersimpan di Telegram'
-                  : 'Penyimpanan Lokal'}
+                {formatBytes(item.size)} · {formatRelativeDateId(item.updatedAt)} · Cloud Telegram
               </p>
             </div>
           </div>
@@ -212,12 +244,20 @@ export function PreviewModal({
               <p className="text-sm font-medium text-slate-800 dark:text-slate-200">{item.name}</p>
               <audio src={mediaUrl} controls className="w-full" />
             </div>
-          ) : item.mimeType === 'application/pdf' && mediaUrl && mediaUrl.startsWith('blob:') ? (
-            <iframe
-              src={mediaUrl}
-              title={item.name}
-              className="h-[62vh] w-full rounded-lg border border-slate-200 bg-white dark:border-slate-800"
-            />
+          ) : officeType && officeType !== 'legacy-office' && (officeLoading || officeBuffer) ? (
+            <div className="h-[62vh]">
+              {officeLoading || !officeBuffer ? (
+                <div className="flex h-full items-center justify-center text-xs text-slate-500 dark:text-slate-400">
+                  Memuat pratinjau dokumen Office...
+                </div>
+              ) : (
+                <OfficePreview officeType={officeType} buffer={officeBuffer} filename={item.name} />
+              )}
+            </div>
+          ) : pdfFile && mediaUrl ? (
+            <div className="h-[62vh]">
+              <PdfCanvasPreview src={mediaUrl} filename={item.name} />
+            </div>
           ) : isTextPreviewable(item.mimeType, item.name) && (textLoading || textContent !== null) ? (
             <div className="rounded-xl border border-slate-200 bg-white p-4 sm:p-5 dark:border-slate-800 dark:bg-slate-900">
               {textLoading ? (
@@ -232,19 +272,34 @@ export function PreviewModal({
             <div className="mx-auto flex max-w-md flex-col items-center rounded-xl border border-slate-200 bg-white p-8 text-center dark:border-slate-800 dark:bg-slate-900">
               <FileIcon type="file" mimeType={item.mimeType} filename={item.name} size="lg" />
               <p className="mt-4 text-sm font-semibold text-slate-900 dark:text-slate-100">
-                Siap diunduh langsung dari {item.storageBackend === 'telegram' ? 'Telegram' : 'penyimpanan lokal'}
+                {item.size > DIRECT_TELEGRAM_MAX_BYTES
+                  ? 'File di atas 20 MB tersimpan di Channel Telegram'
+                  : 'Siap diunduh langsung dari Cloud Telegram'}
               </p>
               <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
                 Tipe MIME: {item.mimeType} · {formatBytes(item.size)}
               </p>
-              <button
-                type="button"
-                onClick={() => onDownload(item)}
-                className="mt-5 inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span>Unduh File Sekarang</span>
-              </button>
+              {item.size > DIRECT_TELEGRAM_MAX_BYTES &&
+              buildTelegramMessageLink(tgConfig.chatId, item.chunks[0]?.telegramMessageId) ? (
+                <a
+                  href={buildTelegramMessageLink(tgConfig.chatId, item.chunks[0]?.telegramMessageId) || '#'}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="mt-5 inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  <span>Buka di Aplikasi Telegram</span>
+                </a>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => onDownload(item)}
+                  className="mt-5 inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  <span>Unduh File Sekarang</span>
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -253,9 +308,9 @@ export function PreviewModal({
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-white px-5 py-3 text-xs dark:border-slate-800 dark:bg-slate-900">
           <div className="flex flex-wrap items-center gap-2 text-slate-500 dark:text-slate-400">
             <span className="font-mono">
-              {item.storageBackend === 'telegram'
-                ? 'Mode Langsung Telegram (Maks. 20 MB)'
-                : 'Cache Lokal Browser (IndexedDB)'}
+              {item.size > DIRECT_TELEGRAM_MAX_BYTES
+                ? 'Cloud Telegram (> 20 MB · Buka via Aplikasi Telegram)'
+                : 'Cloud Telegram (Maks. 20 MB/file)'}
             </span>
             {item.chunks[0]?.telegramFileId && (
               <>
