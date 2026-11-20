@@ -21,6 +21,14 @@ import {
   formatBytes,
 } from './utils/fileHelpers';
 import {
+  type CapturedDropPayload,
+  type DroppedTreeResult,
+  captureDropEntriesSync,
+  extractDroppedTree,
+  extractTreeFromFileList,
+  materializeFolderTree,
+} from './utils/dropUploadHelpers';
+import {
   addDismissedTelegramMessageIds,
   deleteLocalBlob,
   getLocalBlob,
@@ -721,10 +729,20 @@ export default function App() {
     }
   }, [commitItems, pushNotification, updateTransferTask]);
 
-  const enqueueFilesUpload = useCallback(
-    (fileList: FileList | File[], overrideParentId?: string | null) => {
-      const allFiles = Array.from(fileList).filter((f) => f.name);
-      if (allFiles.length === 0) return;
+  const enqueueTreeUpload = useCallback(
+    (tree: DroppedTreeResult, overrideParentId?: string | null) => {
+      const validEntries = tree.files.filter((entry) => entry.file.name);
+      const hasEmptyFolders = tree.emptyFolderPaths.length > 0;
+      if (validEntries.length === 0 && !hasEmptyFolders) {
+        if (tree.skippedUnreadableCount > 0) {
+          pushNotification({
+            kind: 'error',
+            title: 'File/folder tidak dapat dibaca',
+            detail: 'Pastikan item tidak terkunci atau dipindahkan sebelum dilepas.',
+          });
+        }
+        return;
+      }
 
       if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
         pushNotification({
@@ -736,8 +754,10 @@ export default function App() {
         return;
       }
 
-      const oversized = allFiles.filter((f) => f.size > DIRECT_TELEGRAM_MAX_BYTES);
-      const files = allFiles.filter((f) => f.size <= DIRECT_TELEGRAM_MAX_BYTES);
+      const oversized = validEntries.filter((e) => e.file.size > DIRECT_TELEGRAM_MAX_BYTES);
+      const uploadableEntries = validEntries.filter(
+        (e) => e.file.size <= DIRECT_TELEGRAM_MAX_BYTES,
+      );
 
       if (oversized.length > 0) {
         pushNotification({
@@ -745,46 +765,81 @@ export default function App() {
           title: 'Upload ditolak: File harus di bawah 20 MB',
           detail:
             oversized.length === 1
-              ? `"${oversized[0].name}" (${formatBytes(oversized[0].size)}) melebihi batas maksimal 20 MB/file.`
-              : `${oversized.length} file melebihi batas 20 MB/file (${oversized[0].name}, ...).`,
+              ? `"${oversized[0].file.name}" (${formatBytes(oversized[0].file.size)}) melebihi batas maksimal 20 MB/file.`
+              : `${oversized.length} file melebihi batas 20 MB/file (${oversized[0].file.name}, ...).`,
         });
       }
 
-      if (files.length === 0) return;
-
-      const targetParent =
+      const baseParentId =
         overrideParentId !== undefined
           ? overrideParentId
           : section === 'my-drive'
             ? currentFolderId
             : null;
-      const destLabel = targetParent
-        ? itemsRef.current.find((i) => i.id === targetParent)?.name || 'Folder tujuan'
+      const destLabel = baseParentId
+        ? itemsRef.current.find((i) => i.id === baseParentId)?.name || 'Folder tujuan'
         : 'Drive Saya';
 
-      const isBatch = files.length > 1;
+      // Create folder hierarchy for uploadable files + empty folders
+      const allFolderPaths = [
+        ...uploadableEntries.map((e) => e.folderPath),
+        ...tree.emptyFolderPaths,
+      ].filter((p) => p.length > 0);
+
+      let resolveParentId: (path: string[]) => string | null = () => baseParentId;
+      let createdFoldersCount = 0;
+
+      if (allFolderPaths.length > 0) {
+        const nowIso = new Date().toISOString();
+        const materialized = materializeFolderTree(
+          itemsRef.current,
+          baseParentId,
+          allFolderPaths,
+          nowIso,
+          () => `fld-${crypto.randomUUID()}`,
+        );
+        resolveParentId = materialized.resolveParentId;
+        createdFoldersCount = materialized.createdFolders.length;
+        if (createdFoldersCount > 0) {
+          commitItems((prev) => [...materialized.createdFolders, ...prev]);
+        }
+      }
+
+      if (uploadableEntries.length === 0) {
+        if (createdFoldersCount > 0) {
+          pushNotification({
+            kind: 'success',
+            title: `${createdFoldersCount} folder dibuat di ${destLabel}`,
+          });
+        }
+        return;
+      }
+
+      const isBatch = uploadableEntries.length > 1 || createdFoldersCount > 0;
       if (!isBatch) {
         pushNotification({
           kind: 'info',
-          title: `Mengunggah ${files[0].name}`,
+          title: `Mengunggah ${uploadableEntries[0].file.name}`,
           detail: `Dikirim cepat ke ${destLabel} (Cloud Telegram).`,
         });
       } else {
+        const folderNote = createdFoldersCount > 0 ? `${createdFoldersCount} folder & ` : '';
         pushNotification({
           kind: 'info',
-          title: `Mengantrekan ${files.length} file ke ${destLabel}`,
+          title: `Mengantrekan ${folderNote}${uploadableEntries.length} file ke ${destLabel}`,
           detail: `Diproses ${UPLOAD_CONCURRENCY} file paralel dengan auto-retry anti-limit Telegram.`,
         });
       }
 
       const createdTasks: TransferTask[] = [];
-      for (const file of files) {
+      for (const entry of uploadableEntries) {
         const taskId = `tr-${crypto.randomUUID()}`;
+        const resolvedParent = resolveParentId(entry.folderPath);
         createdTasks.push({
           id: taskId,
           kind: 'upload',
-          filename: file.name,
-          totalBytes: file.size,
+          filename: entry.file.name,
+          totalBytes: entry.file.size,
           loadedBytes: 0,
           speedBytesPerSec: 0,
           etaSeconds: 0,
@@ -796,8 +851,8 @@ export default function App() {
 
         uploadQueueRef.current.push({
           taskId,
-          file,
-          targetParent,
+          file: entry.file,
+          targetParent: resolvedParent,
           tgSnapshot: tgConfig,
           isBatch,
         });
@@ -810,7 +865,23 @@ export default function App() {
       setTransfers((prev) => [...createdTasks.reverse(), ...prev].slice(0, 200));
       pumpUploadQueue();
     },
-    [currentFolderId, section, tgConfig, pumpUploadQueue, pushNotification],
+    [commitItems, currentFolderId, section, tgConfig, pumpUploadQueue, pushNotification],
+  );
+
+  const enqueueFilesUpload = useCallback(
+    (fileList: FileList | File[], overrideParentId?: string | null) => {
+      enqueueTreeUpload(extractTreeFromFileList(fileList), overrideParentId);
+    },
+    [enqueueTreeUpload],
+  );
+
+  const handleDropExternalPayload = useCallback(
+    (payload: CapturedDropPayload, overrideParentId?: string | null) => {
+      void extractDroppedTree(payload).then((tree) => {
+        enqueueTreeUpload(tree, overrideParentId);
+      });
+    },
+    [enqueueTreeUpload],
   );
 
   const handleDownloadItem = useCallback(
@@ -1278,10 +1349,10 @@ export default function App() {
       }}
       onDrop={(e) => {
         if (e.dataTransfer.types.includes('application/x-teledrive-ids')) return;
-        if (e.dataTransfer.files?.length) {
+        if (e.dataTransfer.files?.length || e.dataTransfer.items?.length) {
           e.preventDefault();
           setIsDraggingExternalFiles(false);
-          enqueueFilesUpload(e.dataTransfer.files);
+          handleDropExternalPayload(captureDropEntriesSync(e.dataTransfer));
         } else {
           setIsDraggingExternalFiles(false);
         }
@@ -1326,9 +1397,9 @@ export default function App() {
         onCloseMobile={() => setMobileMenuOpen(false)}
         canDropOnRoot={draggingIds.length > 0}
         onDropOnRoot={(ids) => handleDropMoveToFolder(ids, null)}
-        onDropExternalFilesToRoot={(files) => {
+        onDropExternalFilesToRoot={(payload) => {
           setIsDraggingExternalFiles(false);
-          enqueueFilesUpload(files, null);
+          handleDropExternalPayload(payload, null);
         }}
       />
 
@@ -1395,9 +1466,9 @@ export default function App() {
           onPasteItems={handlePasteItems}
           onClearClipboard={() => setClipboardIds([])}
           onDropMoveToFolder={(ids, targetId) => handleDropMoveToFolder(ids, targetId)}
-          onDropExternalFilesToFolder={(files, targetFolderId) => {
+          onDropExternalFilesToFolder={(payload, targetFolderId) => {
             setIsDraggingExternalFiles(false);
-            enqueueFilesUpload(files, targetFolderId);
+            handleDropExternalPayload(payload, targetFolderId);
           }}
           previewOpen={previewPaneOpen}
           onTogglePreviewPane={() => setPreviewPaneOpen((v) => !v)}
@@ -1494,9 +1565,9 @@ export default function App() {
                 onDropMoveToFolder={(ids, targetFolderId) =>
                   handleDropMoveToFolder(ids, targetFolderId)
                 }
-                onDropExternalFilesToFolder={(files, targetFolderId) => {
+                onDropExternalFilesToFolder={(payload, targetFolderId) => {
                   setIsDraggingExternalFiles(false);
-                  enqueueFilesUpload(files, targetFolderId);
+                  handleDropExternalPayload(payload, targetFolderId);
                 }}
                 onToggleSelect={handleToggleSelect}
                 onContextMenuItem={handleContextMenuItem}
@@ -1523,9 +1594,9 @@ export default function App() {
                 onDropMoveToFolder={(ids, targetFolderId) =>
                   handleDropMoveToFolder(ids, targetFolderId)
                 }
-                onDropExternalFilesToFolder={(files, targetFolderId) => {
+                onDropExternalFilesToFolder={(payload, targetFolderId) => {
                   setIsDraggingExternalFiles(false);
-                  enqueueFilesUpload(files, targetFolderId);
+                  handleDropExternalPayload(payload, targetFolderId);
                 }}
                 onToggleSelect={handleToggleSelect}
                 onContextMenuItem={handleContextMenuItem}
@@ -1586,7 +1657,7 @@ export default function App() {
             </div>
             <div className="min-w-0 flex-1">
               <p className="truncate font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
-                Lepas file untuk unggah ke{' '}
+                Lepas file atau folder untuk unggah ke{' '}
                 {section === 'my-drive' && currentFolderId
                   ? items.find((i) => i.id === currentFolderId)?.name || 'Folder ini'
                   : 'Drive Saya'}

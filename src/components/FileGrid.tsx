@@ -14,6 +14,10 @@ import {
   getFileCategory,
 } from '../utils/fileHelpers';
 import { getLocalBlob } from '../utils/localVault';
+import {
+  type CapturedDropPayload,
+  captureDropEntriesSync,
+} from '../utils/dropUploadHelpers';
 import { DIRECT_TELEGRAM_MAX_BYTES, resolveTelegramFileUrl } from '../utils/telegramDirect';
 import { FileIcon } from './FileIcon';
 
@@ -26,7 +30,7 @@ interface FileGridProps {
   onDragStartIds: (ids: string[]) => void;
   onDragEndIds: () => void;
   onDropMoveToFolder: (ids: string[], targetFolderId: string) => void;
-  onDropExternalFilesToFolder?: (files: FileList, targetFolderId: string) => void;
+  onDropExternalFilesToFolder?: (payload: CapturedDropPayload, targetFolderId: string) => void;
   onToggleSelect: (id: string, shiftKey?: boolean) => void;
   onContextMenuItem: (e: React.MouseEvent, item: DriveItem) => void;
   onOpenItem: (item: DriveItem) => void;
@@ -157,7 +161,7 @@ export function FileGrid({
             Folder ({folders.length})
           </h2>
 
-          <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+          <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
             {folders.map((folder) => {
               const selected = selectedIds.has(folder.id);
               const isDropHighlight = dropTargetFolder?.id === folder.id;
@@ -227,10 +231,13 @@ export function FileGrid({
                       }
                       return;
                     }
-                    if (e.dataTransfer.files?.length && onDropExternalFilesToFolder) {
+                    if (
+                      (e.dataTransfer.files?.length || e.dataTransfer.items?.length) &&
+                      onDropExternalFilesToFolder
+                    ) {
                       e.preventDefault();
                       e.stopPropagation();
-                      onDropExternalFilesToFolder(e.dataTransfer.files, folder.id);
+                      onDropExternalFilesToFolder(captureDropEntriesSync(e.dataTransfer), folder.id);
                     }
                   }}
                   className={`group relative flex items-center justify-between gap-3 rounded-2xl border border-l-4 p-3.5 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-md ${
@@ -285,14 +292,14 @@ export function FileGrid({
                   </button>
 
                   {!isTrashView && folder.starred && (
-                    <Star className="pointer-events-none absolute right-3 top-3 h-3.5 w-3.5 fill-amber-400 text-amber-500 transition-opacity group-hover:opacity-0" />
+                    <Star className="pointer-events-none h-3.5 w-3.5 shrink-0 fill-amber-400 text-amber-500 group-hover:hidden" />
                   )}
 
                   <div
                     className={`${
                       isTrashView
                         ? 'flex shrink-0 items-center gap-0.5'
-                        : 'pointer-events-none absolute right-2 top-2 flex items-center gap-0.5 rounded-lg bg-white/95 p-0.5 opacity-0 shadow-xs ring-1 ring-slate-200/70 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 dark:bg-slate-900/95 dark:ring-slate-700/70'
+                        : 'flex shrink-0 items-center gap-0.5 rounded-lg p-0.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100'
                     }`}
                   >
                     {!isTrashView ? (

@@ -9,6 +9,10 @@ import {
 } from 'lucide-react';
 import type { DriveItem } from '../types/drive';
 import { formatBytes, formatRelativeDateId } from '../utils/fileHelpers';
+import {
+  type CapturedDropPayload,
+  captureDropEntriesSync,
+} from '../utils/dropUploadHelpers';
 import { DIRECT_TELEGRAM_MAX_BYTES } from '../utils/telegramDirect';
 import { FileIcon } from './FileIcon';
 
@@ -19,7 +23,7 @@ interface FileTableProps {
   onDragStartIds: (ids: string[]) => void;
   onDragEndIds: () => void;
   onDropMoveToFolder: (ids: string[], targetFolderId: string) => void;
-  onDropExternalFilesToFolder?: (files: FileList, targetFolderId: string) => void;
+  onDropExternalFilesToFolder?: (payload: CapturedDropPayload, targetFolderId: string) => void;
   onToggleSelect: (id: string, shiftKey?: boolean) => void;
   onContextMenuItem: (e: React.MouseEvent, item: DriveItem) => void;
   onOpenItem: (item: DriveItem) => void;
@@ -153,10 +157,16 @@ export function FileTable({
                           }
                           return;
                         }
-                        if (e.dataTransfer.files?.length && onDropExternalFilesToFolder) {
+                        if (
+                          (e.dataTransfer.files?.length || e.dataTransfer.items?.length) &&
+                          onDropExternalFilesToFolder
+                        ) {
                           e.preventDefault();
                           e.stopPropagation();
-                          onDropExternalFilesToFolder(e.dataTransfer.files, item.id);
+                          onDropExternalFilesToFolder(
+                            captureDropEntriesSync(e.dataTransfer),
+                            item.id,
+                          );
                         }
                       }
                     : undefined

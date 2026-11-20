@@ -212,6 +212,7 @@ export function uploadFileDirectToTelegram(
       form.append('document', file, filename);
 
       xhr.open('POST', tgApi(botToken, 'sendDocument'), true);
+      xhr.timeout = 120_000;
 
       xhr.upload.onprogress = (ev) => {
         if (ev.lengthComputable) {
@@ -237,9 +238,12 @@ export function uploadFileDirectToTelegram(
           if (xhr.status < 200 || xhr.status >= 300 || !data.ok || !data.result) {
             const err = new Error(data.description || 'Telegram menolak unggahan file ini.') as Error & {
               retryAfterSeconds?: number;
+              isTransientNetworkError?: boolean;
             };
             if (xhr.status === 429 || data.error_code === 429) {
               err.retryAfterSeconds = Math.max(1, Number(data.parameters?.retry_after) || 5);
+            } else if (xhr.status >= 500 || xhr.status === 0) {
+              err.isTransientNetworkError = true;
             }
             reject(err);
             return;
@@ -259,11 +263,30 @@ export function uploadFileDirectToTelegram(
             messageId: data.result.message_id,
           });
         } catch {
-          reject(new Error('Respons Telegram tidak valid.'));
+          const err = new Error('Respons Telegram tidak valid.') as Error & {
+            isTransientNetworkError?: boolean;
+          };
+          if (xhr.status >= 500 || xhr.status === 0) {
+            err.isTransientNetworkError = true;
+          }
+          reject(err);
         }
       };
 
-      xhr.onerror = () => reject(new Error('Koneksi terputus saat mengunggah ke Telegram.'));
+      xhr.onerror = () => {
+        const err = new Error('Koneksi terputus saat mengunggah ke Telegram.') as Error & {
+          isTransientNetworkError?: boolean;
+        };
+        err.isTransientNetworkError = true;
+        reject(err);
+      };
+      xhr.ontimeout = () => {
+        const err = new Error('Waktu tunggu habis saat mengunggah ke Telegram.') as Error & {
+          isTransientNetworkError?: boolean;
+        };
+        err.isTransientNetworkError = true;
+        reject(err);
+      };
       xhr.onabort = () => reject(new Error('Dibatalkan'));
       xhr.send(form);
     },

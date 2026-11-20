@@ -419,4 +419,121 @@ test('getOfficePreviewType classifies Word, Excel, PowerPoint, and legacy format
   assert.equal(getOfficePreviewType('application/pdf', 'Kontrak.pdf'), null);
 });
 
+import {
+  extractDroppedTree,
+  extractTreeFromFileList,
+  materializeFolderTree,
+} from './dropUploadHelpers';
+
+test('extractDroppedTree reads nested FileSystemDirectoryEntry and skips unreadable directory fallback blobs', async () => {
+  const fileA = new File(['isi surat'], 'Surat.docx', {
+    type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  });
+  const fileB = new File(['rekap'], 'Rekap.xlsx', {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+
+  // 1) Simulate FileSystemEntry traversal (mixed folder + top-level file)
+  const makeFileEntry = (f: File) => ({
+    isFile: true,
+    isDirectory: false,
+    name: f.name,
+    file: (cb: (res: File) => void) => cb(f),
+  });
+
+  let batchIdx = 0;
+  const subDirEntry = {
+    isFile: false,
+    isDirectory: true,
+    name: 'Arsip 2026',
+    createReader: () => ({
+      readEntries: (cb: (entries: unknown[]) => void) => {
+        if (batchIdx === 0) {
+          batchIdx += 1;
+          cb([makeFileEntry(fileB)]);
+        } else {
+          cb([]);
+        }
+      },
+    }),
+  };
+
+  let emptyRead = false;
+  const emptyDirEntry = {
+    isFile: false,
+    isDirectory: true,
+    name: 'Folder Kosong',
+    createReader: () => ({
+      readEntries: (cb: (entries: unknown[]) => void) => {
+        if (!emptyRead) {
+          emptyRead = true;
+          cb([]);
+        } else {
+          cb([]);
+        }
+      },
+    }),
+  };
+
+  const tree = await extractDroppedTree({
+    entries: [makeFileEntry(fileA), subDirEntry, emptyDirEntry] as unknown as FileSystemEntry[],
+    fallbackFiles: [],
+  });
+
+  assert.equal(tree.files.length, 2);
+  assert.deepEqual(tree.files[0].folderPath, []);
+  assert.equal(tree.files[0].file.name, 'Surat.docx');
+  assert.deepEqual(tree.files[1].folderPath, ['Arsip 2026']);
+  assert.equal(tree.files[1].file.name, 'Rekap.xlsx');
+  assert.deepEqual(tree.emptyFolderPaths, [['Folder Kosong']]);
+
+  // 2) Simulate fallback FileList where browser included an unreadable directory pseudo-File
+  const unreadableDirBlob = {
+    name: 'Folder_Dokumen',
+    size: 0,
+    type: '',
+    slice: () => ({
+      arrayBuffer: async () => {
+        throw new DOMException('NotReadableError');
+      },
+    }),
+  } as unknown as File;
+
+  const fallbackTree = await extractDroppedTree({
+    entries: [],
+    fallbackFiles: [unreadableDirBlob, fileA],
+  });
+  assert.equal(fallbackTree.files.length, 1);
+  assert.equal(fallbackTree.files[0].file.name, 'Surat.docx');
+  assert.deepEqual(fallbackTree.emptyFolderPaths, [['Folder_Dokumen']]);
+});
+
+test('materializeFolderTree reuses existing folders and creates missing nested folders', () => {
+  let seq = 0;
+  const res = materializeFolderTree(
+    sampleItems,
+    null,
+    [
+      ['Desain Produk', 'Baru 2026'],
+      ['Kantor', 'Keuangan', 'Q1'],
+    ],
+    '2026-11-20T05:35:00.000Z',
+    () => `fld-gen-${++seq}`,
+  );
+
+  // 'Desain Produk' already exists in sampleItems (id: 'f-root-1'), so only 4 new folders created
+  assert.equal(res.createdFolders.length, 4);
+  const baru2026 = res.createdFolders.find((f) => f.name === 'Baru 2026');
+  assert.equal(baru2026?.parentId, 'f-root-1');
+  assert.equal(res.resolveParentId(['Desain Produk', 'Baru 2026']), baru2026?.id);
+
+  const q1Id = res.resolveParentId(['Kantor', 'Keuangan', 'Q1']);
+  assert.ok(q1Id);
+
+  const fileListTree = extractTreeFromFileList([
+    Object.assign(new File(['abc'], 'a.txt'), { webkitRelativePath: 'Kantor/Q1/a.txt' }),
+  ]);
+  assert.deepEqual(fileListTree.files[0].folderPath, ['Kantor', 'Q1']);
+});
+
 

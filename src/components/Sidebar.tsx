@@ -15,6 +15,10 @@ import {
   X,
 } from 'lucide-react';
 import type { NavSection, StorageSummary } from '../types/drive';
+import {
+  type CapturedDropPayload,
+  captureDropEntriesSync,
+} from '../utils/dropUploadHelpers';
 import { formatBytes } from '../utils/fileHelpers';
 
 interface SidebarProps {
@@ -28,7 +32,7 @@ interface SidebarProps {
   onCloseMobile: () => void;
   canDropOnRoot?: boolean;
   onDropOnRoot?: (ids: string[]) => void;
-  onDropExternalFilesToRoot?: (files: FileList) => void;
+  onDropExternalFilesToRoot?: (payload: CapturedDropPayload) => void;
 }
 
 const NAV_ITEMS: Array<{ id: NavSection; label: string; icon: typeof HardDrive }> = [
@@ -237,10 +241,13 @@ export function Sidebar({
                           }
                           return;
                         }
-                        if (e.dataTransfer.files?.length && onDropExternalFilesToRoot) {
+                        if (
+                          (e.dataTransfer.files?.length || e.dataTransfer.items?.length) &&
+                          onDropExternalFilesToRoot
+                        ) {
                           e.preventDefault();
                           e.stopPropagation();
-                          onDropExternalFilesToRoot(e.dataTransfer.files);
+                          onDropExternalFilesToRoot(captureDropEntriesSync(e.dataTransfer));
                         }
                       }
                     : undefined

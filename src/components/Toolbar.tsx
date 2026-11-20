@@ -14,6 +14,10 @@ import {
   X,
 } from 'lucide-react';
 import type { NavSection, SortDirection, SortField, TypeFilter } from '../types/drive';
+import {
+  type CapturedDropPayload,
+  captureDropEntriesSync,
+} from '../utils/dropUploadHelpers';
 import type { BreadcrumbNode } from '../utils/fileHelpers';
 
 interface ToolbarProps {
@@ -40,7 +44,7 @@ interface ToolbarProps {
   onPasteItems: () => void;
   onClearClipboard: () => void;
   onDropMoveToFolder: (ids: string[], targetFolderId: string | null) => void;
-  onDropExternalFilesToFolder?: (files: FileList, targetFolderId: string | null) => void;
+  onDropExternalFilesToFolder?: (payload: CapturedDropPayload, targetFolderId: string | null) => void;
   previewOpen?: boolean;
   onTogglePreviewPane?: () => void;
   searchQuery: string;
@@ -150,10 +154,13 @@ export function Toolbar({
                         }
                         return;
                       }
-                      if (e.dataTransfer.files?.length && onDropExternalFilesToFolder) {
+                      if (
+                        (e.dataTransfer.files?.length || e.dataTransfer.items?.length) &&
+                        onDropExternalFilesToFolder
+                      ) {
                         e.preventDefault();
                         e.stopPropagation();
-                        onDropExternalFilesToFolder(e.dataTransfer.files, node.id);
+                        onDropExternalFilesToFolder(captureDropEntriesSync(e.dataTransfer), node.id);
                       }
                     }}
                     className={`rounded-lg px-2 py-1 text-sm transition-colors whitespace-nowrap ${

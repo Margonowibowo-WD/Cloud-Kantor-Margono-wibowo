@@ -23,6 +23,7 @@ export interface UploadController {
 }
 
 const MAX_RATE_LIMIT_RETRIES = 3;
+const MAX_TRANSIENT_RETRIES = 2;
 
 function waitWithCancel(ms: number, isCancelled: () => boolean): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -70,6 +71,13 @@ export function startDirectUpload(
       throw new Error('Ukuran file harus di bawah 20 MB per file untuk unggah dari browser.');
     }
 
+    // Ensure the dropped item is a readable file (not a directory handle pseudo-file)
+    try {
+      await file.slice(0, 1).arrayBuffer();
+    } catch {
+      throw new Error(`"${file.name}" berupa folder atau tidak dapat dibaca langsung oleh browser.`);
+    }
+
     const id = `file-${crypto.randomUUID()}`;
     const blobKey = `blob-${id}`;
     const now = new Date().toISOString();
@@ -81,8 +89,10 @@ export function startDirectUpload(
 
     let uploaded: { fileId: string; fileUniqueId: string; messageId: number } | null = null;
     let startedAt = performance.now();
+    let rateLimitAttempts = 0;
+    let transientAttempts = 0;
 
-    for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt += 1) {
+    while (true) {
       if (cancelled) {
         throw new Error('Dibatalkan');
       }
@@ -114,9 +124,13 @@ export function startDirectUpload(
         uploaded = await uploadOp.promise;
         break;
       } catch (err) {
-        const retryAfter = (err as Error & { retryAfterSeconds?: number })?.retryAfterSeconds;
-        if (!cancelled && retryAfter && attempt < MAX_RATE_LIMIT_RETRIES) {
-          const waitSec = Math.min(30, Math.max(1, retryAfter));
+        const typedErr = err as Error & {
+          retryAfterSeconds?: number;
+          isTransientNetworkError?: boolean;
+        };
+        if (!cancelled && typedErr.retryAfterSeconds && rateLimitAttempts < MAX_RATE_LIMIT_RETRIES) {
+          rateLimitAttempts += 1;
+          const waitSec = Math.min(30, Math.max(1, typedErr.retryAfterSeconds));
           onProgress({
             loadedBytes: 0,
             speedBytesPerSec: 0,
@@ -125,6 +139,26 @@ export function startDirectUpload(
             totalChunks: 1,
             status: 'active',
             errorMessage: `Menunggu batas Telegram (${waitSec} dtk)...`,
+            targetBackend: 'telegram',
+          });
+          await waitWithCancel(waitSec * 1000, () => cancelled);
+          continue;
+        }
+        if (
+          !cancelled &&
+          typedErr.isTransientNetworkError &&
+          transientAttempts < MAX_TRANSIENT_RETRIES
+        ) {
+          transientAttempts += 1;
+          const waitSec = transientAttempts * 2;
+          onProgress({
+            loadedBytes: 0,
+            speedBytesPerSec: 0,
+            etaSeconds: waitSec,
+            completedChunks: 0,
+            totalChunks: 1,
+            status: 'active',
+            errorMessage: `Koneksi terganggu, mencoba ulang (${transientAttempts}/${MAX_TRANSIENT_RETRIES})...`,
             targetBackend: 'telegram',
           });
           await waitWithCancel(waitSec * 1000, () => cancelled);
