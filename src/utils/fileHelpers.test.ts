@@ -16,11 +16,14 @@ import {
   isPdfFile,
 } from './fileHelpers';
 import {
+  decodeTelegramDocumentIndex,
   decodeTelegramIndex,
+  encodeTelegramDocumentIndex,
   encodeTelegramIndex,
   mergeDriveItems,
   reconcileRemoteDriveItems,
 } from './telegramIndex';
+import { planBlobCacheEviction } from './localVault';
 import type { DriveItem } from '../types/drive';
 
 const sampleItems: DriveItem[] = [
@@ -536,4 +539,65 @@ test('materializeFolderTree reuses existing folders and creates missing nested f
   assert.deepEqual(fileListTree.files[0].folderPath, ['Kantor', 'Q1']);
 });
 
+test('encodeTelegramDocumentIndex and decodeTelegramDocumentIndex support 120+ items beyond 4000 chars and decode v1 fallback', () => {
+  const manyItems: DriveItem[] = Array.from({ length: 120 }, (_, idx) => ({
+    id: `item-bulk-${idx + 1}`,
+    name: `Arsip_Dokumen_Kantor_Margono_2026_${idx + 1}.pdf`,
+    type: 'file',
+    parentId: idx % 5 === 0 ? 'f-root-1' : null,
+    size: 1024 * (idx + 1),
+    mimeType: 'application/pdf',
+    starred: idx % 10 === 0,
+    trashed: false,
+    createdAt: '2026-11-20T07:00:00.000Z',
+    updatedAt: '2026-11-20T07:00:00.000Z',
+    storageBackend: 'telegram',
+    chunks: [
+      {
+        index: 0,
+        size: 1024 * (idx + 1),
+        telegramFileId: `BQACAgUAAxkBAAI_${idx + 1}`,
+        telegramUniqueId: `AgAD_${idx + 1}`,
+        telegramMessageId: 500 + idx,
+      },
+    ],
+  }));
+
+  const v2Raw = encodeTelegramDocumentIndex(manyItems);
+  assert.ok(v2Raw.length > 4000, 'v2 payload should not truncate at 4000 chars');
+  const decodedV2 = decodeTelegramDocumentIndex(v2Raw);
+  assert.equal(decodedV2.length, 120);
+  assert.equal(decodedV2[119].id, 'item-bulk-120');
+  assert.equal(decodedV2[119].chunks[0]?.telegramUniqueId, 'AgAD_120');
+  assert.equal(decodedV2[119].chunks[0]?.telegramMessageId, 619);
+
+  // Backward compatibility: v1 pinned text payload
+  const v1Raw = encodeTelegramIndex(sampleItems);
+  const decodedV1 = decodeTelegramDocumentIndex(v1Raw);
+  assert.equal(decodedV1.length, sampleItems.length);
+  assert.equal(decodedV1.find((d) => d.id === 'file-1')?.chunks[0]?.telegramFileId, 'tg_1');
+});
+
+test('planBlobCacheEviction evicts oldest LRU entries while protecting newly saved blob key', () => {
+  const manifest = {
+    'blob-oldest': { size: 120, lastAccessedAt: 1000 },
+    'blob-middle': { size: 150, lastAccessedAt: 2000 },
+    'blob-newest': { size: 100, lastAccessedAt: 3000 },
+    'blob-protected-old': { size: 200, lastAccessedAt: 500 },
+  };
+
+  // Total is 570 bytes; cap is 350 bytes; protectedKey must never be evicted
+  const plan = planBlobCacheEviction(manifest, 'blob-protected-old', 350);
+  assert.deepEqual(plan.keysToEvict, ['blob-oldest', 'blob-middle']);
+  assert.equal(plan.totalBytesAfter, 300);
+  assert.ok('blob-protected-old' in plan.nextManifest);
+  assert.ok('blob-newest' in plan.nextManifest);
+  assert.ok(!('blob-oldest' in plan.nextManifest));
+  assert.ok(!('blob-middle' in plan.nextManifest));
+
+  // Under limit -> nothing evicted
+  const underPlan = planBlobCacheEviction(manifest, 'blob-newest', 1000);
+  assert.deepEqual(underPlan.keysToEvict, []);
+  assert.equal(underPlan.totalBytesAfter, 570);
+});
 

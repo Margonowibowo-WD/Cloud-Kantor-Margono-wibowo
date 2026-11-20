@@ -34,6 +34,70 @@ function openBlobDb(): Promise<IDBDatabase> {
   });
 }
 
+const BLOB_LRU_KEY = 'teledrive_blob_lru_v1';
+export const MAX_LOCAL_BLOB_CACHE_BYTES = 350 * 1024 * 1024; // 350 MB local preview cache cap
+
+export interface BlobCacheEntryMeta {
+  size: number;
+  lastAccessedAt: number;
+}
+
+export function planBlobCacheEviction(
+  manifest: Record<string, BlobCacheEntryMeta>,
+  protectedKey: string,
+  maxBytes = MAX_LOCAL_BLOB_CACHE_BYTES,
+): { keysToEvict: string[]; nextManifest: Record<string, BlobCacheEntryMeta>; totalBytesAfter: number } {
+  const nextManifest: Record<string, BlobCacheEntryMeta> = { ...manifest };
+  let totalBytes = Object.values(nextManifest).reduce((acc, m) => acc + (m.size || 0), 0);
+  const keysToEvict: string[] = [];
+
+  if (totalBytes <= maxBytes) {
+    return { keysToEvict, nextManifest, totalBytesAfter: totalBytes };
+  }
+
+  const candidates = Object.entries(nextManifest)
+    .filter(([k]) => k !== protectedKey)
+    .sort(([, a], [, b]) => a.lastAccessedAt - b.lastAccessedAt);
+
+  for (const [key, meta] of candidates) {
+    if (totalBytes <= maxBytes) break;
+    keysToEvict.push(key);
+    totalBytes = Math.max(0, totalBytes - (meta.size || 0));
+    delete nextManifest[key];
+  }
+
+  return { keysToEvict, nextManifest, totalBytesAfter: totalBytes };
+}
+
+function loadBlobLruManifest(): Record<string, BlobCacheEntryMeta> {
+  try {
+    const raw = localStorage.getItem(BLOB_LRU_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, BlobCacheEntryMeta>;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveBlobLruManifest(manifest: Record<string, BlobCacheEntryMeta>): void {
+  try {
+    localStorage.setItem(BLOB_LRU_KEY, JSON.stringify(manifest));
+  } catch {
+    // ignore quota error
+  }
+}
+
+export function getLocalBlobCacheStats(): { fileCount: number; totalBytes: number; maxBytes: number } {
+  const manifest = loadBlobLruManifest();
+  const entries = Object.values(manifest);
+  return {
+    fileCount: entries.length,
+    totalBytes: entries.reduce((acc, m) => acc + (m.size || 0), 0),
+    maxBytes: MAX_LOCAL_BLOB_CACHE_BYTES,
+  };
+}
+
 export async function saveLocalBlob(key: string, blob: Blob): Promise<void> {
   try {
     const db = await openBlobDb();
@@ -43,6 +107,23 @@ export async function saveLocalBlob(key: string, blob: Blob): Promise<void> {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
+
+    const manifest = loadBlobLruManifest();
+    manifest[key] = { size: blob.size, lastAccessedAt: Date.now() };
+    const plan = planBlobCacheEviction(manifest, key, MAX_LOCAL_BLOB_CACHE_BYTES);
+    saveBlobLruManifest(plan.nextManifest);
+
+    if (plan.keysToEvict.length > 0) {
+      await new Promise<void>((resolve) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        for (const evictKey of plan.keysToEvict) {
+          store.delete(evictKey);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      });
+    }
   } catch {
     // IndexedDB unavailable
   }
@@ -51,12 +132,18 @@ export async function saveLocalBlob(key: string, blob: Blob): Promise<void> {
 export async function getLocalBlob(key: string): Promise<Blob | null> {
   try {
     const db = await openBlobDb();
-    return await new Promise<Blob | null>((resolve, reject) => {
+    const blob = await new Promise<Blob | null>((resolve, reject) => {
       const tx = db.transaction(IDB_STORE, 'readonly');
       const req = tx.objectStore(IDB_STORE).get(key);
       req.onsuccess = () => resolve((req.result as Blob) || null);
       req.onerror = () => reject(req.error);
     });
+    if (blob) {
+      const manifest = loadBlobLruManifest();
+      manifest[key] = { size: blob.size, lastAccessedAt: Date.now() };
+      saveBlobLruManifest(manifest);
+    }
+    return blob;
   } catch {
     return null;
   }
@@ -71,6 +158,11 @@ export async function deleteLocalBlob(key: string): Promise<void> {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
+    const manifest = loadBlobLruManifest();
+    if (key in manifest) {
+      delete manifest[key];
+      saveBlobLruManifest(manifest);
+    }
   } catch {
     // ignore
   }

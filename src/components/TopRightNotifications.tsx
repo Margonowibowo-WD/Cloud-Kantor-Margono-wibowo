@@ -14,6 +14,8 @@ interface TopRightNotificationsProps {
   onDismissNotification: (id: string) => void;
   tasks: TransferTask[];
   onCancelTask: (id: string) => void;
+  onRetryTask?: (id: string) => void;
+  onRetryAllFailed?: () => void;
   onClearCompletedTasks: () => void;
 }
 
@@ -22,6 +24,8 @@ export function TopRightNotifications({
   onDismissNotification,
   tasks,
   onCancelTask,
+  onRetryTask,
+  onRetryAllFailed,
   onClearCompletedTasks,
 }: TopRightNotificationsProps) {
   if (notifications.length === 0 && tasks.length === 0) return null;
@@ -77,6 +81,8 @@ export function TopRightNotifications({
           <TransferManager
             tasks={tasks}
             onCancelTask={onCancelTask}
+            onRetryTask={onRetryTask}
+            onRetryAllFailed={onRetryAllFailed}
             onClearCompleted={onClearCompletedTasks}
           />
         </div>

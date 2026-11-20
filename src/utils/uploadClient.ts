@@ -22,7 +22,7 @@ export interface UploadController {
   promise: Promise<DriveItem>;
 }
 
-const MAX_RATE_LIMIT_RETRIES = 3;
+const MAX_RATE_LIMIT_RETRIES = 4;
 const MAX_TRANSIENT_RETRIES = 2;
 
 function waitWithCancel(ms: number, isCancelled: () => boolean): Promise<void> {
@@ -130,7 +130,7 @@ export function startDirectUpload(
         };
         if (!cancelled && typedErr.retryAfterSeconds && rateLimitAttempts < MAX_RATE_LIMIT_RETRIES) {
           rateLimitAttempts += 1;
-          const waitSec = Math.min(30, Math.max(1, typedErr.retryAfterSeconds));
+          const waitSec = Math.min(65, Math.max(1, typedErr.retryAfterSeconds));
           onProgress({
             loadedBytes: 0,
             speedBytesPerSec: 0,

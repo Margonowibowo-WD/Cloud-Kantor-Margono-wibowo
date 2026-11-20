@@ -1,8 +1,14 @@
 import type { DriveItem, TelegramConfigState, TelegramPublicStatus } from '../types/drive';
-import { decodeTelegramIndex, encodeTelegramIndex } from './telegramIndex';
+import {
+  decodeTelegramDocumentIndex,
+  decodeTelegramIndex,
+  encodeTelegramDocumentIndex,
+} from './telegramIndex';
 
 export const DIRECT_TELEGRAM_MAX_BYTES = 20 * 1024 * 1024; // 20 MB Telegram getFile limit
-export const UPLOAD_CONCURRENCY = 3;
+export const UPLOAD_CONCURRENCY = 1;
+export const INDEX_DOCUMENT_FILENAME = 'teledrive-index.json';
+export const INDEX_DOCUMENT_CAPTION_PREFIX = 'TELEDRIVE_IDX_V2:';
 
 export interface DetectedChat {
   id: string;
@@ -19,6 +25,9 @@ export interface DirectVerifyResult {
   chatTitle?: string;
   chatType?: string;
   pinnedIndexText?: string;
+  pinnedIndexDocumentFileId?: string;
+  pinnedIndexDocumentName?: string;
+  pinnedIndexCaption?: string;
   pinnedMessageId?: number;
   error?: string;
 }
@@ -100,6 +109,13 @@ export async function verifyTelegramDirect(
           pinned_message?: {
             message_id: number;
             text?: string;
+            caption?: string;
+            document?: {
+              file_id: string;
+              file_name?: string;
+              mime_type?: string;
+              file_size?: number;
+            };
           };
         };
       };
@@ -123,6 +139,9 @@ export async function verifyTelegramDirect(
         String(chatData.result.id);
       result.chatType = chatData.result.type || 'chat';
       result.pinnedIndexText = chatData.result.pinned_message?.text;
+      result.pinnedIndexDocumentFileId = chatData.result.pinned_message?.document?.file_id;
+      result.pinnedIndexDocumentName = chatData.result.pinned_message?.document?.file_name;
+      result.pinnedIndexCaption = chatData.result.pinned_message?.caption;
       result.pinnedMessageId = chatData.result.pinned_message?.message_id;
     }
 
@@ -212,7 +231,7 @@ export function uploadFileDirectToTelegram(
       form.append('document', file, filename);
 
       xhr.open('POST', tgApi(botToken, 'sendDocument'), true);
-      xhr.timeout = 120_000;
+      xhr.timeout = 300_000;
 
       xhr.upload.onprogress = (ev) => {
         if (ev.lengthComputable) {
@@ -395,37 +414,48 @@ export async function pushIndexToTelegramPinnedMessage(
   items: DriveItem[],
   existingMessageId?: number,
 ): Promise<number | undefined> {
-  const encoded = encodeTelegramIndex(items);
+  const jsonText = encodeTelegramDocumentIndex(items);
+  const blob = new Blob([jsonText], { type: 'application/json' });
+  const caption = `${INDEX_DOCUMENT_CAPTION_PREFIX}${items.length} item`;
 
   if (existingMessageId) {
     try {
-      const editRes = await fetch(tgApi(botToken, 'editMessageText'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId.trim(),
-          message_id: existingMessageId,
-          text: encoded,
+      const form = new FormData();
+      form.append('chat_id', chatId.trim());
+      form.append('message_id', String(existingMessageId));
+      form.append(
+        'media',
+        JSON.stringify({
+          type: 'document',
+          media: 'attach://index_file',
+          caption,
         }),
+      );
+      form.append('index_file', blob, INDEX_DOCUMENT_FILENAME);
+
+      const editRes = await fetch(tgApi(botToken, 'editMessageMedia'), {
+        method: 'POST',
+        body: form,
       });
       const editData = (await editRes.json()) as { ok: boolean; description?: string };
       if (editData.ok || editData.description?.includes('message is not modified')) {
         return existingMessageId;
       }
     } catch {
-      // Fall through to send + pin a fresh index message
+      // Fall through to send + pin a fresh document index message (e.g. migrating from legacy v1 text index)
     }
   }
 
   try {
-    const sendRes = await fetch(tgApi(botToken, 'sendMessage'), {
+    const form = new FormData();
+    form.append('chat_id', chatId.trim());
+    form.append('caption', caption);
+    form.append('disable_notification', 'true');
+    form.append('document', blob, INDEX_DOCUMENT_FILENAME);
+
+    const sendRes = await fetch(tgApi(botToken, 'sendDocument'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId.trim(),
-        text: encoded,
-        disable_notification: true,
-      }),
+      body: form,
     });
     const sendData = (await sendRes.json()) as {
       ok: boolean;
@@ -443,6 +473,11 @@ export async function pushIndexToTelegramPinnedMessage(
         disable_notification: true,
       }),
     }).catch(() => undefined);
+
+    // Clean up old replaced index message if migrating or recreating
+    if (existingMessageId && existingMessageId !== newMsgId) {
+      void deleteTelegramMessageDirect(botToken, chatId, existingMessageId);
+    }
 
     return newMsgId;
   } catch {
@@ -499,6 +534,12 @@ export async function fetchChannelMediaUpdates(
       if (!post || !post.chat) continue;
       if (String(post.chat.id) !== targetChat) continue;
       if (post.text?.startsWith('TELEDRIVE_IDX_V1:')) continue;
+      if (
+        post.caption?.startsWith(INDEX_DOCUMENT_CAPTION_PREFIX) ||
+        post.document?.file_name === INDEX_DOCUMENT_FILENAME
+      ) {
+        continue;
+      }
       if (knownMessageIds.has(post.message_id) || dismissedMessageIds.has(post.message_id)) continue;
 
       const timestamp = post.date ? new Date(post.date * 1000).toISOString() : new Date().toISOString();
@@ -613,13 +654,51 @@ export async function pullIndexFromTelegramPinnedMessage(
   items: DriveItem[];
   pinnedMessageId?: number;
   hasIndex: boolean;
+  isCompleteIndex: boolean;
   rawLength: number;
   error?: string;
 }> {
   const verification = await verifyTelegramDirect(botToken, chatId);
   if (!verification.ok) {
-    return { items: [], hasIndex: false, rawLength: 0, error: verification.error };
+    return {
+      items: [],
+      hasIndex: false,
+      isCompleteIndex: false,
+      rawLength: 0,
+      error: verification.error,
+    };
   }
+
+  // Prefer unlimited v2 JSON document pinned index
+  const isV2Doc =
+    Boolean(verification.pinnedIndexDocumentFileId) &&
+    (verification.pinnedIndexCaption?.startsWith(INDEX_DOCUMENT_CAPTION_PREFIX) ||
+      verification.pinnedIndexDocumentName === INDEX_DOCUMENT_FILENAME ||
+      !verification.pinnedIndexText);
+
+  if (isV2Doc && verification.pinnedIndexDocumentFileId) {
+    try {
+      const docUrl = await resolveTelegramFileUrl(
+        botToken,
+        verification.pinnedIndexDocumentFileId,
+      );
+      const res = await fetch(docUrl);
+      if (res.ok) {
+        const rawJson = await res.text();
+        const items = decodeTelegramDocumentIndex(rawJson);
+        return {
+          items,
+          pinnedMessageId: verification.pinnedMessageId,
+          hasIndex: true,
+          isCompleteIndex: true,
+          rawLength: rawJson.length,
+        };
+      }
+    } catch {
+      // Fall through to legacy text index if document download temporarily failed
+    }
+  }
+
   const rawText = verification.pinnedIndexText || '';
   const hasIndex = rawText.startsWith('TELEDRIVE_IDX_V1:');
   const items = decodeTelegramIndex(verification.pinnedIndexText);
@@ -627,6 +706,7 @@ export async function pullIndexFromTelegramPinnedMessage(
     items,
     pinnedMessageId: verification.pinnedMessageId,
     hasIndex,
+    isCompleteIndex: hasIndex && rawText.length < 3600,
     rawLength: rawText.length,
   };
 }

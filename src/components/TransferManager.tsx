@@ -6,6 +6,7 @@ import {
   ChevronUp,
   Clock,
   Download,
+  RotateCcw,
   Upload,
   X,
 } from 'lucide-react';
@@ -15,12 +16,16 @@ import { formatBytes, formatEta, formatSpeed } from '../utils/fileHelpers';
 interface TransferManagerProps {
   tasks: TransferTask[];
   onCancelTask: (id: string) => void;
+  onRetryTask?: (id: string) => void;
+  onRetryAllFailed?: () => void;
   onClearCompleted: () => void;
 }
 
 export function TransferManager({
   tasks,
   onCancelTask,
+  onRetryTask,
+  onRetryAllFailed,
   onClearCompleted,
 }: TransferManagerProps) {
   const [collapsed, setCollapsed] = useState(false);
@@ -31,29 +36,45 @@ export function TransferManager({
   const queuedCount = tasks.filter((t) => t.status === 'queued').length;
   const activeCount = activeRunningCount + queuedCount;
   const completedCount = tasks.filter((t) => t.status === 'completed').length;
+  const errorCount = tasks.filter((t) => t.status === 'error').length;
+  const retryableCount = tasks.filter((t) => t.status === 'error' && t.canRetry).length;
 
   return (
     <aside
       aria-label="Manajer transfer file"
       className="w-full overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900"
     >
-      <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-2.5 dark:border-slate-800 dark:bg-slate-800/80">
+      <div className="flex items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2.5 dark:border-slate-800 dark:bg-slate-800/80">
         <div className="min-w-0">
-          <p className="text-xs font-semibold text-slate-900 truncate dark:text-slate-100">
+          <p className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
             {activeCount > 0
               ? queuedCount > 0
                 ? `Memproses ${activeRunningCount} aktif · ${queuedCount} antrean`
-                : `Memproses ${activeRunningCount} transfer paralel`
-              : `${completedCount} transfer selesai`}
+                : `Memproses ${activeRunningCount} transfer`
+              : errorCount > 0
+                ? completedCount > 0
+                  ? `${completedCount} selesai · ${errorCount} gagal`
+                  : `${errorCount} transfer gagal`
+                : `${completedCount} transfer selesai`}
           </p>
         </div>
 
-        <div className="flex items-center gap-1">
-          {completedCount > 0 && activeCount === 0 && (
+        <div className="flex shrink-0 items-center gap-1">
+          {retryableCount > 0 && activeCount === 0 && onRetryAllFailed && (
+            <button
+              type="button"
+              onClick={onRetryAllFailed}
+              className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-semibold text-blue-600 hover:bg-blue-50 whitespace-nowrap dark:text-blue-400 dark:hover:bg-blue-950/50"
+            >
+              <RotateCcw className="h-3 w-3" />
+              <span>Coba Ulang ({retryableCount})</span>
+            </button>
+          )}
+          {(completedCount > 0 || errorCount > 0) && activeCount === 0 && (
             <button
               type="button"
               onClick={onClearCompleted}
-              className="rounded px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-700"
+              className="rounded px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-200/70 whitespace-nowrap dark:text-slate-300 dark:hover:bg-slate-700"
             >
               Bersihkan
             </button>
@@ -104,6 +125,16 @@ export function TransferManager({
                     </button>
                   ) : task.status === 'completed' ? (
                     <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                  ) : task.status === 'error' && task.canRetry && onRetryTask ? (
+                    <button
+                      type="button"
+                      onClick={() => onRetryTask(task.id)}
+                      aria-label={`Coba ulang unggahan ${task.filename}`}
+                      title="Coba ulang"
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950/60"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                    </button>
                   ) : (
                     <AlertCircle className="h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
                   )}
@@ -152,7 +183,7 @@ export function TransferManager({
                       </span>
                     </>
                   ) : (
-                    <span className="text-rose-600 dark:text-rose-400">
+                    <span className="truncate font-sans text-rose-600 dark:text-rose-400">
                       {task.errorMessage || 'Dibatalkan'}
                     </span>
                   )}

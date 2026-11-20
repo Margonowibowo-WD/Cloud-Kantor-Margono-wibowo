@@ -14,7 +14,61 @@ interface CompactDriveRecord {
   tr?: 1; // trashed
   u: string; // updatedAt
   fid?: string; // telegramFileId
+  uid?: string; // telegramUniqueId
   mid?: number; // telegramMessageId
+}
+
+interface TelegramDocumentIndexPayload {
+  v: 2;
+  updatedAt: string;
+  items: CompactDriveRecord[];
+}
+
+function toCompactRecord(item: DriveItem): CompactDriveRecord {
+  const rec: CompactDriveRecord = {
+    i: item.id,
+    n: item.name,
+    t: item.type === 'folder' ? 'd' : 'f',
+    p: item.parentId,
+    s: item.size,
+    m: item.mimeType,
+    u: item.updatedAt,
+  };
+  if (item.starred) rec.st = 1;
+  if (item.trashed) rec.tr = 1;
+  if (item.chunks[0]?.telegramFileId) rec.fid = item.chunks[0].telegramFileId;
+  if (item.chunks[0]?.telegramUniqueId) rec.uid = item.chunks[0].telegramUniqueId;
+  if (item.chunks[0]?.telegramMessageId) rec.mid = item.chunks[0].telegramMessageId;
+  return rec;
+}
+
+function fromCompactRecord(rec: CompactDriveRecord): DriveItem {
+  const isFolder = rec.t === 'd';
+  const hasTg = Boolean(rec.fid);
+  return {
+    id: rec.i,
+    name: rec.n,
+    type: isFolder ? 'folder' : 'file',
+    parentId: rec.p ?? null,
+    size: Number(rec.s) || 0,
+    mimeType: rec.m || (isFolder ? 'inode/directory' : 'application/octet-stream'),
+    starred: rec.st === 1,
+    trashed: rec.tr === 1,
+    createdAt: rec.u,
+    updatedAt: rec.u,
+    storageBackend: hasTg || isFolder ? 'telegram' : 'local',
+    chunks: hasTg
+      ? [
+          {
+            index: 0,
+            size: Number(rec.s) || 0,
+            telegramFileId: rec.fid,
+            telegramUniqueId: rec.uid,
+            telegramMessageId: rec.mid,
+          },
+        ]
+      : [],
+  };
 }
 
 export function encodeTelegramIndex(items: DriveItem[]): string {
@@ -29,20 +83,7 @@ export function encodeTelegramIndex(items: DriveItem[]): string {
 
   const packed: CompactDriveRecord[] = [];
   for (const item of sorted) {
-    const rec: CompactDriveRecord = {
-      i: item.id,
-      n: item.name,
-      t: item.type === 'folder' ? 'd' : 'f',
-      p: item.parentId,
-      s: item.size,
-      m: item.mimeType,
-      u: item.updatedAt,
-    };
-    if (item.starred) rec.st = 1;
-    if (item.trashed) rec.tr = 1;
-    if (item.chunks[0]?.telegramFileId) rec.fid = item.chunks[0].telegramFileId;
-    if (item.chunks[0]?.telegramMessageId) rec.mid = item.chunks[0].telegramMessageId;
-
+    const rec = toCompactRecord(item);
     const candidate = INDEX_HEADER + JSON.stringify([...packed, rec]);
     if (candidate.length > MAX_TELEGRAM_TEXT_LENGTH) {
       break;
@@ -60,33 +101,33 @@ export function decodeTelegramIndex(text: string | undefined | null): DriveItem[
   try {
     const raw = JSON.parse(text.slice(INDEX_HEADER.length)) as CompactDriveRecord[];
     if (!Array.isArray(raw)) return [];
-    return raw.map((rec) => {
-      const isFolder = rec.t === 'd';
-      const hasTg = Boolean(rec.fid);
-      return {
-        id: rec.i,
-        name: rec.n,
-        type: isFolder ? 'folder' : 'file',
-        parentId: rec.p ?? null,
-        size: Number(rec.s) || 0,
-        mimeType: rec.m || (isFolder ? 'inode/directory' : 'application/octet-stream'),
-        starred: rec.st === 1,
-        trashed: rec.tr === 1,
-        createdAt: rec.u,
-        updatedAt: rec.u,
-        storageBackend: hasTg || isFolder ? 'telegram' : 'local',
-        chunks: hasTg
-          ? [
-              {
-                index: 0,
-                size: Number(rec.s) || 0,
-                telegramFileId: rec.fid,
-                telegramMessageId: rec.mid,
-              },
-            ]
-          : [],
-      };
-    });
+    return raw.map(fromCompactRecord);
+  } catch {
+    return [];
+  }
+}
+
+export function encodeTelegramDocumentIndex(items: DriveItem[]): string {
+  const payload: TelegramDocumentIndexPayload = {
+    v: 2,
+    updatedAt: new Date().toISOString(),
+    items: items.map(toCompactRecord),
+  };
+  return JSON.stringify(payload);
+}
+
+export function decodeTelegramDocumentIndex(raw: string | undefined | null): DriveItem[] {
+  if (!raw) return [];
+  const trimmed = raw.trim();
+  if (trimmed.startsWith(INDEX_HEADER)) {
+    return decodeTelegramIndex(trimmed);
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as Partial<TelegramDocumentIndexPayload>;
+    if (parsed && parsed.v === 2 && Array.isArray(parsed.items)) {
+      return parsed.items.map(fromCompactRecord);
+    }
+    return [];
   } catch {
     return [];
   }

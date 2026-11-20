@@ -191,6 +191,11 @@ export default function App() {
   >([]);
   const activeUploadCountRef = useRef(0);
   const batchSuccessCountRef = useRef(0);
+  const batchStartedCountRef = useRef(0);
+  const batchPacingTimerRef = useRef<number | null>(null);
+  const failedUploadJobsRef = useRef<
+    Map<string, { file: File; targetParent: string | null; isBatch: boolean }>
+  >(new Map());
   const didAutoSyncRef = useRef(false);
   const lastSyncMsRef = useRef(0);
   const lastSelectedIdRef = useRef<string | null>(null);
@@ -219,16 +224,23 @@ export default function App() {
   );
 
   const [cloudPushTick, setCloudPushTick] = useState(0);
+  const pinnedIndexIdRef = useRef<number | undefined>(tgConfig.pinnedIndexMessageId);
+  pinnedIndexIdRef.current = tgConfig.pinnedIndexMessageId;
 
   // Persist items cleanly & push index to Telegram pinned message outside React state updaters
-  const commitItems = useCallback((updater: (prev: DriveItem[]) => DriveItem[]) => {
-    setItems((prev) => {
-      const next = updater(prev);
-      saveStoredItems(next);
-      return next;
-    });
-    setCloudPushTick((t) => t + 1);
-  }, []);
+  const commitItems = useCallback(
+    (updater: (prev: DriveItem[]) => DriveItem[], options?: { deferIndexPush?: boolean }) => {
+      setItems((prev) => {
+        const next = updater(prev);
+        saveStoredItems(next);
+        return next;
+      });
+      if (!options?.deferIndexPush) {
+        setCloudPushTick((t) => t + 1);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (cloudPushTick === 0) return;
@@ -236,13 +248,15 @@ export default function App() {
 
     let active = true;
     const timer = window.setTimeout(() => {
+      const currentPinId = pinnedIndexIdRef.current;
       void pushIndexToTelegramPinnedMessage(
         tgConfig.botToken,
         tgConfig.chatId,
         itemsRef.current,
-        tgConfig.pinnedIndexMessageId,
+        currentPinId,
       ).then((pinId) => {
-        if (active && pinId && pinId !== tgConfig.pinnedIndexMessageId) {
+        if (active && pinId && pinId !== pinnedIndexIdRef.current) {
+          pinnedIndexIdRef.current = pinId;
           setTgConfig((curr) => {
             const updatedCfg = { ...curr, pinnedIndexMessageId: pinId };
             saveStoredTelegramConfig(updatedCfg);
@@ -256,7 +270,7 @@ export default function App() {
       active = false;
       window.clearTimeout(timer);
     };
-  }, [cloudPushTick, tgConfig.connected, tgConfig.botToken, tgConfig.chatId, tgConfig.pinnedIndexMessageId]);
+  }, [cloudPushTick, tgConfig.connected, tgConfig.botToken, tgConfig.chatId]);
 
   // Two-way sync: pull Pinned Index, import new channel uploads, and prune messages deleted in Telegram
   const syncFromTelegram = useCallback(
@@ -320,7 +334,7 @@ export default function App() {
             addDismissedTelegramMessageIds(deletedInTelegramMsgIds);
           }
 
-          const isCompleteAuthoritativeIndex = res.hasIndex && res.rawLength < 3600;
+          const isCompleteAuthoritativeIndex = res.isCompleteIndex;
           const pinnedWithoutDeleted = res.items.filter((i) => !deletedInTelegramItemIds.has(i.id));
           let nextPinnedId = res.pinnedMessageId ?? tgConfig.pinnedIndexMessageId;
 
@@ -636,11 +650,7 @@ export default function App() {
 
   const updateTransferTask = useCallback((id: string, patch: Partial<TransferTask>) => {
     setTransfers((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
-    if (
-      patch.status === 'completed' ||
-      patch.status === 'error' ||
-      patch.status === 'cancelled'
-    ) {
+    if (patch.status === 'completed' || patch.status === 'cancelled') {
       const existingTimer = transferRemovalTimers.current.get(id);
       if (existingTimer) window.clearTimeout(existingTimer);
       const timer = window.setTimeout(() => {
@@ -667,7 +677,12 @@ export default function App() {
       if (!nextJob) break;
 
       activeUploadCountRef.current += 1;
-      updateTransferTask(nextJob.taskId, { status: 'active' });
+      batchStartedCountRef.current += 1;
+      updateTransferTask(nextJob.taskId, {
+        status: 'active',
+        errorMessage: undefined,
+        canRetry: false,
+      });
 
       const ctrl = startDirectUpload(
         nextJob.file,
@@ -682,10 +697,19 @@ export default function App() {
       ctrl.promise
         .then((createdItem) => {
           transferCancelMap.current.delete(nextJob.taskId);
-          commitItems((prev) => [createdItem, ...prev.filter((i) => i.id !== createdItem.id)]);
+          failedUploadJobsRef.current.delete(nextJob.taskId);
+          const hasMoreQueued = uploadQueueRef.current.length > 0;
           if (nextJob.isBatch) {
             batchSuccessCountRef.current += 1;
-          } else {
+          }
+          // Defer pinned index updates while batch queue has remaining items (checkpoint every 15 files)
+          const shouldCheckpoint =
+            !hasMoreQueued || (nextJob.isBatch && batchSuccessCountRef.current % 15 === 0);
+          commitItems(
+            (prev) => [createdItem, ...prev.filter((i) => i.id !== createdItem.id)],
+            { deferIndexPush: !shouldCheckpoint },
+          );
+          if (!nextJob.isBatch) {
             pushNotification({
               kind: 'success',
               title: `Unggahan selesai: ${createdItem.name}`,
@@ -696,11 +720,20 @@ export default function App() {
         .catch((err) => {
           transferCancelMap.current.delete(nextJob.taskId);
           const msg = err instanceof Error ? err.message : 'Unggahan gagal.';
+          const canRetry = msg !== 'Dibatalkan';
+          if (canRetry) {
+            failedUploadJobsRef.current.set(nextJob.taskId, {
+              file: nextJob.file,
+              targetParent: nextJob.targetParent,
+              isBatch: nextJob.isBatch,
+            });
+          }
           updateTransferTask(nextJob.taskId, {
-            status: msg === 'Dibatalkan' ? 'cancelled' : 'error',
+            status: canRetry ? 'error' : 'cancelled',
             errorMessage: msg,
+            canRetry,
           });
-          if (msg !== 'Dibatalkan') {
+          if (canRetry) {
             pushNotification({
               kind: 'error',
               title: `Gagal mengunggah ${nextJob.file.name}`,
@@ -710,24 +743,89 @@ export default function App() {
         })
         .finally(() => {
           activeUploadCountRef.current = Math.max(0, activeUploadCountRef.current - 1);
-          if (
-            nextJob.isBatch &&
-            activeUploadCountRef.current === 0 &&
-            uploadQueueRef.current.length === 0 &&
-            batchSuccessCountRef.current > 0
-          ) {
+          const queueEmpty =
+            activeUploadCountRef.current === 0 && uploadQueueRef.current.length === 0;
+          if (queueEmpty) {
             const count = batchSuccessCountRef.current;
             batchSuccessCountRef.current = 0;
-            pushNotification({
-              kind: 'success',
-              title: `${count} file selesai diunggah`,
-              detail: 'Semua file tersimpan di Cloud Telegram & tersinkron.',
-            });
+            batchStartedCountRef.current = 0;
+            if (nextJob.isBatch && count > 0) {
+              // Ensure final index push runs once at batch completion
+              setCloudPushTick((t) => t + 1);
+              pushNotification({
+                kind: 'success',
+                title: `${count} file selesai diunggah`,
+                detail: 'Semua file tersimpan di Cloud Telegram & indeks tersinkron.',
+              });
+            }
+            return;
           }
-          pumpUploadQueue();
+
+          // Gentle pacing after 5 consecutive files to stay under Telegram channel flood limits
+          const needsPacing = nextJob.isBatch && batchStartedCountRef.current >= 5;
+          if (needsPacing) {
+            if (batchPacingTimerRef.current) {
+              window.clearTimeout(batchPacingTimerRef.current);
+            }
+            batchPacingTimerRef.current = window.setTimeout(() => {
+              batchPacingTimerRef.current = null;
+              pumpUploadQueue();
+            }, 1100);
+          } else {
+            pumpUploadQueue();
+          }
         });
     }
   }, [commitItems, pushNotification, updateTransferTask]);
+
+  const handleRetryFailedTasks = useCallback(
+    (taskIds: string[]) => {
+      if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
+        setVaultModalOpen(true);
+        return;
+      }
+
+      let requeuedCount = 0;
+      for (const taskId of taskIds) {
+        const failed = failedUploadJobsRef.current.get(taskId);
+        if (!failed) continue;
+        failedUploadJobsRef.current.delete(taskId);
+
+        const existingTimer = transferRemovalTimers.current.get(taskId);
+        if (existingTimer) {
+          window.clearTimeout(existingTimer);
+          transferRemovalTimers.current.delete(taskId);
+        }
+
+        updateTransferTask(taskId, {
+          status: 'queued',
+          loadedBytes: 0,
+          speedBytesPerSec: 0,
+          etaSeconds: 0,
+          errorMessage: undefined,
+          canRetry: false,
+        });
+
+        uploadQueueRef.current.push({
+          taskId,
+          file: failed.file,
+          targetParent: failed.targetParent,
+          tgSnapshot: tgConfig,
+          isBatch: taskIds.length > 1 || failed.isBatch,
+        });
+
+        transferCancelMap.current.set(taskId, () => {
+          uploadQueueRef.current = uploadQueueRef.current.filter((job) => job.taskId !== taskId);
+        });
+        requeuedCount += 1;
+      }
+
+      if (requeuedCount > 0) {
+        pumpUploadQueue();
+      }
+    },
+    [tgConfig, updateTransferTask, pumpUploadQueue],
+  );
 
   const enqueueTreeUpload = useCallback(
     (tree: DroppedTreeResult, overrideParentId?: string | null) => {
@@ -827,7 +925,7 @@ export default function App() {
         pushNotification({
           kind: 'info',
           title: `Mengantrekan ${folderNote}${uploadableEntries.length} file ke ${destLabel}`,
-          detail: `Diproses ${UPLOAD_CONCURRENCY} file paralel dengan auto-retry anti-limit Telegram.`,
+          detail: 'Diproses satu per satu sampai selesai agar upload cepat & koneksi tetap stabil.',
         });
       }
 
@@ -862,7 +960,7 @@ export default function App() {
         });
       }
 
-      setTransfers((prev) => [...createdTasks.reverse(), ...prev].slice(0, 200));
+      setTransfers((prev) => [...createdTasks, ...prev].slice(0, 200));
       pumpUploadQueue();
     },
     [commitItems, currentFolderId, section, tgConfig, pumpUploadQueue, pushNotification],
@@ -1676,9 +1774,22 @@ export default function App() {
         onDismissNotification={dismissNotification}
         tasks={transfers}
         onCancelTask={handleCancelTransfer}
-        onClearCompletedTasks={() =>
-          setTransfers((prev) => prev.filter((t) => t.status === 'active' || t.status === 'queued'))
+        onRetryTask={(taskId) => handleRetryFailedTasks([taskId])}
+        onRetryAllFailed={() =>
+          handleRetryFailedTasks(
+            transfers.filter((t) => t.status === 'error' && t.canRetry).map((t) => t.id),
+          )
         }
+        onClearCompletedTasks={() => {
+          setTransfers((prev) => {
+            for (const t of prev) {
+              if (t.status !== 'active' && t.status !== 'queued') {
+                failedUploadJobsRef.current.delete(t.id);
+              }
+            }
+            return prev.filter((t) => t.status === 'active' || t.status === 'queued');
+          });
+        }}
       />
 
       {/* Modals */}

@@ -106,6 +106,7 @@ export interface TransferTask {
   totalChunks: number;
   status: 'queued' | 'active' | 'completed' | 'error' | 'cancelled';
   errorMessage?: string;
+  canRetry?: boolean;
   targetBackend?: StorageBackend;
   createdAt: number;
 }
