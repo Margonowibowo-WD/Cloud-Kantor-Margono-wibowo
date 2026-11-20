@@ -1,8 +1,14 @@
 import type { DriveItem, TelegramConfigState, TelegramPublicStatus } from '../types/drive';
 import {
-  decodeTelegramDocumentIndex,
+  INDEX_SHARD_V3_HEADER,
+  INDEX_V3_HEADER,
+  type TelegramShardRef,
+  buildTelegramV3Plan,
   decodeTelegramIndex,
-  encodeTelegramDocumentIndex,
+  decodeTelegramV3Manifest,
+  decodeTelegramV3Shard,
+  encodeTelegramV3ManifestText,
+  reconcileConcurrentDriveState,
 } from './telegramIndex';
 
 export const DIRECT_TELEGRAM_MAX_BYTES = 20 * 1024 * 1024; // 20 MB Telegram getFile limit
@@ -75,7 +81,7 @@ export async function verifyTelegramDirect(
   }
 
   try {
-    const meRes = await fetch(tgApi(token, 'getMe'));
+    const meRes = await fetch(tgApi(token, 'getMe'), { method: 'POST' });
     const meData = (await meRes.json()) as {
       ok: boolean;
       description?: string;
@@ -94,9 +100,10 @@ export async function verifyTelegramDirect(
 
     const trimmedChat = chatId?.trim();
     if (trimmedChat) {
-      const chatRes = await fetch(
-        `${tgApi(token, 'getChat')}?chat_id=${encodeURIComponent(trimmedChat)}`,
-      );
+      const chatRes = await fetch(tgApi(token, 'getChat'), {
+        method: 'POST',
+        body: new URLSearchParams({ chat_id: trimmedChat }),
+      });
       const chatData = (await chatRes.json()) as {
         ok: boolean;
         description?: string;
@@ -165,7 +172,10 @@ export async function detectTelegramChatsDirect(botToken: string): Promise<{
   }
 
   try {
-    const res = await fetch(`${tgApi(token, 'getUpdates')}?limit=50`);
+    const res = await fetch(tgApi(token, 'getUpdates'), {
+      method: 'POST',
+      body: new URLSearchParams({ limit: '50' }),
+    });
     const data = (await res.json()) as {
       ok: boolean;
       description?: string;
@@ -324,7 +334,10 @@ export async function resolveTelegramFileUrl(botToken: string, fileId: string): 
     return cached.url;
   }
 
-  const res = await fetch(`${tgApi(botToken, 'getFile')}?file_id=${encodeURIComponent(fileId)}`);
+  const res = await fetch(tgApi(botToken, 'getFile'), {
+    method: 'POST',
+    body: new URLSearchParams({ file_id: fileId }),
+  });
   const data = (await res.json()) as {
     ok: boolean;
     description?: string;
@@ -408,81 +421,215 @@ export async function checkTelegramMessageExists(
   }
 }
 
+export interface PushIndexResult {
+  pinnedMessageId?: number;
+  syncedItems: DriveItem[];
+  syncedTombstones: Record<string, string>;
+}
+
+const shardReadCache = new Map<string, DriveItem[]>();
+
+async function postBotTextMessage(
+  botToken: string,
+  chatId: string,
+  text: string,
+): Promise<number | undefined> {
+  try {
+    const res = await fetch(tgApi(botToken, 'sendMessage'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId.trim(),
+        text,
+        disable_notification: true,
+      }),
+    });
+    const data = (await res.json()) as { ok: boolean; result?: { message_id: number } };
+    return data.ok && data.result ? data.result.message_id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function editBotTextMessage(
+  botToken: string,
+  chatId: string,
+  messageId: number,
+  text: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(tgApi(botToken, 'editMessageText'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId.trim(),
+        message_id: messageId,
+        text,
+      }),
+    });
+    const data = (await res.json()) as { ok: boolean; description?: string };
+    return Boolean(data.ok || data.description?.includes('message is not modified'));
+  } catch {
+    return false;
+  }
+}
+
+async function readBotTextMessageById(
+  botToken: string,
+  chatId: string,
+  messageId: number,
+): Promise<string | null> {
+  try {
+    const res = await fetch(tgApi(botToken, 'forwardMessage'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId.trim(),
+        from_chat_id: chatId.trim(),
+        message_id: messageId,
+        disable_notification: true,
+      }),
+    });
+    const data = (await res.json()) as {
+      ok: boolean;
+      result?: { message_id: number; text?: string };
+    };
+    if (!data.ok || !data.result) return null;
+    const text = data.result.text || null;
+    if (data.result.message_id && data.result.message_id !== messageId) {
+      void deleteTelegramMessageDirect(botToken, chatId, data.result.message_id);
+    }
+    return text;
+  } catch {
+    return null;
+  }
+}
+
 export async function pushIndexToTelegramPinnedMessage(
   botToken: string,
   chatId: string,
   items: DriveItem[],
   existingMessageId?: number,
-): Promise<number | undefined> {
-  const jsonText = encodeTelegramDocumentIndex(items);
-  const blob = new Blob([jsonText], { type: 'application/json' });
-  const caption = `${INDEX_DOCUMENT_CAPTION_PREFIX}${items.length} item`;
+  tombstones: Record<string, string> = {},
+  options?: { skipMergePull?: boolean },
+): Promise<PushIndexResult | undefined> {
+  let mergedItems = items;
+  let mergedTombstones = tombstones;
+  let targetMessageId = existingMessageId;
+  let existingPinnedText: string | undefined;
+  let existingShardRefs: TelegramShardRef[] = [];
 
-  if (existingMessageId) {
-    try {
-      const form = new FormData();
-      form.append('chat_id', chatId.trim());
-      form.append('message_id', String(existingMessageId));
-      form.append(
-        'media',
-        JSON.stringify({
-          type: 'document',
-          media: 'attach://index_file',
-          caption,
-        }),
-      );
-      form.append('index_file', blob, INDEX_DOCUMENT_FILENAME);
-
-      const editRes = await fetch(tgApi(botToken, 'editMessageMedia'), {
-        method: 'POST',
-        body: form,
-      });
-      const editData = (await editRes.json()) as { ok: boolean; description?: string };
-      if (editData.ok || editData.description?.includes('message is not modified')) {
-        return existingMessageId;
+  if (!options?.skipMergePull) {
+    const remote = await pullIndexFromTelegramPinnedMessage(botToken, chatId);
+    if (!remote.error) {
+      if (remote.pinnedMessageId) {
+        targetMessageId = remote.pinnedMessageId;
       }
-    } catch {
-      // Fall through to send + pin a fresh document index message (e.g. migrating from legacy v1 text index)
+      existingPinnedText = remote.rawPinnedText;
+      existingShardRefs = remote.shardRefs || [];
+      if (remote.hasIndex) {
+        const reconciled = reconcileConcurrentDriveState(
+          items,
+          remote.items,
+          [],
+          tombstones,
+          remote.tombstones,
+        );
+        mergedItems = reconciled.items;
+        mergedTombstones = reconciled.tombstones;
+      }
     }
   }
 
-  try {
-    const form = new FormData();
-    form.append('chat_id', chatId.trim());
-    form.append('caption', caption);
-    form.append('disable_notification', 'true');
-    form.append('document', blob, INDEX_DOCUMENT_FILENAME);
+  const plan = await buildTelegramV3Plan(mergedItems, mergedTombstones);
+  const nextShardRefs: TelegramShardRef[] = [];
+  const reusedShardIds = new Set<number>();
 
-    const sendRes = await fetch(tgApi(botToken, 'sendDocument'), {
-      method: 'POST',
-      body: form,
-    });
-    const sendData = (await sendRes.json()) as {
-      ok: boolean;
-      result?: { message_id: number };
+  for (let idx = 0; idx < plan.shardBatches.length; idx += 1) {
+    const batch = plan.shardBatches[idx];
+    const prevRef = existingShardRefs[idx];
+    if (prevRef && prevRef.h === batch.hash) {
+      nextShardRefs.push(prevRef);
+      reusedShardIds.add(prevRef.id);
+      continue;
+    }
+    if (prevRef) {
+      const edited = await editBotTextMessage(botToken, chatId, prevRef.id, batch.text);
+      if (edited) {
+        nextShardRefs.push({ id: prevRef.id, h: batch.hash });
+        reusedShardIds.add(prevRef.id);
+        shardReadCache.set(`${chatId.trim()}:${prevRef.id}:${batch.hash}`, batch.items);
+        continue;
+      }
+    }
+    const createdShardId = await postBotTextMessage(botToken, chatId, batch.text);
+    if (createdShardId) {
+      nextShardRefs.push({ id: createdShardId, h: batch.hash });
+      reusedShardIds.add(createdShardId);
+      shardReadCache.set(`${chatId.trim()}:${createdShardId}:${batch.hash}`, batch.items);
+    }
+  }
+
+  // Delete obsolete overflow shard messages
+  for (const oldRef of existingShardRefs) {
+    if (!reusedShardIds.has(oldRef.id)) {
+      void deleteTelegramMessageDirect(botToken, chatId, oldRef.id);
+    }
+  }
+
+  const { text: manifestText } = await encodeTelegramV3ManifestText(
+    plan.inlineItems,
+    plan.cleanedTombstones,
+    nextShardRefs,
+  );
+
+  // If the existing pinned message is already a text message, edit it cleanly in place
+  const canEditExistingText =
+    Boolean(targetMessageId) &&
+    (existingPinnedText === undefined ||
+      existingPinnedText.startsWith(INDEX_V3_HEADER) ||
+      existingPinnedText.startsWith('TELEDRIVE_IDX_V1:'));
+
+  if (targetMessageId && canEditExistingText) {
+    const edited = await editBotTextMessage(botToken, chatId, targetMessageId, manifestText);
+    if (edited) {
+      return {
+        pinnedMessageId: targetMessageId,
+        syncedItems: mergedItems,
+        syncedTombstones: mergedTombstones,
+      };
+    }
+  }
+
+  // Otherwise create a fresh pinned text manifest (e.g. migrating off legacy teledrive-index.json document)
+  const newMsgId = await postBotTextMessage(botToken, chatId, manifestText);
+  if (!newMsgId) {
+    return {
+      pinnedMessageId: targetMessageId,
+      syncedItems: mergedItems,
+      syncedTombstones: mergedTombstones,
     };
-    if (!sendData.ok || !sendData.result) return existingMessageId;
-
-    const newMsgId = sendData.result.message_id;
-    await fetch(tgApi(botToken, 'pinChatMessage'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId.trim(),
-        message_id: newMsgId,
-        disable_notification: true,
-      }),
-    }).catch(() => undefined);
-
-    // Clean up old replaced index message if migrating or recreating
-    if (existingMessageId && existingMessageId !== newMsgId) {
-      void deleteTelegramMessageDirect(botToken, chatId, existingMessageId);
-    }
-
-    return newMsgId;
-  } catch {
-    return existingMessageId;
   }
+
+  await fetch(tgApi(botToken, 'pinChatMessage'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId.trim(),
+      message_id: newMsgId,
+      disable_notification: true,
+    }),
+  }).catch(() => undefined);
+
+  if (targetMessageId && targetMessageId !== newMsgId) {
+    void deleteTelegramMessageDirect(botToken, chatId, targetMessageId);
+  }
+
+  return {
+    pinnedMessageId: newMsgId,
+    syncedItems: mergedItems,
+    syncedTombstones: mergedTombstones,
+  };
 }
 
 export function buildTelegramMessageLink(
@@ -520,7 +667,10 @@ export async function fetchChannelMediaUpdates(
   if (!token || !targetChat) return [];
 
   try {
-    const res = await fetch(`${tgApi(token, 'getUpdates')}?limit=100`);
+    const res = await fetch(tgApi(token, 'getUpdates'), {
+      method: 'POST',
+      body: new URLSearchParams({ limit: '100' }),
+    });
     const data = (await res.json()) as {
       ok: boolean;
       result?: Array<{ channel_post?: TgChannelPostFile; message?: TgChannelPostFile }>;
@@ -533,7 +683,13 @@ export async function fetchChannelMediaUpdates(
       const post = u.channel_post || u.message;
       if (!post || !post.chat) continue;
       if (String(post.chat.id) !== targetChat) continue;
-      if (post.text?.startsWith('TELEDRIVE_IDX_V1:')) continue;
+      if (
+        post.text?.startsWith('TELEDRIVE_IDX_V1:') ||
+        post.text?.startsWith(INDEX_V3_HEADER) ||
+        post.text?.startsWith(INDEX_SHARD_V3_HEADER)
+      ) {
+        continue;
+      }
       if (
         post.caption?.startsWith(INDEX_DOCUMENT_CAPTION_PREFIX) ||
         post.document?.file_name === INDEX_DOCUMENT_FILENAME
@@ -652,7 +808,10 @@ export async function pullIndexFromTelegramPinnedMessage(
   chatId: string,
 ): Promise<{
   items: DriveItem[];
+  tombstones: Record<string, string>;
   pinnedMessageId?: number;
+  rawPinnedText?: string;
+  shardRefs?: TelegramShardRef[];
   hasIndex: boolean;
   isCompleteIndex: boolean;
   rawLength: number;
@@ -662,6 +821,7 @@ export async function pullIndexFromTelegramPinnedMessage(
   if (!verification.ok) {
     return {
       items: [],
+      tombstones: {},
       hasIndex: false,
       isCompleteIndex: false,
       rawLength: 0,
@@ -669,44 +829,91 @@ export async function pullIndexFromTelegramPinnedMessage(
     };
   }
 
-  // Prefer unlimited v2 JSON document pinned index
-  const isV2Doc =
-    Boolean(verification.pinnedIndexDocumentFileId) &&
-    (verification.pinnedIndexCaption?.startsWith(INDEX_DOCUMENT_CAPTION_PREFIX) ||
-      verification.pinnedIndexDocumentName === INDEX_DOCUMENT_FILENAME ||
-      !verification.pinnedIndexText);
+  let candidateText = verification.pinnedIndexText;
+  let candidateMessageId = verification.pinnedMessageId;
+  const resolvedChatId = (verification.chatId || chatId).trim();
 
-  if (isV2Doc && verification.pinnedIndexDocumentFileId) {
+  // If pinned message is not yet a V3/V1 text manifest, check recent channel updates as fallback
+  const hasPinnedTextManifest = Boolean(
+    candidateText &&
+      (candidateText.startsWith(INDEX_V3_HEADER) || candidateText.startsWith('TELEDRIVE_IDX_V1:')),
+  );
+
+  if (!hasPinnedTextManifest) {
     try {
-      const docUrl = await resolveTelegramFileUrl(
-        botToken,
-        verification.pinnedIndexDocumentFileId,
-      );
-      const res = await fetch(docUrl);
-      if (res.ok) {
-        const rawJson = await res.text();
-        const items = decodeTelegramDocumentIndex(rawJson);
-        return {
-          items,
-          pinnedMessageId: verification.pinnedMessageId,
-          hasIndex: true,
-          isCompleteIndex: true,
-          rawLength: rawJson.length,
-        };
+      const updRes = await fetch(tgApi(botToken, 'getUpdates'), {
+        method: 'POST',
+        body: new URLSearchParams({ limit: '100' }),
+      });
+      const updData = (await updRes.json()) as {
+        ok: boolean;
+        result?: Array<{
+          channel_post?: TgChannelPostFile;
+          edited_channel_post?: TgChannelPostFile;
+          message?: TgChannelPostFile;
+          edited_message?: TgChannelPostFile;
+        }>;
+      };
+      if (updData.ok && Array.isArray(updData.result)) {
+        for (const u of updData.result) {
+          const post =
+            u.edited_channel_post || u.channel_post || u.edited_message || u.message;
+          if (!post?.chat || String(post.chat.id) !== resolvedChatId) continue;
+          if (post.text?.startsWith(INDEX_V3_HEADER)) {
+            if (!candidateMessageId || !hasPinnedTextManifest || post.message_id >= candidateMessageId) {
+              candidateText = post.text;
+              candidateMessageId = post.message_id;
+            }
+          }
+        }
       }
     } catch {
-      // Fall through to legacy text index if document download temporarily failed
+      // ignore fallback error
     }
   }
 
-  const rawText = verification.pinnedIndexText || '';
-  const hasIndex = rawText.startsWith('TELEDRIVE_IDX_V1:');
-  const items = decodeTelegramIndex(verification.pinnedIndexText);
+  if (candidateText?.startsWith(INDEX_V3_HEADER)) {
+    const manifest = await decodeTelegramV3Manifest(candidateText);
+    if (manifest.isV3) {
+      const shardItems: DriveItem[] = [];
+      for (const ref of manifest.shards) {
+        const cacheKey = `${resolvedChatId}:${ref.id}:${ref.h}`;
+        const cached = shardReadCache.get(cacheKey);
+        if (cached) {
+          shardItems.push(...cached);
+          continue;
+        }
+        const rawShard = await readBotTextMessageById(botToken, resolvedChatId, ref.id);
+        if (rawShard) {
+          const decodedShard = await decodeTelegramV3Shard(rawShard);
+          shardReadCache.set(cacheKey, decodedShard);
+          shardItems.push(...decodedShard);
+        }
+      }
+
+      return {
+        items: [...manifest.items, ...shardItems],
+        tombstones: manifest.tombstones,
+        pinnedMessageId: candidateMessageId,
+        rawPinnedText: candidateText,
+        shardRefs: manifest.shards,
+        hasIndex: true,
+        isCompleteIndex: true,
+        rawLength: candidateText.length,
+      };
+    }
+  }
+
+  const rawText = candidateText || '';
+  const hasV1 = rawText.startsWith('TELEDRIVE_IDX_V1:');
+  const items = decodeTelegramIndex(rawText);
   return {
     items,
-    pinnedMessageId: verification.pinnedMessageId,
-    hasIndex,
-    isCompleteIndex: hasIndex && rawText.length < 3600,
+    tombstones: {},
+    pinnedMessageId: candidateMessageId,
+    rawPinnedText: rawText || undefined,
+    hasIndex: hasV1,
+    isCompleteIndex: hasV1 && rawText.length < 3600,
     rawLength: rawText.length,
   };
 }

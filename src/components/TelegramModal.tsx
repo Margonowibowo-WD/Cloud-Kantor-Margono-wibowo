@@ -48,7 +48,6 @@ export function TelegramModal({
   const [autoSync, setAutoSync] = useState(config.autoSync ?? true);
   const [showToken, setShowToken] = useState(false);
 
-  const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [pulling, setPulling] = useState(false);
@@ -101,23 +100,6 @@ export function TelegramModal({
         text: `Ditemukan ${res.chats.length} chat/channel. Dipilih otomatis: ${res.chats[0].title}`,
       });
     }
-  };
-
-  const handleTest = async () => {
-    setTesting(true);
-    setFeedback(null);
-    const res = await verifyTelegramDirect(activeToken, chatId);
-    setTesting(false);
-
-    if (!res.ok) {
-      setFeedback({ kind: 'error', text: res.error || 'Koneksi Telegram gagal.' });
-      return;
-    }
-
-    setFeedback({
-      kind: 'success',
-      text: `Bot @${res.botUsername} aktif${res.chatTitle ? ` dan terhubung ke "${res.chatTitle}"` : ''}.`,
-    });
   };
 
   const handlePullIndex = async () => {
@@ -549,15 +531,6 @@ export function TelegramModal({
                   <span>Putuskan</span>
                 </button>
               )}
-              <button
-                type="button"
-                onClick={handleTest}
-                disabled={testing || saving}
-                className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-              >
-                {testing && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                <span>Uji Koneksi</span>
-              </button>
               <button
                 type="button"
                 onClick={handlePullIndex}

@@ -3,6 +3,7 @@ import type { DriveItem, TelegramConfigState } from '../types/drive';
 const ITEMS_KEY = 'teledrive_items_v2';
 const TG_CONFIG_KEY = 'teledrive_tg_config_v2';
 const DISMISSED_TG_MSGS_KEY = 'teledrive_dismissed_tg_msgs_v1';
+const TOMBSTONES_KEY = 'teledrive_tombstones_v1';
 const IDB_NAME = 'TeleDriveBlobVault';
 const IDB_STORE = 'blobs';
 
@@ -228,6 +229,46 @@ export function addDismissedTelegramMessageIds(messageIds: number[]): void {
   } catch {
     // ignore
   }
+}
+
+export function loadDeletedTombstones(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(TOMBSTONES_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object') return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof k === 'string' && typeof v === 'string') {
+        out[k] = v;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function saveDeletedTombstones(tombstones: Record<string, string>): void {
+  try {
+    const entries = Object.entries(tombstones);
+    entries.sort(([, a], [, b]) => Date.parse(b) - Date.parse(a));
+    localStorage.setItem(TOMBSTONES_KEY, JSON.stringify(Object.fromEntries(entries.slice(0, 500))));
+  } catch {
+    // ignore
+  }
+}
+
+export function addDeletedTombstones(
+  ids: string[],
+  deletedAtIso = new Date().toISOString(),
+): Record<string, string> {
+  const current = loadDeletedTombstones();
+  for (const id of ids) {
+    if (id) current[id] = deletedAtIso;
+  }
+  saveDeletedTombstones(current);
+  return current;
 }
 
 export function loadStoredTelegramConfig(): TelegramConfigState {

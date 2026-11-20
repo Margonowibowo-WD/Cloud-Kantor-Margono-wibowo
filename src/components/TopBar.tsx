@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  AlertCircle,
+  CheckCircle2,
   KeyRound,
   LayoutGrid,
   List,
@@ -17,6 +19,7 @@ import {
 import type { TelegramPublicStatus, ViewMode } from '../types/drive';
 
 export type ThemeMode = 'auto' | 'light' | 'dark';
+export type CloudSyncState = 'syncing' | 'synced' | 'error' | 'disconnected';
 
 interface TopBarProps {
   searchQuery: string;
@@ -31,6 +34,7 @@ interface TopBarProps {
   searchInputRef?: React.RefObject<HTMLInputElement | null>;
   telegram: TelegramPublicStatus;
   syncingTelegram?: boolean;
+  syncState?: CloudSyncState;
   vaultAvailable?: boolean;
   onSyncNow: () => void;
   onOpenTelegramModal: () => void;
@@ -50,6 +54,7 @@ export function TopBar({
   searchInputRef,
   telegram,
   syncingTelegram = false,
+  syncState,
   vaultAvailable = false,
   onSyncNow,
   onOpenTelegramModal,
@@ -69,6 +74,29 @@ export function TopBar({
     document.addEventListener('mousedown', handleOutside);
     return () => document.removeEventListener('mousedown', handleOutside);
   }, []);
+
+  const effectiveSyncState: CloudSyncState =
+    syncState ||
+    (syncingTelegram ? 'syncing' : telegram.connected ? 'synced' : 'disconnected');
+
+  const lastSyncedLabel = telegram.lastCheckedAt
+    ? new Date(telegram.lastCheckedAt).toLocaleTimeString('id-ID', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      })
+    : null;
+
+  const syncTitle =
+    effectiveSyncState === 'syncing'
+      ? 'Sedang menyinkronkan dengan Cloud Telegram...'
+      : effectiveSyncState === 'synced'
+        ? `Tersinkron permanen (${telegram.botUsername ? `@${telegram.botUsername}` : 'Cloud Telegram'})${
+            lastSyncedLabel ? ` · Terakhir: ${lastSyncedLabel}` : ''
+          }. Klik untuk sinkronkan sekarang.`
+        : effectiveSyncState === 'error'
+          ? 'Sinkronisasi tertunda. Klik untuk sinkronkan ulang sekarang.'
+          : 'Menghubungkan sinkronisasi Cloud...';
 
   return (
     <header className="flex h-16 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 sm:gap-4 sm:px-6 dark:border-slate-800 dark:bg-slate-900">
@@ -180,6 +208,43 @@ export function TopBar({
           <span className="hidden sm:inline">Unggah Cepat</span>
         </button>
 
+        {/* Permanent Top-Right Cloud Sync Indicator */}
+        <button
+          type="button"
+          onClick={onSyncNow}
+          disabled={effectiveSyncState === 'syncing'}
+          title={syncTitle}
+          aria-label={
+            effectiveSyncState === 'syncing'
+              ? 'Menyinkronkan Cloud'
+              : effectiveSyncState === 'synced'
+                ? 'Cloud Tersinkron'
+                : 'Sinkronisasi Cloud tertunda'
+          }
+          className={`td-press flex h-9 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-semibold transition-colors whitespace-nowrap disabled:opacity-80 ${
+            effectiveSyncState === 'synced'
+              ? 'border-emerald-200 bg-emerald-50/90 text-emerald-700 hover:bg-emerald-100/80 dark:border-emerald-900/70 dark:bg-emerald-950/50 dark:text-emerald-300 dark:hover:bg-emerald-950/80'
+              : effectiveSyncState === 'syncing'
+                ? 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900/70 dark:bg-blue-950/50 dark:text-blue-300'
+                : 'border-amber-200 bg-amber-50 text-amber-800 hover:bg-amber-100/80 dark:border-amber-900/70 dark:bg-amber-950/50 dark:text-amber-300'
+          }`}
+        >
+          {effectiveSyncState === 'syncing' ? (
+            <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
+          ) : effectiveSyncState === 'synced' ? (
+            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+          ) : (
+            <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+          )}
+          <span className="hidden md:inline">
+            {effectiveSyncState === 'syncing'
+              ? 'Menyinkronkan...'
+              : effectiveSyncState === 'synced'
+                ? 'Tersinkron'
+                : 'Belum Sinkron'}
+          </span>
+        </button>
+
         {/* Profile Menu (Discreet Telegram Connection & Sync Controls) */}
         <div className="relative" ref={profileRef}>
           <button
@@ -204,8 +269,8 @@ export function TopBar({
                 </p>
                 <p className="mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400">
                   {telegram.connected
-                    ? `Terhubung · @${telegram.botUsername || 'Bot'}`
-                    : 'Cloud Belum Terhubung'}
+                    ? `Tersinkron permanen · @${telegram.botUsername || 'Bot'}`
+                    : 'Menghubungkan otomatis...'}
                 </p>
               </div>
 
@@ -222,7 +287,7 @@ export function TopBar({
                     className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 dark:text-slate-200 dark:hover:bg-slate-800"
                   >
                     <RefreshCw className={`h-3.5 w-3.5 ${syncingTelegram ? 'animate-spin' : ''}`} />
-                    <span>{syncingTelegram ? 'Menyinkronkan...' : 'Sinkronkan Telegram'}</span>
+                    <span>{syncingTelegram ? 'Menyinkronkan...' : 'Sinkronkan Sekarang'}</span>
                   </button>
                 )}
 

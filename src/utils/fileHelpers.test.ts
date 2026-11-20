@@ -16,11 +16,17 @@ import {
   isPdfFile,
 } from './fileHelpers';
 import {
+  buildTelegramV3Plan,
   decodeTelegramDocumentIndex,
+  decodeTelegramDocumentIndexFull,
   decodeTelegramIndex,
+  decodeTelegramV3Manifest,
+  decodeTelegramV3Shard,
   encodeTelegramDocumentIndex,
   encodeTelegramIndex,
+  encodeTelegramV3ManifestText,
   mergeDriveItems,
+  reconcileConcurrentDriveState,
   reconcileRemoteDriveItems,
 } from './telegramIndex';
 import { planBlobCacheEviction } from './localVault';
@@ -600,4 +606,110 @@ test('planBlobCacheEviction evicts oldest LRU entries while protecting newly sav
   assert.deepEqual(underPlan.keysToEvict, []);
   assert.equal(underPlan.totalBytesAfter, 570);
 });
+
+test('reconcileConcurrentDriveState unions multi-browser uploads while enforcing tombstoned deletions', () => {
+  const browserAItems: DriveItem[] = [
+    sampleItems[0],
+    sampleItems[2], // file-1 (to be deleted by Browser B)
+  ];
+  const browserBItems: DriveItem[] = [
+    sampleItems[0],
+    {
+      ...sampleItems[3],
+      id: 'file-from-browser-b',
+      name: 'Upload_Browser_B.pdf',
+      updatedAt: '2026-11-20T08:15:00.000Z',
+    },
+  ];
+  const browserATombstones = {};
+  const browserBTombstones = { 'file-1': '2026-11-20T08:10:00.000Z' };
+
+  const reconciled = reconcileConcurrentDriveState(
+    browserAItems,
+    browserBItems,
+    [],
+    browserATombstones,
+    browserBTombstones,
+  );
+
+  // file-1 is removed due to tombstone, while f-root-1 and file-from-browser-b are both preserved
+  assert.deepEqual(
+    reconciled.items.map((i) => i.id).sort(),
+    ['f-root-1', 'file-from-browser-b'],
+  );
+
+  // Encoded v2 document index preserves tombstones cleanly across browsers
+  const rawV2 = encodeTelegramDocumentIndex(reconciled.items, reconciled.tombstones);
+  const decodedFull = decodeTelegramDocumentIndexFull(rawV2);
+  assert.equal(decodedFull.items.length, 2);
+  assert.equal(decodedFull.tombstones['file-1'], '2026-11-20T08:10:00.000Z');
+});
+
+test('V3 compressed text manifest fits 100+ items inline <=4096 chars and shards 300+ items cleanly', async () => {
+  const makeBulk = (count: number): DriveItem[] =>
+    Array.from({ length: count }, (_, idx) => ({
+      id: `v3-item-${idx + 1}`,
+      name: `Dokumen_Kantor_Margono_${idx + 1}.pdf`,
+      type: 'file',
+      parentId: idx % 7 === 0 ? 'fld-1' : null,
+      size: 2048 * (idx + 1),
+      mimeType: 'application/pdf',
+      starred: idx % 9 === 0,
+      trashed: false,
+      createdAt: `2026-11-20T08:${String(idx % 60).padStart(2, '0')}:00.000Z`,
+      updatedAt: `2026-11-20T08:${String(idx % 60).padStart(2, '0')}:00.000Z`,
+      storageBackend: 'telegram',
+      chunks: [
+        {
+          index: 0,
+          size: 2048 * (idx + 1),
+          telegramFileId: `BQAC_V3_${idx + 1}`,
+          telegramUniqueId: `AgAD_V3_${idx + 1}`,
+          telegramMessageId: 1000 + idx,
+        },
+      ],
+    }));
+
+  // 1) 80 items compress cleanly into a single <=4000-char pinned text message
+  const medium = makeBulk(80);
+  const plan80 = await buildTelegramV3Plan(medium, { 'deleted-old': '2026-11-20T07:00:00.000Z' });
+  assert.equal(plan80.shardBatches.length, 0);
+  const manifest80 = await encodeTelegramV3ManifestText(
+    plan80.inlineItems,
+    plan80.cleanedTombstones,
+    [],
+  );
+  assert.ok(manifest80.text.length <= 4096, `Expected <= 4096 chars, got ${manifest80.text.length}`);
+
+  const decoded80 = await decodeTelegramV3Manifest(manifest80.text);
+  assert.equal(decoded80.isV3, true);
+  assert.equal(decoded80.items.length, 80);
+  assert.equal(decoded80.tombstones['deleted-old'], '2026-11-20T07:00:00.000Z');
+
+  // 2) 320 items automatically overflow older items into <=4000-char shards
+  const huge = makeBulk(320);
+  const plan320 = await buildTelegramV3Plan(huge, {});
+  assert.ok(plan320.shardBatches.length >= 1, 'Expected overflow shards for 320 items');
+
+  const shardRefs = [];
+  const reconstructed: DriveItem[] = [];
+  for (let i = 0; i < plan320.shardBatches.length; i += 1) {
+    const batch = plan320.shardBatches[i];
+    assert.ok(batch.text.length <= 4096);
+    shardRefs.push({ id: 2000 + i, h: batch.hash });
+    const decodedShard = await decodeTelegramV3Shard(batch.text);
+    reconstructed.push(...decodedShard);
+  }
+
+  const manifest320 = await encodeTelegramV3ManifestText(
+    plan320.inlineItems,
+    plan320.cleanedTombstones,
+    shardRefs,
+  );
+  assert.ok(manifest320.text.length <= 4096);
+  const decoded320 = await decodeTelegramV3Manifest(manifest320.text);
+  assert.equal(decoded320.items.length + reconstructed.length, 320);
+});
+
+
 

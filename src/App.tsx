@@ -29,12 +29,15 @@ import {
   materializeFolderTree,
 } from './utils/dropUploadHelpers';
 import {
+  addDeletedTombstones,
   addDismissedTelegramMessageIds,
   deleteLocalBlob,
   getLocalBlob,
+  loadDeletedTombstones,
   loadDismissedTelegramMessageIds,
   loadStoredItems,
   loadStoredTelegramConfig,
+  saveDeletedTombstones,
   saveStoredItems,
   saveStoredTelegramConfig,
 } from './utils/localVault';
@@ -48,12 +51,13 @@ import {
   pushIndexToTelegramPinnedMessage,
   toPublicStatus,
   uploadFileDirectToTelegram,
+  verifyTelegramDirect,
 } from './utils/telegramDirect';
-import { mergeDriveItems, reconcileRemoteDriveItems } from './utils/telegramIndex';
-import { isVaultConfigured } from './utils/cryptoVault';
+import { mergeDriveItems, reconcileConcurrentDriveState } from './utils/telegramIndex';
+import { decryptTelegramVault, isVaultConfigured } from './utils/cryptoVault';
 import { startDirectDownload, startDirectUpload } from './utils/uploadClient';
 import { Sidebar } from './components/Sidebar';
-import { type ThemeMode, TopBar } from './components/TopBar';
+import { type CloudSyncState, type ThemeMode, TopBar } from './components/TopBar';
 import { Toolbar } from './components/Toolbar';
 import { FileGrid } from './components/FileGrid';
 import { FileTable } from './components/FileTable';
@@ -67,6 +71,7 @@ import { ConfirmDeleteModal, FolderNameModal } from './components/ActionModals';
 
 const DEFAULT_TELEGRAM_VAULT =
   'TDVAULT1:wIxIsTjutAMZac4LmnW4fw.YR-haJJvsPu4fl1-.IQil19h6ECXpwU1XufaUy_jvptzX6edLgPLrSezQD69Uef1Y2mA4hO6_TtpACJpfSdPD0uqYBjr0n_DgZR5nqIXFpBxhJ9ksf2tuTnIwDFVZWzlbGHlumExEYw';
+const DEFAULT_VAULT_ACCESS_KEY = '061194';
 
 const ENV_TELEGRAM_VAULT =
   ((import.meta.env.VITE_TELEGRAM_VAULT as string | undefined) || '').trim() ||
@@ -145,9 +150,7 @@ export default function App() {
 
   const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
   const [telegramModalOpen, setTelegramModalOpen] = useState(false);
-  const [vaultModalOpen, setVaultModalOpen] = useState(
-    () => isVaultConfigured(ENV_TELEGRAM_VAULT) && !loadStoredTelegramConfig().connected,
-  );
+  const [vaultModalOpen, setVaultModalOpen] = useState(false);
   const [nameModal, setNameModal] = useState<{
     open: boolean;
     mode: 'create' | 'rename';
@@ -164,6 +167,9 @@ export default function App() {
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
   const [syncingTelegram, setSyncingTelegram] = useState(false);
+  const [syncState, setSyncState] = useState<CloudSyncState>(() =>
+    loadStoredTelegramConfig().connected ? 'synced' : 'syncing',
+  );
   const [marquee, setMarquee] = useState<{
     startX: number;
     startY: number;
@@ -197,8 +203,11 @@ export default function App() {
     Map<string, { file: File; targetParent: string | null; isBatch: boolean }>
   >(new Map());
   const didAutoSyncRef = useRef(false);
+  const syncInFlightRef = useRef(false);
+  const autoConnectAttemptedRef = useRef(false);
   const lastSyncMsRef = useRef(0);
   const lastSelectedIdRef = useRef<string | null>(null);
+  const tombstonesRef = useRef<Record<string, string>>(loadDeletedTombstones());
   const itemsRef = useRef<DriveItem[]>(items);
   itemsRef.current = items;
   const mainRef = useRef<HTMLElement>(null);
@@ -249,20 +258,38 @@ export default function App() {
     let active = true;
     const timer = window.setTimeout(() => {
       const currentPinId = pinnedIndexIdRef.current;
+      setSyncState('syncing');
       void pushIndexToTelegramPinnedMessage(
         tgConfig.botToken,
         tgConfig.chatId,
         itemsRef.current,
         currentPinId,
-      ).then((pinId) => {
-        if (active && pinId && pinId !== pinnedIndexIdRef.current) {
-          pinnedIndexIdRef.current = pinId;
-          setTgConfig((curr) => {
-            const updatedCfg = { ...curr, pinnedIndexMessageId: pinId };
-            saveStoredTelegramConfig(updatedCfg);
-            return updatedCfg;
-          });
+        tombstonesRef.current,
+      ).then((pushRes) => {
+        if (!active || !pushRes) {
+          if (active) setSyncState('error');
+          return;
         }
+        tombstonesRef.current = pushRes.syncedTombstones;
+        saveDeletedTombstones(pushRes.syncedTombstones);
+        saveStoredItems(pushRes.syncedItems);
+        setItems(pushRes.syncedItems);
+
+        const nextPinId = pushRes.pinnedMessageId ?? pinnedIndexIdRef.current;
+        if (nextPinId) {
+          pinnedIndexIdRef.current = nextPinId;
+        }
+        const nowIso = new Date().toISOString();
+        setTgConfig((curr) => {
+          const updatedCfg: TelegramConfigState = {
+            ...curr,
+            pinnedIndexMessageId: nextPinId,
+            lastSyncedAt: nowIso,
+          };
+          saveStoredTelegramConfig(updatedCfg);
+          return updatedCfg;
+        });
+        setSyncState('synced');
       });
     }, 600);
 
@@ -272,15 +299,61 @@ export default function App() {
     };
   }, [cloudPushTick, tgConfig.connected, tgConfig.botToken, tgConfig.chatId]);
 
-  // Two-way sync: pull Pinned Index, import new channel uploads, and prune messages deleted in Telegram
+  const connectDefaultVaultSilently = useCallback(async (): Promise<TelegramConfigState | null> => {
+    if (!isVaultConfigured(ENV_TELEGRAM_VAULT)) return null;
+    try {
+      setSyncState('syncing');
+      const creds = await decryptTelegramVault(ENV_TELEGRAM_VAULT, DEFAULT_VAULT_ACCESS_KEY);
+      const verification = await verifyTelegramDirect(creds.botToken, creds.chatId);
+      if (!verification.ok) {
+        setSyncState('error');
+        return null;
+      }
+      const nextCfg: TelegramConfigState = {
+        connected: true,
+        botToken: creds.botToken,
+        chatId: verification.chatId || creds.chatId,
+        botUsername: verification.botUsername,
+        botName: verification.botName,
+        chatTitle: verification.chatTitle,
+        chatType: verification.chatType,
+        autoSync: true,
+        pinnedIndexMessageId: verification.pinnedMessageId,
+        lastSyncedAt: new Date().toISOString(),
+      };
+      if (nextCfg.pinnedIndexMessageId) {
+        pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
+      }
+      setTgConfig(nextCfg);
+      saveStoredTelegramConfig(nextCfg);
+      return nextCfg;
+    } catch {
+      // Custom vault configured with a non-default PIN
+      setSyncState('disconnected');
+      setVaultModalOpen(true);
+      return null;
+    }
+  }, []);
+
+  // Two-way sync: pull Pinned Index, import new channel uploads, merge concurrent edits & tombstones
   const syncFromTelegram = useCallback(
-    async (silent = false) => {
-      if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) return;
-      const syncStartedAtMs = Date.now();
-      lastSyncMsRef.current = syncStartedAtMs;
+    async (silent = false, configOverride?: TelegramConfigState) => {
+      const activeCfg = configOverride || tgConfig;
+      if (!activeCfg.connected || !activeCfg.botToken || !activeCfg.chatId) {
+        const autoCfg = await connectDefaultVaultSilently();
+        if (!autoCfg) return;
+        configOverride = autoCfg;
+      }
+      const cfg = configOverride || tgConfig;
+      if (!cfg.connected || !cfg.botToken || !cfg.chatId) return;
+      if (syncInFlightRef.current) return;
+
+      syncInFlightRef.current = true;
+      lastSyncMsRef.current = Date.now();
       setSyncingTelegram(true);
+      setSyncState('syncing');
       try {
-        const res = await pullIndexFromTelegramPinnedMessage(tgConfig.botToken, tgConfig.chatId);
+        const res = await pullIndexFromTelegramPinnedMessage(cfg.botToken, cfg.chatId);
         if (!res.error) {
           const knownMsgIds = new Set<number>();
           for (const item of itemsRef.current) {
@@ -296,8 +369,8 @@ export default function App() {
 
           const dismissedIds = loadDismissedTelegramMessageIds();
           const channelMedia = await fetchChannelMediaUpdates(
-            tgConfig.botToken,
-            tgConfig.chatId,
+            cfg.botToken,
+            cfg.chatId,
             knownMsgIds,
             dismissedIds,
           );
@@ -312,18 +385,14 @@ export default function App() {
                 arr.findIndex((x) => x.id === i.id) === idx,
             )
             .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
-            .slice(0, 25);
+            .slice(0, 20);
 
           const deletedInTelegramItemIds = new Set<string>();
           const deletedInTelegramMsgIds: number[] = [];
           for (const candidate of probeCandidates) {
             const msgId = candidate.chunks[0]?.telegramMessageId;
             if (!msgId) continue;
-            const status = await checkTelegramMessageExists(
-              tgConfig.botToken,
-              tgConfig.chatId,
-              msgId,
-            );
+            const status = await checkTelegramMessageExists(cfg.botToken, cfg.chatId, msgId);
             if (status === 'deleted') {
               deletedInTelegramItemIds.add(candidate.id);
               deletedInTelegramMsgIds.push(msgId);
@@ -333,41 +402,63 @@ export default function App() {
           if (deletedInTelegramMsgIds.length > 0) {
             addDismissedTelegramMessageIds(deletedInTelegramMsgIds);
           }
-
-          const isCompleteAuthoritativeIndex = res.isCompleteIndex;
-          const pinnedWithoutDeleted = res.items.filter((i) => !deletedInTelegramItemIds.has(i.id));
-          let nextPinnedId = res.pinnedMessageId ?? tgConfig.pinnedIndexMessageId;
-
-          const reconciled = reconcileRemoteDriveItems(
-            itemsRef.current,
-            pinnedWithoutDeleted,
-            channelMedia,
-            isCompleteAuthoritativeIndex,
-            syncStartedAtMs,
-          ).filter((i) => !deletedInTelegramItemIds.has(i.id));
-
-          saveStoredItems(reconciled);
-          setItems(reconciled);
-
-          if (channelMedia.length > 0 || deletedInTelegramItemIds.size > 0) {
-            const pushedPin = await pushIndexToTelegramPinnedMessage(
-              tgConfig.botToken,
-              tgConfig.chatId,
-              reconciled,
-              nextPinnedId,
-            );
-            if (pushedPin) nextPinnedId = pushedPin;
+          if (deletedInTelegramItemIds.size > 0) {
+            tombstonesRef.current = addDeletedTombstones(Array.from(deletedInTelegramItemIds));
           }
 
+          const reconciled = reconcileConcurrentDriveState(
+            itemsRef.current,
+            res.items,
+            channelMedia,
+            tombstonesRef.current,
+            res.tombstones,
+          );
+
+          tombstonesRef.current = reconciled.tombstones;
+          saveDeletedTombstones(reconciled.tombstones);
+          saveStoredItems(reconciled.items);
+          setItems(reconciled.items);
+
+          let nextPinnedId = res.pinnedMessageId ?? cfg.pinnedIndexMessageId;
+
+          // Push back whenever local had items/updates not yet reflected in the remote index
+          const remoteById = new Map(res.items.map((i) => [i.id, i]));
+          const localHasUnpushedChanges =
+            !res.hasIndex ||
+            channelMedia.length > 0 ||
+            deletedInTelegramItemIds.size > 0 ||
+            reconciled.items.some((item) => {
+              const r = remoteById.get(item.id);
+              return !r || (Date.parse(item.updatedAt) || 0) > (Date.parse(r.updatedAt) || 0);
+            });
+
+          if (localHasUnpushedChanges && reconciled.items.length + Object.keys(reconciled.tombstones).length > 0) {
+            const pushRes = await pushIndexToTelegramPinnedMessage(
+              cfg.botToken,
+              cfg.chatId,
+              reconciled.items,
+              nextPinnedId,
+              reconciled.tombstones,
+              { skipMergePull: true },
+            );
+            if (pushRes?.pinnedMessageId) nextPinnedId = pushRes.pinnedMessageId;
+          }
+
+          if (nextPinnedId) {
+            pinnedIndexIdRef.current = nextPinnedId;
+          }
+
+          const nowIso = new Date().toISOString();
           setTgConfig((curr) => {
             const updatedCfg: TelegramConfigState = {
               ...curr,
               pinnedIndexMessageId: nextPinnedId ?? curr.pinnedIndexMessageId,
-              lastSyncedAt: new Date().toISOString(),
+              lastSyncedAt: nowIso,
             };
             saveStoredTelegramConfig(updatedCfg);
             return updatedCfg;
           });
+          setSyncState('synced');
 
           if (!silent) {
             const notes: string[] = [];
@@ -383,33 +474,46 @@ export default function App() {
               detail:
                 notes.length > 0
                   ? `${notes.join(' · ')}.`
-                  : res.items.length > 0
-                    ? `${res.items.length} item tersinkron dari @${tgConfig.botUsername || 'Bot'}.`
-                    : `Terhubung ke @${tgConfig.botUsername || 'Bot'}.`,
+                  : `${reconciled.items.length} item tersinkron dari @${cfg.botUsername || 'Bot'}.`,
             });
           }
-        } else if (!silent) {
-          pushNotification({
-            kind: 'error',
-            title: 'Sinkronisasi gagal',
-            detail: res.error,
-          });
+        } else {
+          setSyncState('error');
+          if (!silent) {
+            pushNotification({
+              kind: 'error',
+              title: 'Sinkronisasi gagal',
+              detail: res.error,
+            });
+          }
         }
       } finally {
+        syncInFlightRef.current = false;
         setSyncingTelegram(false);
       }
     },
     [
-      tgConfig.connected,
-      tgConfig.botToken,
-      tgConfig.chatId,
-      tgConfig.botUsername,
-      tgConfig.pinnedIndexMessageId,
+      tgConfig,
+      connectDefaultVaultSilently,
       pushNotification,
     ],
   );
 
-  // Automatically sync on startup & whenever user returns to the tab
+  // Permanent automatic connect on startup if this browser/origin isn't connected yet
+  useEffect(() => {
+    if (tgConfig.connected && tgConfig.botToken && tgConfig.chatId) return;
+    if (autoConnectAttemptedRef.current) return;
+    autoConnectAttemptedRef.current = true;
+
+    void connectDefaultVaultSilently().then((autoCfg) => {
+      if (autoCfg) {
+        didAutoSyncRef.current = true;
+        void syncFromTelegram(true, autoCfg);
+      }
+    });
+  }, [tgConfig.connected, tgConfig.botToken, tgConfig.chatId, connectDefaultVaultSilently, syncFromTelegram]);
+
+  // Automatically sync on startup, tab focus/visibility, and every 12s while visible
   useEffect(() => {
     if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) return;
 
@@ -419,14 +523,29 @@ export default function App() {
     }
 
     const onVisibilityOrFocus = () => {
-      if (document.visibilityState === 'visible' && Date.now() - lastSyncMsRef.current > 15_000) {
+      if (
+        document.visibilityState === 'visible' &&
+        activeUploadCountRef.current === 0 &&
+        Date.now() - lastSyncMsRef.current > 5_000
+      ) {
         void syncFromTelegram(true);
       }
     };
 
+    const intervalId = window.setInterval(() => {
+      if (
+        document.visibilityState === 'visible' &&
+        activeUploadCountRef.current === 0 &&
+        Date.now() - lastSyncMsRef.current > 10_000
+      ) {
+        void syncFromTelegram(true);
+      }
+    }, 12_000);
+
     window.addEventListener('focus', onVisibilityOrFocus);
     document.addEventListener('visibilitychange', onVisibilityOrFocus);
     return () => {
+      window.clearInterval(intervalId);
       window.removeEventListener('focus', onVisibilityOrFocus);
       document.removeEventListener('visibilitychange', onVisibilityOrFocus);
     };
@@ -1192,6 +1311,7 @@ export default function App() {
       addDismissedTelegramMessageIds(deletedTgMsgIds);
     }
 
+    tombstonesRef.current = addDeletedTombstones(Array.from(expanded));
     commitItems((prev) => prev.filter((i) => !expanded.has(i.id)));
     setSelectedIds(new Set());
 
@@ -1515,6 +1635,7 @@ export default function App() {
           searchInputRef={searchInputRef}
           telegram={telegramStatus}
           syncingTelegram={syncingTelegram}
+          syncState={syncState}
           vaultAvailable={isVaultConfigured(ENV_TELEGRAM_VAULT)}
           onSyncNow={() => void syncFromTelegram(false)}
           onOpenTelegramModal={() => setTelegramModalOpen(true)}
@@ -1811,6 +1932,8 @@ export default function App() {
         onSaveConfig={(nextCfg, pulledItems) => {
           setTgConfig(nextCfg);
           saveStoredTelegramConfig(nextCfg);
+          pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
+          setSyncState(nextCfg.connected ? 'synced' : 'disconnected');
           if (pulledItems && pulledItems.length > 0) {
             setItems((prev) => {
               const merged = mergeDriveItems(prev, pulledItems);
@@ -1827,6 +1950,7 @@ export default function App() {
         }}
         onPullRemoteItems={(pulledItems, pinnedMsgId) => {
           if (pinnedMsgId) {
+            pinnedIndexIdRef.current = pinnedMsgId;
             setTgConfig((curr) => {
               const next = { ...curr, pinnedIndexMessageId: pinnedMsgId };
               saveStoredTelegramConfig(next);
@@ -1839,6 +1963,7 @@ export default function App() {
               saveStoredItems(merged);
               return merged;
             });
+            setSyncState('synced');
             pushNotification({
               kind: 'success',
               title: `${pulledItems.length} item dimuat dari Telegram`,
@@ -1853,8 +1978,10 @@ export default function App() {
         onUnlockSuccess={(nextCfg, pulledItems) => {
           setTgConfig(nextCfg);
           saveStoredTelegramConfig(nextCfg);
+          pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
           didAutoSyncRef.current = true;
           lastSyncMsRef.current = Date.now();
+          setSyncState('synced');
           if (pulledItems.length > 0) {
             setItems((prev) => {
               const merged = mergeDriveItems(prev, pulledItems);
