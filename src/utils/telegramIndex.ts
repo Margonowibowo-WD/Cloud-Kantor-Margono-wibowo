@@ -10,11 +10,24 @@ export interface TelegramShardRef {
   h: string;
 }
 
+export interface CloudViewPrefs {
+  v?: 'grid' | 'list';
+  sf?: 'name' | 'updatedAt' | 'size';
+  sd?: 'asc' | 'desc';
+  u?: string;
+}
+
+interface TelegramV3BodyPayload {
+  i: CompactDriveRecord[];
+  t?: Record<string, string>;
+  p?: CloudViewPrefs;
+}
+
 interface TelegramV3ManifestPayload {
   v: 3;
   rev: string;
-  z?: string; // deflate-raw base64url of { i: CompactDriveRecord[], t?: Record<string, string> }
-  j?: { i: CompactDriveRecord[]; t?: Record<string, string> };
+  z?: string; // deflate-raw base64url of TelegramV3BodyPayload
+  j?: TelegramV3BodyPayload;
   s?: TelegramShardRef[];
 }
 
@@ -356,6 +369,7 @@ export async function decodeTelegramV3Shard(raw: string | undefined | null): Pro
 export async function buildTelegramV3Plan(
   items: DriveItem[],
   tombstones: Record<string, string> = {},
+  prefs?: CloudViewPrefs,
 ): Promise<{
   inlineItems: DriveItem[];
   shardBatches: Array<{ items: DriveItem[]; text: string; hash: string }>;
@@ -368,9 +382,10 @@ export async function buildTelegramV3Plan(
   const MAX_INLINE_MANIFEST_CHARS = 3400;
 
   const packInlineManifest = async (candidateInline: DriveItem[]): Promise<string> => {
-    const body = {
+    const body: TelegramV3BodyPayload = {
       i: candidateInline.map(toCompactRecord),
       ...(Object.keys(cleanedTombstones).length > 0 ? { t: cleanedTombstones } : {}),
+      ...(prefs ? { p: prefs } : {}),
     };
     const json = JSON.stringify(body);
     const z = await compressText(json);
@@ -440,10 +455,12 @@ export async function encodeTelegramV3ManifestText(
   inlineItems: DriveItem[],
   cleanedTombstones: Record<string, string>,
   shards: TelegramShardRef[],
+  prefs?: CloudViewPrefs,
 ): Promise<{ text: string; rev: string }> {
-  const body = {
+  const body: TelegramV3BodyPayload = {
     i: inlineItems.map(toCompactRecord),
     ...(Object.keys(cleanedTombstones).length > 0 ? { t: cleanedTombstones } : {}),
+    ...(prefs ? { p: prefs } : {}),
   };
   const json = JSON.stringify(body);
   const z = await compressText(json);
@@ -460,12 +477,23 @@ export async function encodeTelegramV3ManifestText(
   };
 }
 
+export function extractV3Revision(raw: string | undefined | null): string | null {
+  if (!raw || !raw.startsWith(INDEX_V3_HEADER)) return null;
+  try {
+    const parsed = JSON.parse(raw.slice(INDEX_V3_HEADER.length)) as Partial<TelegramV3ManifestPayload>;
+    return parsed?.v === 3 && typeof parsed.rev === 'string' ? parsed.rev : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function decodeTelegramV3Manifest(raw: string | undefined | null): Promise<{
   isV3: boolean;
   rev: string;
   items: DriveItem[];
   tombstones: Record<string, string>;
   shards: TelegramShardRef[];
+  prefs?: CloudViewPrefs;
 }> {
   if (!raw || !raw.startsWith(INDEX_V3_HEADER)) {
     return { isV3: false, rev: '', items: [], tombstones: {}, shards: [] };
@@ -475,11 +503,11 @@ export async function decodeTelegramV3Manifest(raw: string | undefined | null): 
     if (!parsed || parsed.v !== 3) {
       return { isV3: false, rev: '', items: [], tombstones: {}, shards: [] };
     }
-    let body: { i?: CompactDriveRecord[]; t?: Record<string, string> } | null = null;
+    let body: Partial<TelegramV3BodyPayload> | null = null;
     if (typeof parsed.z === 'string') {
       const decodedJson = await decompressText(parsed.z);
       if (decodedJson) {
-        body = JSON.parse(decodedJson) as { i?: CompactDriveRecord[]; t?: Record<string, string> };
+        body = JSON.parse(decodedJson) as Partial<TelegramV3BodyPayload>;
       }
     } else if (parsed.j && typeof parsed.j === 'object') {
       body = parsed.j;
@@ -495,6 +523,8 @@ export async function decodeTelegramV3Manifest(raw: string | undefined | null): 
     const shards: TelegramShardRef[] = Array.isArray(parsed.s)
       ? parsed.s.filter((ref): ref is TelegramShardRef => Boolean(ref && typeof ref.id === 'number' && typeof ref.h === 'string'))
       : [];
+    const prefs: CloudViewPrefs | undefined =
+      body?.p && typeof body.p === 'object' ? body.p : undefined;
 
     return {
       isV3: true,
@@ -502,6 +532,7 @@ export async function decodeTelegramV3Manifest(raw: string | undefined | null): 
       items,
       tombstones,
       shards,
+      prefs,
     };
   } catch {
     return { isV3: false, rev: '', items: [], tombstones: {}, shards: [] };

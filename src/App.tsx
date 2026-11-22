@@ -37,9 +37,11 @@ import {
   loadDismissedTelegramMessageIds,
   loadStoredItems,
   loadStoredTelegramConfig,
+  loadStoredViewPrefs,
   saveDeletedTombstones,
   saveStoredItems,
   saveStoredTelegramConfig,
+  saveStoredViewPrefs,
 } from './utils/localVault';
 import {
   DIRECT_TELEGRAM_MAX_BYTES,
@@ -53,7 +55,11 @@ import {
   uploadFileDirectToTelegram,
   verifyTelegramDirect,
 } from './utils/telegramDirect';
-import { mergeDriveItems, reconcileConcurrentDriveState } from './utils/telegramIndex';
+import {
+  type CloudViewPrefs,
+  mergeDriveItems,
+  reconcileConcurrentDriveState,
+} from './utils/telegramIndex';
 import { decryptTelegramVault, isVaultConfigured } from './utils/cryptoVault';
 import { startDirectDownload, startDirectUpload } from './utils/uploadClient';
 import { Sidebar } from './components/Sidebar';
@@ -125,6 +131,7 @@ function loadInitialThemeMode(): ThemeMode {
 }
 
 export default function App() {
+  const initialViewPrefs = useMemo(() => loadStoredViewPrefs(), []);
   const [items, setItems] = useState<DriveItem[]>(() => loadStoredItems());
   const [tgConfig, setTgConfig] = useState<TelegramConfigState>(() => loadStoredTelegramConfig());
 
@@ -132,9 +139,9 @@ export default function App() {
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
-  const [sortField, setSortField] = useState<SortField>('name');
-  const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
-  const [viewMode, setViewMode] = useState<ViewMode>('grid');
+  const [sortField, setSortField] = useState<SortField>(initialViewPrefs.sf || 'name');
+  const [sortDirection, setSortDirection] = useState<SortDirection>(initialViewPrefs.sd || 'asc');
+  const [viewMode, setViewMode] = useState<ViewMode>(initialViewPrefs.v || 'grid');
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => loadInitialThemeMode());
   const [isNightNow, setIsNightNow] = useState<boolean>(() => isNightHour());
   const [previewPaneOpen, setPreviewPaneOpen] = useState<boolean>(
@@ -205,15 +212,21 @@ export default function App() {
   const didAutoSyncRef = useRef(false);
   const syncInFlightRef = useRef(false);
   const autoConnectAttemptedRef = useRef(false);
+  const hasSyncedOnceRef = useRef(false);
   const lastSyncMsRef = useRef(0);
+  const lastChannelUpdatesMsRef = useRef(0);
+  const lastProbeMsRef = useRef(0);
+  const lastSyncedRevRef = useRef<string | undefined>(undefined);
   const lastSelectedIdRef = useRef<string | null>(null);
   const tombstonesRef = useRef<Record<string, string>>(loadDeletedTombstones());
+  const viewPrefsRef = useRef<CloudViewPrefs>(initialViewPrefs);
   const itemsRef = useRef<DriveItem[]>(items);
   itemsRef.current = items;
   const mainRef = useRef<HTMLElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const tabChannelRef = useRef<BroadcastChannel | null>(null);
 
   const telegramStatus: TelegramPublicStatus = useMemo(() => toPublicStatus(tgConfig), [tgConfig]);
 
@@ -232,6 +245,32 @@ export default function App() {
     [],
   );
 
+  const broadcastLocalStateToTabs = useCallback(() => {
+    try {
+      tabChannelRef.current?.postMessage({
+        type: 'teledrive-state-updated',
+        rev: lastSyncedRevRef.current,
+      });
+    } catch {
+      // ignore BroadcastChannel unavailable
+    }
+  }, []);
+
+  const applyRemoteViewPrefs = useCallback((remotePrefs?: CloudViewPrefs) => {
+    if (!remotePrefs) return;
+    const localMs = viewPrefsRef.current.u ? Date.parse(viewPrefsRef.current.u) || 0 : 0;
+    const remoteMs = remotePrefs.u ? Date.parse(remotePrefs.u) || 0 : 0;
+    if (remoteMs > localMs || (!viewPrefsRef.current.u && remotePrefs.u)) {
+      viewPrefsRef.current = remotePrefs;
+      saveStoredViewPrefs(remotePrefs);
+      if (remotePrefs.v === 'grid' || remotePrefs.v === 'list') setViewMode(remotePrefs.v);
+      if (remotePrefs.sf === 'name' || remotePrefs.sf === 'updatedAt' || remotePrefs.sf === 'size') {
+        setSortField(remotePrefs.sf);
+      }
+      if (remotePrefs.sd === 'asc' || remotePrefs.sd === 'desc') setSortDirection(remotePrefs.sd);
+    }
+  }, []);
+
   const [cloudPushTick, setCloudPushTick] = useState(0);
   const pinnedIndexIdRef = useRef<number | undefined>(tgConfig.pinnedIndexMessageId);
   pinnedIndexIdRef.current = tgConfig.pinnedIndexMessageId;
@@ -244,11 +283,12 @@ export default function App() {
         saveStoredItems(next);
         return next;
       });
+      broadcastLocalStateToTabs();
       if (!options?.deferIndexPush) {
         setCloudPushTick((t) => t + 1);
       }
     },
-    [],
+    [broadcastLocalStateToTabs],
   );
 
   useEffect(() => {
@@ -265,15 +305,20 @@ export default function App() {
         itemsRef.current,
         currentPinId,
         tombstonesRef.current,
+        { prefs: viewPrefsRef.current },
       ).then((pushRes) => {
         if (!active || !pushRes) {
           if (active) setSyncState('error');
           return;
         }
+        hasSyncedOnceRef.current = true;
+        if (pushRes.rev) lastSyncedRevRef.current = pushRes.rev;
+        if (pushRes.syncedPrefs) applyRemoteViewPrefs(pushRes.syncedPrefs);
         tombstonesRef.current = pushRes.syncedTombstones;
         saveDeletedTombstones(pushRes.syncedTombstones);
         saveStoredItems(pushRes.syncedItems);
         setItems(pushRes.syncedItems);
+        broadcastLocalStateToTabs();
 
         const nextPinId = pushRes.pinnedMessageId ?? pinnedIndexIdRef.current;
         if (nextPinId) {
@@ -297,9 +342,20 @@ export default function App() {
       active = false;
       window.clearTimeout(timer);
     };
-  }, [cloudPushTick, tgConfig.connected, tgConfig.botToken, tgConfig.chatId]);
+  }, [
+    cloudPushTick,
+    tgConfig.connected,
+    tgConfig.botToken,
+    tgConfig.chatId,
+    applyRemoteViewPrefs,
+    broadcastLocalStateToTabs,
+  ]);
 
-  const connectDefaultVaultSilently = useCallback(async (): Promise<TelegramConfigState | null> => {
+  const connectDefaultVaultSilently = useCallback(async (): Promise<{
+    config: TelegramConfigState;
+    pinnedIndexText?: string;
+    pinnedMessageId?: number;
+  } | null> => {
     if (!isVaultConfigured(ENV_TELEGRAM_VAULT)) return null;
     try {
       setSyncState('syncing');
@@ -326,7 +382,11 @@ export default function App() {
       }
       setTgConfig(nextCfg);
       saveStoredTelegramConfig(nextCfg);
-      return nextCfg;
+      return {
+        config: nextCfg,
+        pinnedIndexText: verification.pinnedIndexText,
+        pinnedMessageId: verification.pinnedMessageId,
+      };
     } catch {
       // Custom vault configured with a non-default PIN
       setSyncState('disconnected');
@@ -335,48 +395,110 @@ export default function App() {
     }
   }, []);
 
-  // Two-way sync: pull Pinned Index, import new channel uploads, merge concurrent edits & tombstones
+  // Two-way Google Drive-grade sync: 1-call revision check in background, no badge flicker
   const syncFromTelegram = useCallback(
-    async (silent = false, configOverride?: TelegramConfigState) => {
+    async (
+      silent = false,
+      configOverride?: TelegramConfigState,
+      prefetched?: { pinnedIndexText?: string; pinnedMessageId?: number },
+    ) => {
       const activeCfg = configOverride || tgConfig;
       if (!activeCfg.connected || !activeCfg.botToken || !activeCfg.chatId) {
-        const autoCfg = await connectDefaultVaultSilently();
-        if (!autoCfg) return;
-        configOverride = autoCfg;
+        const auto = await connectDefaultVaultSilently();
+        if (!auto) return;
+        configOverride = auto.config;
+        prefetched = {
+          pinnedIndexText: auto.pinnedIndexText,
+          pinnedMessageId: auto.pinnedMessageId,
+        };
       }
       const cfg = configOverride || tgConfig;
       if (!cfg.connected || !cfg.botToken || !cfg.chatId) return;
       if (syncInFlightRef.current) return;
 
       syncInFlightRef.current = true;
-      lastSyncMsRef.current = Date.now();
-      setSyncingTelegram(true);
-      setSyncState('syncing');
-      try {
-        const res = await pullIndexFromTelegramPinnedMessage(cfg.botToken, cfg.chatId);
-        if (!res.error) {
-          const knownMsgIds = new Set<number>();
-          for (const item of itemsRef.current) {
-            for (const c of item.chunks) {
-              if (c.telegramMessageId) knownMsgIds.add(c.telegramMessageId);
-            }
-          }
-          for (const item of res.items) {
-            for (const c of item.chunks) {
-              if (c.telegramMessageId) knownMsgIds.add(c.telegramMessageId);
-            }
-          }
+      const nowMs = Date.now();
+      lastSyncMsRef.current = nowMs;
 
+      // Calm Google Drive indicator: do NOT blink "Menyinkronkan..." on routine silent background checks once synced
+      const showVisibleSpinner = !silent || !hasSyncedOnceRef.current;
+      if (showVisibleSpinner) {
+        setSyncingTelegram(true);
+        setSyncState('syncing');
+      }
+
+      try {
+        const res = await pullIndexFromTelegramPinnedMessage(cfg.botToken, cfg.chatId, {
+          skipVerifyGetMe: Boolean(cfg.connected),
+          cachedRev: silent && hasSyncedOnceRef.current ? lastSyncedRevRef.current : undefined,
+          prefetchedPinnedText: prefetched?.pinnedIndexText,
+          prefetchedPinnedMessageId: prefetched?.pinnedMessageId,
+          prefetchedChatId: cfg.chatId,
+        });
+
+        if (res.error) {
+          setSyncState('error');
+          if (!silent) {
+            pushNotification({
+              kind: 'error',
+              title: 'Sinkronisasi gagal',
+              detail: res.error,
+            });
+          }
+          return;
+        }
+
+        const shouldScanUpdates =
+          !silent ||
+          !hasSyncedOnceRef.current ||
+          nowMs - lastChannelUpdatesMsRef.current >= 60_000;
+
+        // Ultra-fast Google Drive no-op path: 1 getChat check proved remote index didn't change
+        if (res.unchanged && !shouldScanUpdates) {
+          hasSyncedOnceRef.current = true;
+          setSyncState('synced');
+          const nowIso = new Date().toISOString();
+          setTgConfig((curr) => {
+            const updatedCfg: TelegramConfigState = { ...curr, lastSyncedAt: nowIso };
+            saveStoredTelegramConfig(updatedCfg);
+            return updatedCfg;
+          });
+          return;
+        }
+
+        // If remote index changed on another device while silent, gently ensure local view updates
+        const knownMsgIds = new Set<number>();
+        for (const item of itemsRef.current) {
+          for (const c of item.chunks) {
+            if (c.telegramMessageId) knownMsgIds.add(c.telegramMessageId);
+          }
+        }
+        const remoteItemsForScan = res.unchanged ? itemsRef.current : res.items;
+        for (const item of remoteItemsForScan) {
+          for (const c of item.chunks) {
+            if (c.telegramMessageId) knownMsgIds.add(c.telegramMessageId);
+          }
+        }
+
+        let channelMedia: DriveItem[] = [];
+        if (shouldScanUpdates) {
+          lastChannelUpdatesMsRef.current = nowMs;
           const dismissedIds = loadDismissedTelegramMessageIds();
-          const channelMedia = await fetchChannelMediaUpdates(
+          channelMedia = await fetchChannelMediaUpdates(
             cfg.botToken,
             cfg.chatId,
             knownMsgIds,
             dismissedIds,
           );
+        }
 
-          // Probe recent Telegram-backed files to detect direct deletions inside Telegram channel
-          const probeCandidates = [...res.items, ...itemsRef.current]
+        // Probe Telegram channel deletions only on manual sync or every 5 minutes (prevents 20-call polling storms)
+        const shouldProbeDeletions = !silent || nowMs - lastProbeMsRef.current >= 300_000;
+        const deletedInTelegramItemIds = new Set<string>();
+        const deletedInTelegramMsgIds: number[] = [];
+        if (shouldProbeDeletions) {
+          lastProbeMsRef.current = nowMs;
+          const probeCandidates = [...remoteItemsForScan, ...itemsRef.current]
             .filter(
               (i, idx, arr) =>
                 i.type === 'file' &&
@@ -385,10 +507,8 @@ export default function App() {
                 arr.findIndex((x) => x.id === i.id) === idx,
             )
             .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
-            .slice(0, 20);
+            .slice(0, 10);
 
-          const deletedInTelegramItemIds = new Set<string>();
-          const deletedInTelegramMsgIds: number[] = [];
           for (const candidate of probeCandidates) {
             const msgId = candidate.chunks[0]?.telegramMessageId;
             if (!msgId) continue;
@@ -405,99 +525,165 @@ export default function App() {
           if (deletedInTelegramItemIds.size > 0) {
             tombstonesRef.current = addDeletedTombstones(Array.from(deletedInTelegramItemIds));
           }
+        }
 
-          const reconciled = reconcileConcurrentDriveState(
-            itemsRef.current,
-            res.items,
-            channelMedia,
-            tombstonesRef.current,
-            res.tombstones,
-          );
-
-          tombstonesRef.current = reconciled.tombstones;
-          saveDeletedTombstones(reconciled.tombstones);
-          saveStoredItems(reconciled.items);
-          setItems(reconciled.items);
-
-          let nextPinnedId = res.pinnedMessageId ?? cfg.pinnedIndexMessageId;
-
-          // Push back whenever local had items/updates not yet reflected in the remote index
-          const remoteById = new Map(res.items.map((i) => [i.id, i]));
-          const localHasUnpushedChanges =
-            !res.hasIndex ||
-            channelMedia.length > 0 ||
-            deletedInTelegramItemIds.size > 0 ||
-            reconciled.items.some((item) => {
-              const r = remoteById.get(item.id);
-              return !r || (Date.parse(item.updatedAt) || 0) > (Date.parse(r.updatedAt) || 0);
-            });
-
-          if (localHasUnpushedChanges && reconciled.items.length + Object.keys(reconciled.tombstones).length > 0) {
-            const pushRes = await pushIndexToTelegramPinnedMessage(
-              cfg.botToken,
-              cfg.chatId,
-              reconciled.items,
-              nextPinnedId,
-              reconciled.tombstones,
-              { skipMergePull: true },
-            );
-            if (pushRes?.pinnedMessageId) nextPinnedId = pushRes.pinnedMessageId;
-          }
-
-          if (nextPinnedId) {
-            pinnedIndexIdRef.current = nextPinnedId;
-          }
-
-          const nowIso = new Date().toISOString();
-          setTgConfig((curr) => {
-            const updatedCfg: TelegramConfigState = {
-              ...curr,
-              pinnedIndexMessageId: nextPinnedId ?? curr.pinnedIndexMessageId,
-              lastSyncedAt: nowIso,
-            };
-            saveStoredTelegramConfig(updatedCfg);
-            return updatedCfg;
-          });
+        if (res.unchanged && channelMedia.length === 0 && deletedInTelegramItemIds.size === 0) {
+          hasSyncedOnceRef.current = true;
           setSyncState('synced');
-
           if (!silent) {
-            const notes: string[] = [];
-            if (channelMedia.length > 0) {
-              notes.push(`${channelMedia.length} file baru dari Telegram ditambahkan`);
-            }
-            if (deletedInTelegramItemIds.size > 0) {
-              notes.push(`${deletedInTelegramItemIds.size} file yang dihapus di Telegram disinkronkan`);
-            }
             pushNotification({
               kind: 'success',
               title: 'Sinkronisasi Cloud selesai',
-              detail:
-                notes.length > 0
-                  ? `${notes.join(' · ')}.`
-                  : `${reconciled.items.length} item tersinkron dari @${cfg.botUsername || 'Bot'}.`,
+              detail: `${itemsRef.current.length} item tersinkron dari @${cfg.botUsername || 'Bot'}.`,
             });
           }
-        } else {
-          setSyncState('error');
-          if (!silent) {
-            pushNotification({
-              kind: 'error',
-              title: 'Sinkronisasi gagal',
-              detail: res.error,
-            });
+          return;
+        }
+
+        const effectiveRemoteItems = res.unchanged ? itemsRef.current : res.items;
+        const effectiveRemoteTombstones = res.unchanged ? tombstonesRef.current : res.tombstones;
+
+        const reconciled = reconcileConcurrentDriveState(
+          itemsRef.current,
+          effectiveRemoteItems,
+          channelMedia,
+          tombstonesRef.current,
+          effectiveRemoteTombstones,
+        );
+
+        if (!res.unchanged && res.prefs) {
+          applyRemoteViewPrefs(res.prefs);
+        }
+
+        tombstonesRef.current = reconciled.tombstones;
+        saveDeletedTombstones(reconciled.tombstones);
+        saveStoredItems(reconciled.items);
+        setItems(reconciled.items);
+        broadcastLocalStateToTabs();
+
+        let nextPinnedId = res.pinnedMessageId ?? cfg.pinnedIndexMessageId;
+        if (res.rev) {
+          lastSyncedRevRef.current = res.rev;
+        }
+
+        // Push back whenever local had items/updates not yet reflected in the remote index
+        const remoteById = new Map(effectiveRemoteItems.map((i) => [i.id, i]));
+        const localHasUnpushedChanges =
+          !res.hasIndex ||
+          channelMedia.length > 0 ||
+          deletedInTelegramItemIds.size > 0 ||
+          reconciled.items.some((item) => {
+            const r = remoteById.get(item.id);
+            return !r || (Date.parse(item.updatedAt) || 0) > (Date.parse(r.updatedAt) || 0);
+          });
+
+        if (
+          localHasUnpushedChanges &&
+          reconciled.items.length + Object.keys(reconciled.tombstones).length > 0
+        ) {
+          const pushRes = await pushIndexToTelegramPinnedMessage(
+            cfg.botToken,
+            cfg.chatId,
+            reconciled.items,
+            nextPinnedId,
+            reconciled.tombstones,
+            { skipMergePull: true, prefs: viewPrefsRef.current },
+          );
+          if (pushRes?.pinnedMessageId) nextPinnedId = pushRes.pinnedMessageId;
+          if (pushRes?.rev) lastSyncedRevRef.current = pushRes.rev;
+        }
+
+        if (nextPinnedId) {
+          pinnedIndexIdRef.current = nextPinnedId;
+        }
+
+        const nowIso = new Date().toISOString();
+        setTgConfig((curr) => {
+          const updatedCfg: TelegramConfigState = {
+            ...curr,
+            pinnedIndexMessageId: nextPinnedId ?? curr.pinnedIndexMessageId,
+            lastSyncedAt: nowIso,
+          };
+          saveStoredTelegramConfig(updatedCfg);
+          return updatedCfg;
+        });
+        hasSyncedOnceRef.current = true;
+        setSyncState('synced');
+
+        if (!silent) {
+          const notes: string[] = [];
+          if (channelMedia.length > 0) {
+            notes.push(`${channelMedia.length} file baru dari Telegram ditambahkan`);
           }
+          if (deletedInTelegramItemIds.size > 0) {
+            notes.push(`${deletedInTelegramItemIds.size} file yang dihapus di Telegram disinkronkan`);
+          }
+          pushNotification({
+            kind: 'success',
+            title: 'Sinkronisasi Cloud selesai',
+            detail:
+              notes.length > 0
+                ? `${notes.join(' · ')}.`
+                : `${reconciled.items.length} item tersinkron dari @${cfg.botUsername || 'Bot'}.`,
+          });
         }
       } finally {
         syncInFlightRef.current = false;
-        setSyncingTelegram(false);
+        if (showVisibleSpinner) {
+          setSyncingTelegram(false);
+        }
       }
     },
     [
       tgConfig,
       connectDefaultVaultSilently,
       pushNotification,
+      applyRemoteViewPrefs,
+      broadcastLocalStateToTabs,
     ],
   );
+
+  // Instant cross-tab sync within the same browser via BroadcastChannel + storage events
+  useEffect(() => {
+    const reloadFromLocalStorage = () => {
+      const freshItems = loadStoredItems();
+      const freshTombstones = loadDeletedTombstones();
+      const freshPrefs = loadStoredViewPrefs();
+      tombstonesRef.current = freshTombstones;
+      setItems(freshItems);
+      applyRemoteViewPrefs(freshPrefs);
+    };
+
+    if (typeof BroadcastChannel !== 'undefined') {
+      const ch = new BroadcastChannel('teledrive_sync_v1');
+      tabChannelRef.current = ch;
+      ch.onmessage = (ev) => {
+        if (ev.data?.type === 'teledrive-state-updated') {
+          if (typeof ev.data.rev === 'string') {
+            lastSyncedRevRef.current = ev.data.rev;
+          }
+          reloadFromLocalStorage();
+        }
+      };
+    }
+
+    const onStorage = (e: StorageEvent) => {
+      if (
+        e.key === 'teledrive_items_v2' ||
+        e.key === 'teledrive_tombstones_v1' ||
+        e.key === 'teledrive_view_prefs_v1'
+      ) {
+        reloadFromLocalStorage();
+      }
+    };
+    window.addEventListener('storage', onStorage);
+
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      tabChannelRef.current?.close();
+      tabChannelRef.current = null;
+    };
+  }, [applyRemoteViewPrefs]);
 
   // Permanent automatic connect on startup if this browser/origin isn't connected yet
   useEffect(() => {
@@ -505,15 +691,18 @@ export default function App() {
     if (autoConnectAttemptedRef.current) return;
     autoConnectAttemptedRef.current = true;
 
-    void connectDefaultVaultSilently().then((autoCfg) => {
-      if (autoCfg) {
+    void connectDefaultVaultSilently().then((auto) => {
+      if (auto) {
         didAutoSyncRef.current = true;
-        void syncFromTelegram(true, autoCfg);
+        void syncFromTelegram(true, auto.config, {
+          pinnedIndexText: auto.pinnedIndexText,
+          pinnedMessageId: auto.pinnedMessageId,
+        });
       }
     });
   }, [tgConfig.connected, tgConfig.botToken, tgConfig.chatId, connectDefaultVaultSilently, syncFromTelegram]);
 
-  // Automatically sync on startup, tab focus/visibility, and every 12s while visible
+  // Google Drive calm background sync: startup, tab focus/visibility, and gentle 30s delta revision check
   useEffect(() => {
     if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) return;
 
@@ -526,7 +715,7 @@ export default function App() {
       if (
         document.visibilityState === 'visible' &&
         activeUploadCountRef.current === 0 &&
-        Date.now() - lastSyncMsRef.current > 5_000
+        Date.now() - lastSyncMsRef.current > 8_000
       ) {
         void syncFromTelegram(true);
       }
@@ -536,11 +725,11 @@ export default function App() {
       if (
         document.visibilityState === 'visible' &&
         activeUploadCountRef.current === 0 &&
-        Date.now() - lastSyncMsRef.current > 10_000
+        Date.now() - lastSyncMsRef.current > 25_000
       ) {
         void syncFromTelegram(true);
       }
-    }, 12_000);
+    }, 30_000);
 
     window.addEventListener('focus', onVisibilityOrFocus);
     document.addEventListener('visibilitychange', onVisibilityOrFocus);
@@ -758,13 +947,40 @@ export default function App() {
     setSelectedIds(new Set());
   };
 
+  const handleViewModeChange = (nextMode: ViewMode) => {
+    setViewMode(nextMode);
+    const updated: CloudViewPrefs = {
+      ...viewPrefsRef.current,
+      v: nextMode,
+      u: new Date().toISOString(),
+    };
+    viewPrefsRef.current = updated;
+    saveStoredViewPrefs(updated);
+    broadcastLocalStateToTabs();
+    setCloudPushTick((t) => t + 1);
+  };
+
   const handleSortChange = (field: SortField) => {
-    if (field === sortField) {
-      setSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
-    } else {
-      setSortField(field);
-      setSortDirection(field === 'updatedAt' ? 'desc' : 'asc');
-    }
+    const nextDirection: SortDirection =
+      field === sortField
+        ? sortDirection === 'asc'
+          ? 'desc'
+          : 'asc'
+        : field === 'updatedAt'
+          ? 'desc'
+          : 'asc';
+    setSortField(field);
+    setSortDirection(nextDirection);
+    const updated: CloudViewPrefs = {
+      ...viewPrefsRef.current,
+      sf: field,
+      sd: nextDirection,
+      u: new Date().toISOString(),
+    };
+    viewPrefsRef.current = updated;
+    saveStoredViewPrefs(updated);
+    broadcastLocalStateToTabs();
+    setCloudPushTick((t) => t + 1);
   };
 
   const updateTransferTask = useCallback((id: string, patch: Partial<TransferTask>) => {
@@ -1626,7 +1842,7 @@ export default function App() {
           searchQuery={searchQuery}
           onSearchChange={setSearchQuery}
           viewMode={viewMode}
-          onViewModeChange={setViewMode}
+          onViewModeChange={handleViewModeChange}
           themeMode={themeMode}
           effectiveDark={effectiveDark}
           onCycleThemeMode={handleCycleThemeMode}

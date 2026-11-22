@@ -247,12 +247,16 @@ export async function resolveItemPlayableUrl(
   if (tgFileId && tgConfig.botToken) {
     const tgUrl = await resolveTelegramFileUrl(tgConfig.botToken, tgFileId);
     if (options?.forceTypedBlob) {
-      const res = await fetch(tgUrl);
-      if (res.ok) {
-        const rawBlob = await res.blob();
-        await saveLocalBlob(`blob-${item.id}`, rawBlob);
-        const typedBlob = new Blob([rawBlob], { type: effectiveMime });
-        return { url: URL.createObjectURL(typedBlob), isObjectUrl: true };
+      try {
+        const res = await fetch(tgUrl);
+        if (res.ok) {
+          const rawBlob = await res.blob();
+          await saveLocalBlob(`blob-${item.id}`, rawBlob);
+          const typedBlob = new Blob([rawBlob], { type: effectiveMime });
+          return { url: URL.createObjectURL(typedBlob), isObjectUrl: true };
+        }
+      } catch {
+        throw new Error('Pratinjau PDF di perangkat lain memerlukan unduhan langsung. Klik Unduh File.');
       }
     }
     return { url: tgUrl, isObjectUrl: false };
@@ -274,7 +278,12 @@ export async function resolveItemArrayBuffer(
   const tgFileId = item.chunks[0]?.telegramFileId;
   if (tgFileId && tgConfig.botToken) {
     const tgUrl = await resolveTelegramFileUrl(tgConfig.botToken, tgFileId);
-    const res = await fetch(tgUrl);
+    let res: Response;
+    try {
+      res = await fetch(tgUrl);
+    } catch {
+      throw new Error('Pratinjau dokumen Office di perangkat lain dibatasi browser. Klik Unduh File.');
+    }
     if (!res.ok) {
       throw new Error('Gagal mengunduh file dari Cloud Telegram untuk pratinjau.');
     }
@@ -302,11 +311,15 @@ export async function resolveItemTextContent(
   const tgFileId = item.chunks[0]?.telegramFileId;
   if (tgFileId && tgConfig.botToken) {
     const tgUrl = await resolveTelegramFileUrl(tgConfig.botToken, tgFileId);
-    const res = await fetch(tgUrl);
-    if (res.ok) {
-      const text = await res.text();
-      await saveLocalBlob(`blob-${item.id}`, new Blob([text], { type: item.mimeType || 'text/plain' }));
-      return text;
+    try {
+      const res = await fetch(tgUrl);
+      if (res.ok) {
+        const text = await res.text();
+        await saveLocalBlob(`blob-${item.id}`, new Blob([text], { type: item.mimeType || 'text/plain' }));
+        return text;
+      }
+    } catch {
+      throw new Error('Pratinjau file teks di perangkat lain dibatasi browser. Klik Unduh File.');
     }
   }
   return null;

@@ -1,9 +1,11 @@
 import type { DriveItem, TelegramConfigState } from '../types/drive';
+import type { CloudViewPrefs } from './telegramIndex';
 
 const ITEMS_KEY = 'teledrive_items_v2';
 const TG_CONFIG_KEY = 'teledrive_tg_config_v2';
 const DISMISSED_TG_MSGS_KEY = 'teledrive_dismissed_tg_msgs_v1';
 const TOMBSTONES_KEY = 'teledrive_tombstones_v1';
+const VIEW_PREFS_KEY = 'teledrive_view_prefs_v1';
 const IDB_NAME = 'TeleDriveBlobVault';
 const IDB_STORE = 'blobs';
 
@@ -304,6 +306,25 @@ export function loadStoredTelegramConfig(): TelegramConfigState {
 export function saveStoredTelegramConfig(cfg: TelegramConfigState): void {
   try {
     localStorage.setItem(TG_CONFIG_KEY, JSON.stringify(cfg));
+  } catch {
+    // ignore
+  }
+}
+
+export function loadStoredViewPrefs(): CloudViewPrefs {
+  try {
+    const raw = localStorage.getItem(VIEW_PREFS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as CloudViewPrefs;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveStoredViewPrefs(prefs: CloudViewPrefs): void {
+  try {
+    localStorage.setItem(VIEW_PREFS_KEY, JSON.stringify(prefs));
   } catch {
     // ignore
   }

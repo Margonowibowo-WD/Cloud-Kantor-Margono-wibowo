@@ -1,5 +1,6 @@
 import type { DriveItem, TelegramConfigState, TelegramPublicStatus } from '../types/drive';
 import {
+  type CloudViewPrefs,
   INDEX_SHARD_V3_HEADER,
   INDEX_V3_HEADER,
   type TelegramShardRef,
@@ -8,6 +9,7 @@ import {
   decodeTelegramV3Manifest,
   decodeTelegramV3Shard,
   encodeTelegramV3ManifestText,
+  extractV3Revision,
   reconcileConcurrentDriveState,
 } from './telegramIndex';
 
@@ -153,6 +155,57 @@ export async function verifyTelegramDirect(
     }
 
     return result;
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Gagal menghubungi server Telegram API.',
+    };
+  }
+}
+
+export async function fetchPinnedChatInfoQuick(
+  botToken: string,
+  chatId: string,
+): Promise<{
+  ok: boolean;
+  chatId?: string;
+  pinnedMessageId?: number;
+  pinnedIndexText?: string;
+  error?: string;
+}> {
+  const token = botToken.trim();
+  const trimmedChat = chatId.trim();
+  if (!token || !trimmedChat) {
+    return { ok: false, error: 'Konfigurasi Telegram tidak lengkap.' };
+  }
+  try {
+    const chatRes = await fetch(tgApi(token, 'getChat'), {
+      method: 'POST',
+      body: new URLSearchParams({ chat_id: trimmedChat }),
+    });
+    const chatData = (await chatRes.json()) as {
+      ok: boolean;
+      description?: string;
+      result?: {
+        id: number | string;
+        pinned_message?: {
+          message_id: number;
+          text?: string;
+        };
+      };
+    };
+    if (!chatData.ok || !chatData.result) {
+      return {
+        ok: false,
+        error: chatData.description || 'Gagal membaca pembaruan channel Telegram.',
+      };
+    }
+    return {
+      ok: true,
+      chatId: String(chatData.result.id),
+      pinnedMessageId: chatData.result.pinned_message?.message_id,
+      pinnedIndexText: chatData.result.pinned_message?.text,
+    };
   } catch (err) {
     return {
       ok: false,
@@ -425,9 +478,20 @@ export interface PushIndexResult {
   pinnedMessageId?: number;
   syncedItems: DriveItem[];
   syncedTombstones: Record<string, string>;
+  syncedPrefs?: CloudViewPrefs;
+  rev?: string;
 }
 
 const shardReadCache = new Map<string, DriveItem[]>();
+
+function mergeNewerPrefs(local?: CloudViewPrefs, remote?: CloudViewPrefs): CloudViewPrefs | undefined {
+  if (!local && !remote) return undefined;
+  if (!local) return remote;
+  if (!remote) return local;
+  const localMs = local.u ? Date.parse(local.u) || 0 : 0;
+  const remoteMs = remote.u ? Date.parse(remote.u) || 0 : 0;
+  return remoteMs > localMs ? remote : local;
+}
 
 async function postBotTextMessage(
   botToken: string,
@@ -511,16 +575,19 @@ export async function pushIndexToTelegramPinnedMessage(
   items: DriveItem[],
   existingMessageId?: number,
   tombstones: Record<string, string> = {},
-  options?: { skipMergePull?: boolean },
+  options?: { skipMergePull?: boolean; prefs?: CloudViewPrefs },
 ): Promise<PushIndexResult | undefined> {
   let mergedItems = items;
   let mergedTombstones = tombstones;
+  let mergedPrefs = options?.prefs;
   let targetMessageId = existingMessageId;
   let existingPinnedText: string | undefined;
   let existingShardRefs: TelegramShardRef[] = [];
 
   if (!options?.skipMergePull) {
-    const remote = await pullIndexFromTelegramPinnedMessage(botToken, chatId);
+    const remote = await pullIndexFromTelegramPinnedMessage(botToken, chatId, {
+      skipVerifyGetMe: true,
+    });
     if (!remote.error) {
       if (remote.pinnedMessageId) {
         targetMessageId = remote.pinnedMessageId;
@@ -537,11 +604,12 @@ export async function pushIndexToTelegramPinnedMessage(
         );
         mergedItems = reconciled.items;
         mergedTombstones = reconciled.tombstones;
+        mergedPrefs = mergeNewerPrefs(options?.prefs, remote.prefs);
       }
     }
   }
 
-  const plan = await buildTelegramV3Plan(mergedItems, mergedTombstones);
+  const plan = await buildTelegramV3Plan(mergedItems, mergedTombstones, mergedPrefs);
   const nextShardRefs: TelegramShardRef[] = [];
   const reusedShardIds = new Set<number>();
 
@@ -577,11 +645,23 @@ export async function pushIndexToTelegramPinnedMessage(
     }
   }
 
-  const { text: manifestText } = await encodeTelegramV3ManifestText(
+  const { text: manifestText, rev } = await encodeTelegramV3ManifestText(
     plan.inlineItems,
     plan.cleanedTombstones,
     nextShardRefs,
+    mergedPrefs,
   );
+
+  // Skip write call completely if remote pinned text already equals this exact manifest
+  if (targetMessageId && existingPinnedText && existingPinnedText === manifestText) {
+    return {
+      pinnedMessageId: targetMessageId,
+      syncedItems: mergedItems,
+      syncedTombstones: mergedTombstones,
+      syncedPrefs: mergedPrefs,
+      rev,
+    };
+  }
 
   // If the existing pinned message is already a text message, edit it cleanly in place
   const canEditExistingText =
@@ -597,6 +677,8 @@ export async function pushIndexToTelegramPinnedMessage(
         pinnedMessageId: targetMessageId,
         syncedItems: mergedItems,
         syncedTombstones: mergedTombstones,
+        syncedPrefs: mergedPrefs,
+        rev,
       };
     }
   }
@@ -608,6 +690,8 @@ export async function pushIndexToTelegramPinnedMessage(
       pinnedMessageId: targetMessageId,
       syncedItems: mergedItems,
       syncedTombstones: mergedTombstones,
+      syncedPrefs: mergedPrefs,
+      rev,
     };
   }
 
@@ -629,6 +713,8 @@ export async function pushIndexToTelegramPinnedMessage(
     pinnedMessageId: newMsgId,
     syncedItems: mergedItems,
     syncedTombstones: mergedTombstones,
+    syncedPrefs: mergedPrefs,
+    rev,
   };
 }
 
@@ -806,9 +892,19 @@ export async function fetchChannelMediaUpdates(
 export async function pullIndexFromTelegramPinnedMessage(
   botToken: string,
   chatId: string,
+  options?: {
+    skipVerifyGetMe?: boolean;
+    prefetchedPinnedText?: string;
+    prefetchedPinnedMessageId?: number;
+    prefetchedChatId?: string;
+    cachedRev?: string;
+  },
 ): Promise<{
   items: DriveItem[];
   tombstones: Record<string, string>;
+  prefs?: CloudViewPrefs;
+  rev?: string;
+  unchanged?: boolean;
   pinnedMessageId?: number;
   rawPinnedText?: string;
   shardRefs?: TelegramShardRef[];
@@ -817,21 +913,28 @@ export async function pullIndexFromTelegramPinnedMessage(
   rawLength: number;
   error?: string;
 }> {
-  const verification = await verifyTelegramDirect(botToken, chatId);
-  if (!verification.ok) {
-    return {
-      items: [],
-      tombstones: {},
-      hasIndex: false,
-      isCompleteIndex: false,
-      rawLength: 0,
-      error: verification.error,
-    };
-  }
+  let candidateText = options?.prefetchedPinnedText;
+  let candidateMessageId = options?.prefetchedPinnedMessageId;
+  let resolvedChatId = (options?.prefetchedChatId || chatId).trim();
 
-  let candidateText = verification.pinnedIndexText;
-  let candidateMessageId = verification.pinnedMessageId;
-  const resolvedChatId = (verification.chatId || chatId).trim();
+  if (candidateText === undefined && candidateMessageId === undefined) {
+    const check = options?.skipVerifyGetMe
+      ? await fetchPinnedChatInfoQuick(botToken, chatId)
+      : await verifyTelegramDirect(botToken, chatId);
+    if (!check.ok) {
+      return {
+        items: [],
+        tombstones: {},
+        hasIndex: false,
+        isCompleteIndex: false,
+        rawLength: 0,
+        error: check.error,
+      };
+    }
+    candidateText = check.pinnedIndexText;
+    candidateMessageId = check.pinnedMessageId;
+    resolvedChatId = (check.chatId || chatId).trim();
+  }
 
   // If pinned message is not yet a V3/V1 text manifest, check recent channel updates as fallback
   const hasPinnedTextManifest = Boolean(
@@ -873,6 +976,21 @@ export async function pullIndexFromTelegramPinnedMessage(
   }
 
   if (candidateText?.startsWith(INDEX_V3_HEADER)) {
+    const quickRev = extractV3Revision(candidateText);
+    if (options?.cachedRev && quickRev && quickRev === options.cachedRev) {
+      return {
+        items: [],
+        tombstones: {},
+        rev: quickRev,
+        unchanged: true,
+        pinnedMessageId: candidateMessageId,
+        rawPinnedText: candidateText,
+        hasIndex: true,
+        isCompleteIndex: true,
+        rawLength: candidateText.length,
+      };
+    }
+
     const manifest = await decodeTelegramV3Manifest(candidateText);
     if (manifest.isV3) {
       const shardItems: DriveItem[] = [];
@@ -894,6 +1012,9 @@ export async function pullIndexFromTelegramPinnedMessage(
       return {
         items: [...manifest.items, ...shardItems],
         tombstones: manifest.tombstones,
+        prefs: manifest.prefs,
+        rev: manifest.rev,
+        unchanged: false,
         pinnedMessageId: candidateMessageId,
         rawPinnedText: candidateText,
         shardRefs: manifest.shards,

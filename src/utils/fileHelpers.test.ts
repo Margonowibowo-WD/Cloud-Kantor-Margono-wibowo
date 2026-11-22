@@ -25,6 +25,7 @@ import {
   encodeTelegramDocumentIndex,
   encodeTelegramIndex,
   encodeTelegramV3ManifestText,
+  extractV3Revision,
   mergeDriveItems,
   reconcileConcurrentDriveState,
   reconcileRemoteDriveItems,
@@ -709,6 +710,24 @@ test('V3 compressed text manifest fits 100+ items inline <=4096 chars and shards
   assert.ok(manifest320.text.length <= 4096);
   const decoded320 = await decodeTelegramV3Manifest(manifest320.text);
   assert.equal(decoded320.items.length + reconstructed.length, 320);
+});
+
+test('V3 manifest preserves CloudViewPrefs and extracts revision without full decompression', async () => {
+  const prefs = {
+    v: 'list' as const,
+    sf: 'updatedAt' as const,
+    sd: 'desc' as const,
+    u: '2026-11-22T03:00:00.000Z',
+  };
+  const plan = await buildTelegramV3Plan(sampleItems.slice(0, 2), {}, prefs);
+  const encoded = await encodeTelegramV3ManifestText(plan.inlineItems, plan.cleanedTombstones, [], prefs);
+
+  const quickRev = extractV3Revision(encoded.text);
+  assert.equal(quickRev, encoded.rev);
+
+  const decoded = await decodeTelegramV3Manifest(encoded.text);
+  assert.deepEqual(decoded.prefs, prefs);
+  assert.equal(decoded.rev, encoded.rev);
 });
 
 
