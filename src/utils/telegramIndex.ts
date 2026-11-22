@@ -350,9 +350,11 @@ export async function encodeTelegramV3Shard(items: DriveItem[]): Promise<{ text:
 }
 
 export async function decodeTelegramV3Shard(raw: string | undefined | null): Promise<DriveItem[]> {
-  if (!raw || !raw.startsWith(INDEX_SHARD_V3_HEADER)) return [];
+  if (!raw) return [];
+  const headerIdx = raw.indexOf(INDEX_SHARD_V3_HEADER);
+  if (headerIdx === -1) return [];
   try {
-    const rest = raw.slice(INDEX_SHARD_V3_HEADER.length);
+    const rest = raw.slice(headerIdx + INDEX_SHARD_V3_HEADER.length).trim();
     const mode = rest.slice(0, 2);
     const secondColon = rest.indexOf(':', 2);
     if (secondColon === -1) return [];
@@ -378,8 +380,9 @@ export async function buildTelegramV3Plan(
   const cleanedTombstones = pruneTombstones(tombstones);
   const sorted = [...items].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 
-  // Reserve room for up to ~20 shard refs in the manifest text (~500 chars)
-  const MAX_INLINE_MANIFEST_CHARS = 3400;
+  // Reserve room for readable header (~180 chars) + up to ~20 shard refs in the manifest text
+  const MAX_INLINE_MANIFEST_CHARS = 3200;
+  const MAX_MANIFEST_WITH_HEADER_CHARS = 3820;
 
   const packInlineManifest = async (candidateInline: DriveItem[]): Promise<string> => {
     const body: TelegramV3BodyPayload = {
@@ -397,9 +400,9 @@ export async function buildTelegramV3Plan(
     return INDEX_V3_HEADER + JSON.stringify(manifest);
   };
 
-  // Fast path: check if ALL items fit directly inside the single pinned text message
+  // Fast path: check if ALL items fit directly inside the single pinned text message (with human header)
   const fullAttempt = await packInlineManifest(sorted);
-  if (fullAttempt.length <= MAX_TELEGRAM_TEXT_LENGTH) {
+  if (fullAttempt.length <= MAX_MANIFEST_WITH_HEADER_CHARS) {
     return { inlineItems: sorted, shardBatches: [], cleanedTombstones };
   }
 
@@ -477,14 +480,89 @@ export async function encodeTelegramV3ManifestText(
   };
 }
 
-export function extractV3Revision(raw: string | undefined | null): string | null {
-  if (!raw || !raw.startsWith(INDEX_V3_HEADER)) return null;
+export function extractV3RawLine(raw: string | undefined | null): string | null {
+  if (!raw) return null;
+  const idx = raw.indexOf(INDEX_V3_HEADER);
+  if (idx === -1) return null;
+  return raw.slice(idx).trim();
+}
+
+export function extractV3Meta(
+  raw: string | undefined | null,
+): { rev: string; shardRefs: TelegramShardRef[] } | null {
+  const v3Line = extractV3RawLine(raw);
+  if (!v3Line) return null;
   try {
-    const parsed = JSON.parse(raw.slice(INDEX_V3_HEADER.length)) as Partial<TelegramV3ManifestPayload>;
-    return parsed?.v === 3 && typeof parsed.rev === 'string' ? parsed.rev : null;
+    const parsed = JSON.parse(v3Line.slice(INDEX_V3_HEADER.length)) as Partial<TelegramV3ManifestPayload>;
+    if (parsed?.v !== 3 || typeof parsed.rev !== 'string') return null;
+    const shardRefs: TelegramShardRef[] = Array.isArray(parsed.s)
+      ? parsed.s.filter(
+          (ref): ref is TelegramShardRef =>
+            Boolean(ref && typeof ref.id === 'number' && typeof ref.h === 'string'),
+        )
+      : [];
+    return { rev: parsed.rev, shardRefs };
   } catch {
     return null;
   }
+}
+
+export function extractV3Revision(raw: string | undefined | null): string | null {
+  return extractV3Meta(raw)?.rev ?? null;
+}
+
+function escapeTelegramHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function formatCompactStorageSize(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+export function formatTelegramIndexHtml(manifestText: string, items: DriveItem[]): string {
+  const active = items.filter((i) => !i.trashed);
+  const folderCount = active.filter((i) => i.type === 'folder').length;
+  const fileCount = active.filter((i) => i.type === 'file').length;
+  const totalBytes = active.reduce((acc, i) => acc + (i.type === 'file' ? i.size || 0 : 0), 0);
+  const timeLabel = new Date().toLocaleString('id-ID', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
+  const escapedManifest = escapeTelegramHtml(manifestText);
+  const quoteBlock = `<blockquote expandable>${escapedManifest}</blockquote>`;
+
+  const fullHeaderLines = [
+    '🗂 <b>TeleDrive Cloud — Indeks Sinkronisasi</b>',
+    `📁 ${folderCount} Folder • 📄 ${fileCount} File (${formatCompactStorageSize(totalBytes)}) • 🕒 ${escapeTelegramHtml(timeLabel)}`,
+    '<i>Pesan tersemat otomatis agar semua perangkat tetap sinkron (jangan dihapus).</i>',
+    '',
+  ];
+  const fullCandidate = [...fullHeaderLines, quoteBlock].join('\n');
+  const fullPlainLen = fullCandidate.replace(/<[^>]+>/g, '').length;
+  if (fullPlainLen <= 4080) {
+    return fullCandidate;
+  }
+
+  const compactHeader = `🗂 <b>TeleDrive Cloud — Indeks</b> (${folderCount}F · ${fileCount}B)\n`;
+  if ((compactHeader + quoteBlock).replace(/<[^>]+>/g, '').length <= 4080) {
+    return compactHeader + quoteBlock;
+  }
+  return quoteBlock;
+}
+
+export function formatTelegramShardHtml(shardText: string, partNumber: number): string {
+  return [
+    `📦 <b>TeleDrive Cloud — Arsip Sinkronisasi #${partNumber}</b>`,
+    '<i>Paket data otomatis untuk folder/file besar (jangan dihapus).</i>',
+    `<blockquote expandable>${escapeTelegramHtml(shardText)}</blockquote>`,
+  ].join('\n');
 }
 
 export async function decodeTelegramV3Manifest(raw: string | undefined | null): Promise<{
@@ -495,11 +573,12 @@ export async function decodeTelegramV3Manifest(raw: string | undefined | null): 
   shards: TelegramShardRef[];
   prefs?: CloudViewPrefs;
 }> {
-  if (!raw || !raw.startsWith(INDEX_V3_HEADER)) {
+  const v3Line = extractV3RawLine(raw);
+  if (!v3Line) {
     return { isV3: false, rev: '', items: [], tombstones: {}, shards: [] };
   }
   try {
-    const parsed = JSON.parse(raw.slice(INDEX_V3_HEADER.length)) as Partial<TelegramV3ManifestPayload>;
+    const parsed = JSON.parse(v3Line.slice(INDEX_V3_HEADER.length)) as Partial<TelegramV3ManifestPayload>;
     if (!parsed || parsed.v !== 3) {
       return { isV3: false, rev: '', items: [], tombstones: {}, shards: [] };
     }

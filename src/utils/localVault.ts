@@ -6,6 +6,8 @@ const TG_CONFIG_KEY = 'teledrive_tg_config_v2';
 const DISMISSED_TG_MSGS_KEY = 'teledrive_dismissed_tg_msgs_v1';
 const TOMBSTONES_KEY = 'teledrive_tombstones_v1';
 const VIEW_PREFS_KEY = 'teledrive_view_prefs_v1';
+const LOCAL_VAULT_KEY = 'teledrive_encrypted_vault_v1';
+const SHARD_CACHE_KEY = 'teledrive_shard_cache_v1';
 const IDB_NAME = 'TeleDriveBlobVault';
 const IDB_STORE = 'blobs';
 
@@ -273,9 +275,41 @@ export function addDeletedTombstones(
   return current;
 }
 
+export function loadLocalEncryptedVault(): string {
+  try {
+    return (localStorage.getItem(LOCAL_VAULT_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+export function saveLocalEncryptedVault(vaultCode: string): void {
+  try {
+    localStorage.setItem(LOCAL_VAULT_KEY, vaultCode.trim());
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function clearLocalEncryptedVault(): void {
+  try {
+    localStorage.removeItem(LOCAL_VAULT_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export function isSessionOnlyLogin(): boolean {
+  try {
+    return Boolean(sessionStorage.getItem(TG_CONFIG_KEY));
+  } catch {
+    return false;
+  }
+}
+
 export function loadStoredTelegramConfig(): TelegramConfigState {
   try {
-    const raw = localStorage.getItem(TG_CONFIG_KEY);
+    const raw = sessionStorage.getItem(TG_CONFIG_KEY) || localStorage.getItem(TG_CONFIG_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<TelegramConfigState>;
       return {
@@ -303,9 +337,42 @@ export function loadStoredTelegramConfig(): TelegramConfigState {
   };
 }
 
-export function saveStoredTelegramConfig(cfg: TelegramConfigState): void {
+export function saveStoredTelegramConfig(
+  cfg: TelegramConfigState,
+  sessionOnly?: boolean,
+): void {
   try {
-    localStorage.setItem(TG_CONFIG_KEY, JSON.stringify(cfg));
+    if (!cfg.connected || !cfg.botToken || !cfg.chatId) {
+      sessionStorage.removeItem(TG_CONFIG_KEY);
+      localStorage.removeItem(TG_CONFIG_KEY);
+      return;
+    }
+    const useSession = sessionOnly ?? isSessionOnlyLogin();
+    const serialized = JSON.stringify(cfg);
+    if (useSession) {
+      sessionStorage.setItem(TG_CONFIG_KEY, serialized);
+      localStorage.removeItem(TG_CONFIG_KEY);
+    } else {
+      localStorage.setItem(TG_CONFIG_KEY, serialized);
+      sessionStorage.removeItem(TG_CONFIG_KEY);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function wipeUnlockedSessionData(options?: { clearLocalVault?: boolean }): void {
+  try {
+    sessionStorage.removeItem(TG_CONFIG_KEY);
+    localStorage.removeItem(TG_CONFIG_KEY);
+    localStorage.removeItem(ITEMS_KEY);
+    localStorage.removeItem(TOMBSTONES_KEY);
+    localStorage.removeItem(DISMISSED_TG_MSGS_KEY);
+    localStorage.removeItem(VIEW_PREFS_KEY);
+    localStorage.removeItem(SHARD_CACHE_KEY);
+    if (options?.clearLocalVault) {
+      localStorage.removeItem(LOCAL_VAULT_KEY);
+    }
   } catch {
     // ignore
   }

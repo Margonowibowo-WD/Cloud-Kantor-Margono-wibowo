@@ -161,7 +161,7 @@ export function FileGrid({
             Folder ({folders.length})
           </h2>
 
-          <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(205px,1fr))] gap-3">
             {folders.map((folder) => {
               const selected = selectedIds.has(folder.id);
               const isDropHighlight = dropTargetFolder?.id === folder.id;
@@ -240,7 +240,7 @@ export function FileGrid({
                       onDropExternalFilesToFolder(captureDropEntriesSync(e.dataTransfer), folder.id);
                     }
                   }}
-                  className={`group relative flex items-center justify-between gap-3 rounded-2xl border border-l-4 p-3.5 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-md ${
+                  className={`group relative flex flex-col justify-between gap-2 rounded-2xl border border-l-4 p-3 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-md ${
                     isDropHighlight
                       ? 'border-blue-500 border-l-blue-600 bg-blue-50 ring-2 ring-blue-500 dark:bg-blue-950/60'
                       : selected
@@ -257,24 +257,30 @@ export function FileGrid({
                         onOpenItem(folder);
                       }
                     }}
-                    className="flex min-w-0 flex-1 items-center gap-3.5 rounded-xl text-left focus-visible:outline-2 focus-visible:outline-blue-600"
+                    title={folder.name}
+                    className="flex w-full min-w-0 items-start gap-2.5 rounded-xl text-left focus-visible:outline-2 focus-visible:outline-blue-600"
                   >
-                    <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-amber-100/90 ring-1 ring-amber-200/80 transition-transform duration-150 group-hover:scale-105 dark:bg-amber-950/70 dark:ring-amber-800/70">
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-100/90 ring-1 ring-amber-200/80 transition-transform duration-150 group-hover:scale-105 dark:bg-amber-950/70 dark:ring-amber-800/70">
                       <FileIcon
                         type="folder"
                         mimeType={folder.mimeType}
                         filename={folder.name}
-                        size="lg"
+                        size="md"
                       />
                     </div>
                     <div className="min-w-0 flex-1">
-                      <div className="truncate font-display text-sm font-bold text-slate-900 dark:text-slate-100">
-                        {folder.name}
+                      <div className="flex items-start justify-between gap-1.5">
+                        <span className="line-clamp-2 break-words font-display text-[13px] font-bold leading-snug text-slate-900 dark:text-slate-100">
+                          {folder.name}
+                        </span>
+                        {!isTrashView && folder.starred && (
+                          <Star className="mt-0.5 h-3 w-3 shrink-0 fill-amber-400 text-amber-500" />
+                        )}
                       </div>
-                      <div className="mt-0.5 flex items-center gap-1.5 text-[11px] font-medium tabular-nums text-slate-500 whitespace-nowrap dark:text-slate-400">
+                      <div className="mt-0.5 flex items-center gap-1 text-[10.5px] font-medium tabular-nums text-slate-500 whitespace-nowrap dark:text-slate-400">
                         {isExternalUploadDrop ? (
-                          <span className="font-semibold text-blue-600 dark:text-blue-400">
-                            Lepas untuk unggah ke folder ini
+                          <span className="truncate font-semibold text-blue-600 dark:text-blue-400">
+                            Lepas untuk unggah ke folder
                           </span>
                         ) : (
                           <>
@@ -291,17 +297,8 @@ export function FileGrid({
                     </div>
                   </button>
 
-                  {!isTrashView && folder.starred && (
-                    <Star className="pointer-events-none h-3.5 w-3.5 shrink-0 fill-amber-400 text-amber-500 group-hover:hidden" />
-                  )}
-
-                  <div
-                    className={`${
-                      isTrashView
-                        ? 'flex shrink-0 items-center gap-0.5'
-                        : 'flex shrink-0 items-center gap-0.5 rounded-lg p-0.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100'
-                    }`}
-                  >
+                  {/* Dedicated Action Bar Below Folder Name (Never Squeezes Title) */}
+                  <div className="flex items-center justify-end gap-0.5 border-t border-amber-200/60 pt-1.5 dark:border-amber-900/40">
                     {!isTrashView ? (
                       <>
                         <button
@@ -312,9 +309,10 @@ export function FileGrid({
                               ? `Hapus bintang ${folder.name}`
                               : `Bintangi ${folder.name}`
                           }
+                          title={folder.starred ? 'Hapus bintang' : 'Favoritkan'}
                           className={`flex h-6 w-6 items-center justify-center rounded-md transition-colors ${
                             folder.starred
-                              ? 'text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-950/40'
+                              ? 'text-amber-500 hover:bg-amber-100/70 dark:hover:bg-amber-950/40'
                               : 'text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 dark:hover:bg-slate-700'
                           }`}
                         >
@@ -324,6 +322,7 @@ export function FileGrid({
                           type="button"
                           onClick={() => onCopyItem(folder)}
                           aria-label={`Salin ${folder.name}`}
+                          title="Salin"
                           className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 dark:hover:bg-slate-700"
                         >
                           <Copy className="h-3 w-3" />
@@ -332,6 +331,7 @@ export function FileGrid({
                           type="button"
                           onClick={() => onRenameItem(folder)}
                           aria-label={`Ubah nama ${folder.name}`}
+                          title="Ubah nama"
                           className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 dark:hover:bg-slate-700"
                         >
                           <Pencil className="h-3 w-3" />
@@ -340,6 +340,7 @@ export function FileGrid({
                           type="button"
                           onClick={() => onTrashItem(folder)}
                           aria-label={`Buang ${folder.name}`}
+                          title="Pindahkan ke Sampah"
                           className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-rose-100 hover:text-rose-700 dark:hover:bg-rose-950/50 dark:hover:text-rose-300"
                         >
                           <Trash2 className="h-3 w-3" />
@@ -351,6 +352,7 @@ export function FileGrid({
                           type="button"
                           onClick={() => onRestoreItem(folder)}
                           aria-label={`Pulihkan ${folder.name}`}
+                          title="Pulihkan"
                           className="flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-100 dark:text-blue-400 dark:hover:bg-blue-950/50"
                         >
                           <RotateCcw className="h-3 w-3" />
@@ -359,6 +361,7 @@ export function FileGrid({
                           type="button"
                           onClick={() => onDeletePermanent(folder)}
                           aria-label={`Hapus permanen ${folder.name}`}
+                          title="Hapus permanen"
                           className="flex h-6 w-6 items-center justify-center rounded-md text-rose-600 hover:bg-rose-100 dark:text-rose-400 dark:hover:bg-rose-950/50"
                         >
                           <Trash2 className="h-3 w-3" />
@@ -383,7 +386,7 @@ export function FileGrid({
             File ({files.length})
           </h2>
 
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(175px,1fr))] gap-3">
             {files.map((file) => {
               const selected = selectedIds.has(file.id);
               const category = getFileCategory(file.mimeType, file.name);

@@ -35,13 +35,16 @@ import {
   getLocalBlob,
   loadDeletedTombstones,
   loadDismissedTelegramMessageIds,
+  loadLocalEncryptedVault,
   loadStoredItems,
   loadStoredTelegramConfig,
   loadStoredViewPrefs,
   saveDeletedTombstones,
+  saveLocalEncryptedVault,
   saveStoredItems,
   saveStoredTelegramConfig,
   saveStoredViewPrefs,
+  wipeUnlockedSessionData,
 } from './utils/localVault';
 import {
   DIRECT_TELEGRAM_MAX_BYTES,
@@ -60,7 +63,7 @@ import {
   mergeDriveItems,
   reconcileConcurrentDriveState,
 } from './utils/telegramIndex';
-import { decryptTelegramVault, isVaultConfigured } from './utils/cryptoVault';
+import { isVaultConfigured } from './utils/cryptoVault';
 import { startDirectDownload, startDirectUpload } from './utils/uploadClient';
 import { Sidebar } from './components/Sidebar';
 import { type CloudSyncState, type ThemeMode, TopBar } from './components/TopBar';
@@ -72,16 +75,10 @@ import { type AppNotification, TopRightNotifications } from './components/TopRig
 import { PreviewModal } from './components/PreviewModal';
 import { RightPreviewPane } from './components/RightPreviewPane';
 import { TelegramModal } from './components/TelegramModal';
-import { VaultUnlockModal } from './components/VaultUnlockModal';
+import { PersonalLockScreen } from './components/PersonalLockScreen';
 import { ConfirmDeleteModal, FolderNameModal } from './components/ActionModals';
 
-const DEFAULT_TELEGRAM_VAULT =
-  'TDVAULT1:wIxIsTjutAMZac4LmnW4fw.YR-haJJvsPu4fl1-.IQil19h6ECXpwU1XufaUy_jvptzX6edLgPLrSezQD69Uef1Y2mA4hO6_TtpACJpfSdPD0uqYBjr0n_DgZR5nqIXFpBxhJ9ksf2tuTnIwDFVZWzlbGHlumExEYw';
-const DEFAULT_VAULT_ACCESS_KEY = '061194';
-
-const ENV_TELEGRAM_VAULT =
-  ((import.meta.env.VITE_TELEGRAM_VAULT as string | undefined) || '').trim() ||
-  DEFAULT_TELEGRAM_VAULT;
+const ENV_TELEGRAM_VAULT = ((import.meta.env.VITE_TELEGRAM_VAULT as string | undefined) || '').trim();
 
 function collectDescendantIds(rootId: string, allItems: DriveItem[]): Set<string> {
   const result = new Set<string>([rootId]);
@@ -157,7 +154,10 @@ export default function App() {
 
   const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
   const [telegramModalOpen, setTelegramModalOpen] = useState(false);
-  const [vaultModalOpen, setVaultModalOpen] = useState(false);
+  const [localVaultString, setLocalVaultString] = useState<string>(() => loadLocalEncryptedVault());
+  const activeVaultString = isVaultConfigured(ENV_TELEGRAM_VAULT)
+    ? ENV_TELEGRAM_VAULT
+    : localVaultString;
   const [nameModal, setNameModal] = useState<{
     open: boolean;
     mode: 'create' | 'rename';
@@ -175,7 +175,7 @@ export default function App() {
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
   const [syncingTelegram, setSyncingTelegram] = useState(false);
   const [syncState, setSyncState] = useState<CloudSyncState>(() =>
-    loadStoredTelegramConfig().connected ? 'synced' : 'syncing',
+    loadStoredTelegramConfig().connected ? 'synced' : 'disconnected',
   );
   const [marquee, setMarquee] = useState<{
     startX: number;
@@ -211,8 +211,9 @@ export default function App() {
   >(new Map());
   const didAutoSyncRef = useRef(false);
   const syncInFlightRef = useRef(false);
-  const autoConnectAttemptedRef = useRef(false);
   const hasSyncedOnceRef = useRef(false);
+  const pinBlockedRef = useRef(false);
+  const autoCreateIndexAttemptedRef = useRef(false);
   const lastSyncMsRef = useRef(0);
   const lastChannelUpdatesMsRef = useRef(0);
   const lastProbeMsRef = useRef(0);
@@ -334,6 +335,15 @@ export default function App() {
           saveStoredTelegramConfig(updatedCfg);
           return updatedCfg;
         });
+        if (pushRes.pinBlocked && !pinBlockedRef.current) {
+          pinBlockedRef.current = true;
+          pushNotification({
+            kind: 'error',
+            title: 'Bot belum diizinkan Pin Pesan di Channel',
+            detail:
+              'Buka Info Channel Telegram -> Admin -> aktifkan izin "Pin Messages" & "Edit Messages" untuk Bot agar tidak membuat pesan baru.',
+          });
+        }
         setSyncState('synced');
       });
     }, 600);
@@ -351,49 +361,56 @@ export default function App() {
     broadcastLocalStateToTabs,
   ]);
 
-  const connectDefaultVaultSilently = useCallback(async (): Promise<{
-    config: TelegramConfigState;
-    pinnedIndexText?: string;
-    pinnedMessageId?: number;
-  } | null> => {
-    if (!isVaultConfigured(ENV_TELEGRAM_VAULT)) return null;
-    try {
-      setSyncState('syncing');
-      const creds = await decryptTelegramVault(ENV_TELEGRAM_VAULT, DEFAULT_VAULT_ACCESS_KEY);
-      const verification = await verifyTelegramDirect(creds.botToken, creds.chatId);
-      if (!verification.ok) {
-        setSyncState('error');
-        return null;
+  const handleLockDrive = useCallback(
+    (options?: { broadcast?: boolean; clearLocalVault?: boolean }) => {
+      for (const cancel of transferCancelMap.current.values()) {
+        try {
+          cancel();
+        } catch {
+          // ignore abort errors
+        }
       }
-      const nextCfg: TelegramConfigState = {
-        connected: true,
-        botToken: creds.botToken,
-        chatId: verification.chatId || creds.chatId,
-        botUsername: verification.botUsername,
-        botName: verification.botName,
-        chatTitle: verification.chatTitle,
-        chatType: verification.chatType,
-        autoSync: true,
-        pinnedIndexMessageId: verification.pinnedMessageId,
-        lastSyncedAt: new Date().toISOString(),
-      };
-      if (nextCfg.pinnedIndexMessageId) {
-        pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
+      transferCancelMap.current.clear();
+      uploadQueueRef.current = [];
+      failedUploadJobsRef.current.clear();
+      activeUploadCountRef.current = 0;
+
+      wipeUnlockedSessionData({ clearLocalVault: options?.clearLocalVault });
+      if (options?.clearLocalVault) {
+        setLocalVaultString('');
       }
-      setTgConfig(nextCfg);
-      saveStoredTelegramConfig(nextCfg);
-      return {
-        config: nextCfg,
-        pinnedIndexText: verification.pinnedIndexText,
-        pinnedMessageId: verification.pinnedMessageId,
-      };
-    } catch {
-      // Custom vault configured with a non-default PIN
+
+      didAutoSyncRef.current = false;
+      hasSyncedOnceRef.current = false;
+      lastSyncedRevRef.current = undefined;
+      pinnedIndexIdRef.current = undefined;
+      tombstonesRef.current = {};
+
+      setItems([]);
+      setTransfers([]);
+      setSelectedIds(new Set());
+      setClipboardIds([]);
+      setPreviewItem(null);
+      setTelegramModalOpen(false);
+      setContextMenu(null);
       setSyncState('disconnected');
-      setVaultModalOpen(true);
-      return null;
-    }
-  }, []);
+      setTgConfig({
+        connected: false,
+        botToken: '',
+        chatId: '',
+        autoSync: true,
+      });
+
+      if (options?.broadcast !== false) {
+        try {
+          tabChannelRef.current?.postMessage({ type: 'teledrive-locked' });
+        } catch {
+          // ignore
+        }
+      }
+    },
+    [],
+  );
 
   // Two-way Google Drive-grade sync: 1-call revision check in background, no badge flicker
   const syncFromTelegram = useCallback(
@@ -402,16 +419,6 @@ export default function App() {
       configOverride?: TelegramConfigState,
       prefetched?: { pinnedIndexText?: string; pinnedMessageId?: number },
     ) => {
-      const activeCfg = configOverride || tgConfig;
-      if (!activeCfg.connected || !activeCfg.botToken || !activeCfg.chatId) {
-        const auto = await connectDefaultVaultSilently();
-        if (!auto) return;
-        configOverride = auto.config;
-        prefetched = {
-          pinnedIndexText: auto.pinnedIndexText,
-          pinnedMessageId: auto.pinnedMessageId,
-        };
-      }
       const cfg = configOverride || tgConfig;
       if (!cfg.connected || !cfg.botToken || !cfg.chatId) return;
       if (syncInFlightRef.current) return;
@@ -484,11 +491,16 @@ export default function App() {
         if (shouldScanUpdates) {
           lastChannelUpdatesMsRef.current = nowMs;
           const dismissedIds = loadDismissedTelegramMessageIds();
+          const activeShardIds = new Set((res.shardRefs || []).map((s) => s.id));
           channelMedia = await fetchChannelMediaUpdates(
             cfg.botToken,
             cfg.chatId,
             knownMsgIds,
             dismissedIds,
+            {
+              pinnedMessageId: res.pinnedMessageId ?? cfg.pinnedIndexMessageId,
+              shardIds: activeShardIds,
+            },
           );
         }
 
@@ -566,10 +578,16 @@ export default function App() {
           lastSyncedRevRef.current = res.rev;
         }
 
-        // Push back whenever local had items/updates not yet reflected in the remote index
+        // Push back whenever local had items/updates not yet reflected in the remote index (or raw index needs clean HTML formatting)
+        const needsFormattingUpgrade = Boolean(
+          res.hasIndex &&
+            res.rawPinnedText &&
+            !res.rawPinnedText.includes('TeleDrive Cloud'),
+        );
         const remoteById = new Map(effectiveRemoteItems.map((i) => [i.id, i]));
         const localHasUnpushedChanges =
           !res.hasIndex ||
+          needsFormattingUpgrade ||
           channelMedia.length > 0 ||
           deletedInTelegramItemIds.size > 0 ||
           reconciled.items.some((item) => {
@@ -577,20 +595,41 @@ export default function App() {
             return !r || (Date.parse(item.updatedAt) || 0) > (Date.parse(r.updatedAt) || 0);
           });
 
-        if (
+        const allowCreateNewIndex = !silent || !autoCreateIndexAttemptedRef.current;
+        const shouldPushBack =
           localHasUnpushedChanges &&
-          reconciled.items.length + Object.keys(reconciled.tombstones).length > 0
-        ) {
+          reconciled.items.length + Object.keys(reconciled.tombstones).length > 0 &&
+          !(pinBlockedRef.current && !res.hasIndex) &&
+          (res.hasIndex || allowCreateNewIndex);
+
+        if (shouldPushBack) {
+          if (!res.hasIndex) {
+            autoCreateIndexAttemptedRef.current = true;
+          }
           const pushRes = await pushIndexToTelegramPinnedMessage(
             cfg.botToken,
             cfg.chatId,
             reconciled.items,
             nextPinnedId,
             reconciled.tombstones,
-            { skipMergePull: true, prefs: viewPrefsRef.current },
+            {
+              skipMergePull: true,
+              prefs: viewPrefsRef.current,
+              existingPinnedText: res.rawPinnedText,
+              existingShardRefs: res.shardRefs,
+            },
           );
           if (pushRes?.pinnedMessageId) nextPinnedId = pushRes.pinnedMessageId;
           if (pushRes?.rev) lastSyncedRevRef.current = pushRes.rev;
+          if (pushRes?.pinBlocked && !pinBlockedRef.current) {
+            pinBlockedRef.current = true;
+            pushNotification({
+              kind: 'error',
+              title: 'Bot belum diizinkan Pin Pesan di Channel',
+              detail:
+                'Buka Info Channel Telegram -> Admin -> aktifkan izin "Pin Messages" & "Edit Messages" untuk Bot agar tidak membuat pesan baru.',
+            });
+          }
         }
 
         if (nextPinnedId) {
@@ -636,7 +675,6 @@ export default function App() {
     },
     [
       tgConfig,
-      connectDefaultVaultSilently,
       pushNotification,
       applyRemoteViewPrefs,
       broadcastLocalStateToTabs,
@@ -658,6 +696,10 @@ export default function App() {
       const ch = new BroadcastChannel('teledrive_sync_v1');
       tabChannelRef.current = ch;
       ch.onmessage = (ev) => {
+        if (ev.data?.type === 'teledrive-locked') {
+          handleLockDrive({ broadcast: false });
+          return;
+        }
         if (ev.data?.type === 'teledrive-state-updated') {
           if (typeof ev.data.rev === 'string') {
             lastSyncedRevRef.current = ev.data.rev;
@@ -683,24 +725,7 @@ export default function App() {
       tabChannelRef.current?.close();
       tabChannelRef.current = null;
     };
-  }, [applyRemoteViewPrefs]);
-
-  // Permanent automatic connect on startup if this browser/origin isn't connected yet
-  useEffect(() => {
-    if (tgConfig.connected && tgConfig.botToken && tgConfig.chatId) return;
-    if (autoConnectAttemptedRef.current) return;
-    autoConnectAttemptedRef.current = true;
-
-    void connectDefaultVaultSilently().then((auto) => {
-      if (auto) {
-        didAutoSyncRef.current = true;
-        void syncFromTelegram(true, auto.config, {
-          pinnedIndexText: auto.pinnedIndexText,
-          pinnedMessageId: auto.pinnedMessageId,
-        });
-      }
-    });
-  }, [tgConfig.connected, tgConfig.botToken, tgConfig.chatId, connectDefaultVaultSilently, syncFromTelegram]);
+  }, [applyRemoteViewPrefs, handleLockDrive]);
 
   // Google Drive calm background sync: startup, tab focus/visibility, and gentle 30s delta revision check
   useEffect(() => {
@@ -1116,7 +1141,6 @@ export default function App() {
   const handleRetryFailedTasks = useCallback(
     (taskIds: string[]) => {
       if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
-        setVaultModalOpen(true);
         return;
       }
 
@@ -1178,12 +1202,7 @@ export default function App() {
       }
 
       if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
-        pushNotification({
-          kind: 'error',
-          title: 'Cloud Telegram belum terhubung',
-          detail: 'Masukkan PIN Brankas untuk mengunggah ke Cloud.',
-        });
-        setVaultModalOpen(true);
+        setTelegramModalOpen(true);
         return;
       }
 
@@ -1764,6 +1783,38 @@ export default function App() {
     visibleItems.length > 0 && visibleItems.every((i) => selectedIds.has(i.id));
   const isTrashView = section === 'trash';
 
+  if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
+    return (
+      <PersonalLockScreen
+        vaultString={activeVaultString}
+        onUnlockSuccess={(nextCfg, pulledItems, opts) => {
+          if (opts?.savedLocalVault) {
+            saveLocalEncryptedVault(opts.savedLocalVault);
+            setLocalVaultString(opts.savedLocalVault);
+          }
+          setTgConfig(nextCfg);
+          saveStoredTelegramConfig(nextCfg, opts?.sessionOnly);
+          pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
+          didAutoSyncRef.current = false;
+          hasSyncedOnceRef.current = false;
+          lastSyncMsRef.current = 0;
+          setSyncState('synced');
+          if (pulledItems.length > 0) {
+            setItems(pulledItems);
+            saveStoredItems(pulledItems);
+          }
+          pushNotification({
+            kind: 'success',
+            title: `Terhubung ke @${nextCfg.botUsername || 'Bot'}`,
+            detail: opts?.savedLocalVault
+              ? 'PIN pengunci aktif & file Anda siap diakses.'
+              : 'Drive pribadi Anda siap digunakan.',
+          });
+        }}
+      />
+    );
+  }
+
   return (
     <div
       className="flex h-screen overflow-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100"
@@ -1852,10 +1903,10 @@ export default function App() {
           telegram={telegramStatus}
           syncingTelegram={syncingTelegram}
           syncState={syncState}
-          vaultAvailable={isVaultConfigured(ENV_TELEGRAM_VAULT)}
+          vaultAvailable={isVaultConfigured(activeVaultString)}
           onSyncNow={() => void syncFromTelegram(false)}
           onOpenTelegramModal={() => setTelegramModalOpen(true)}
-          onOpenVaultUnlock={() => setVaultModalOpen(true)}
+          onLockDrive={() => handleLockDrive()}
         />
 
         <Toolbar
@@ -2142,14 +2193,21 @@ export default function App() {
       <TelegramModal
         open={telegramModalOpen}
         config={tgConfig}
-        vaultAvailable={isVaultConfigured(ENV_TELEGRAM_VAULT)}
-        onOpenVaultUnlock={() => setVaultModalOpen(true)}
+        vaultAvailable={isVaultConfigured(activeVaultString)}
         onClose={() => setTelegramModalOpen(false)}
+        onSaveLocalVault={(vaultCode) => {
+          saveLocalEncryptedVault(vaultCode);
+          setLocalVaultString(vaultCode);
+        }}
         onSaveConfig={(nextCfg, pulledItems) => {
+          if (!nextCfg.connected) {
+            handleLockDrive({ clearLocalVault: true });
+            return;
+          }
           setTgConfig(nextCfg);
           saveStoredTelegramConfig(nextCfg);
           pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
-          setSyncState(nextCfg.connected ? 'synced' : 'disconnected');
+          setSyncState('synced');
           if (pulledItems && pulledItems.length > 0) {
             setItems((prev) => {
               const merged = mergeDriveItems(prev, pulledItems);
@@ -2159,9 +2217,7 @@ export default function App() {
           }
           pushNotification({
             kind: 'success',
-            title: nextCfg.connected
-              ? `Terhubung ke @${nextCfg.botUsername}`
-              : 'Koneksi Telegram diputuskan',
+            title: `Terhubung ke @${nextCfg.botUsername}`,
           });
         }}
         onPullRemoteItems={(pulledItems, pinnedMsgId) => {
@@ -2186,36 +2242,6 @@ export default function App() {
             });
           }
         }}
-      />
-
-      <VaultUnlockModal
-        open={vaultModalOpen}
-        vaultString={ENV_TELEGRAM_VAULT}
-        onUnlockSuccess={(nextCfg, pulledItems) => {
-          setTgConfig(nextCfg);
-          saveStoredTelegramConfig(nextCfg);
-          pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
-          didAutoSyncRef.current = true;
-          lastSyncMsRef.current = Date.now();
-          setSyncState('synced');
-          if (pulledItems.length > 0) {
-            setItems((prev) => {
-              const merged = mergeDriveItems(prev, pulledItems);
-              saveStoredItems(merged);
-              return merged;
-            });
-          }
-          setVaultModalOpen(false);
-          pushNotification({
-            kind: 'success',
-            title: `Terhubung ke @${nextCfg.botUsername || 'Bot'}`,
-            detail:
-              pulledItems.length > 0
-                ? `${pulledItems.length} item otomatis disinkronkan.`
-                : 'Cloud Kantor Margono siap digunakan.',
-          });
-        }}
-        onDismiss={() => setVaultModalOpen(false)}
       />
 
       <FolderNameModal

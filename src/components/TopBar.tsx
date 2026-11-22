@@ -5,6 +5,7 @@ import {
   KeyRound,
   LayoutGrid,
   List,
+  Lock,
   Menu,
   Moon,
   RefreshCw,
@@ -39,6 +40,7 @@ interface TopBarProps {
   onSyncNow: () => void;
   onOpenTelegramModal: () => void;
   onOpenVaultUnlock?: () => void;
+  onLockDrive?: () => void;
 }
 
 export function TopBar({
@@ -59,6 +61,7 @@ export function TopBar({
   onSyncNow,
   onOpenTelegramModal,
   onOpenVaultUnlock,
+  onLockDrive,
 }: TopBarProps) {
   const localRef = useRef<HTMLInputElement>(null);
   const inputRef = searchInputRef ?? localRef;
@@ -245,6 +248,19 @@ export function TopBar({
           </span>
         </button>
 
+        {/* Quick Lock Button */}
+        {onLockDrive && (
+          <button
+            type="button"
+            onClick={onLockDrive}
+            title="Kunci layar & lindungi Drive"
+            aria-label="Kunci layar TeleDrive"
+            className="td-press flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700 dark:hover:text-white"
+          >
+            <Lock className="h-4 w-4" />
+          </button>
+        )}
+
         {/* Profile Menu (Discreet Telegram Connection & Sync Controls) */}
         <div className="relative" ref={profileRef}>
           <button
@@ -318,6 +334,21 @@ export function TopBar({
                   <Settings2 className="h-3.5 w-3.5" />
                   <span>Pengaturan Koneksi</span>
                 </button>
+
+                {onLockDrive && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setProfileOpen(false);
+                      onLockDrive();
+                    }}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                  >
+                    <Lock className="h-3.5 w-3.5" />
+                    <span>Kunci Layar Sekarang</span>
+                  </button>
+                )}
               </div>
             </div>
           )}

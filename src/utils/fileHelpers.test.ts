@@ -25,7 +25,10 @@ import {
   encodeTelegramDocumentIndex,
   encodeTelegramIndex,
   encodeTelegramV3ManifestText,
+  extractV3Meta,
   extractV3Revision,
+  formatTelegramIndexHtml,
+  formatTelegramShardHtml,
   mergeDriveItems,
   reconcileConcurrentDriveState,
   reconcileRemoteDriveItems,
@@ -728,6 +731,46 @@ test('V3 manifest preserves CloudViewPrefs and extracts revision without full de
   const decoded = await decodeTelegramV3Manifest(encoded.text);
   assert.deepEqual(decoded.prefs, prefs);
   assert.equal(decoded.rev, encoded.rev);
+
+  // Verify decoding still succeeds when Telegram wraps V3 inside readable summary + expandable quote
+  const htmlFormatted = formatTelegramIndexHtml(encoded.text, sampleItems.slice(0, 2));
+  const simulatedTelegramPlainText = htmlFormatted
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+  assert.ok(simulatedTelegramPlainText.includes('TeleDrive Cloud — Indeks Sinkronisasi'));
+  assert.equal(extractV3Revision(simulatedTelegramPlainText), encoded.rev);
+  const decodedWrapped = await decodeTelegramV3Manifest(simulatedTelegramPlainText);
+  assert.equal(decodedWrapped.isV3, true);
+  assert.equal(decodedWrapped.items.length, 2);
+
+  const shardHtml = formatTelegramShardHtml('TELEDRIVE_SHARD_V3:J:abc:[]', 1);
+  const shardPlain = shardHtml.replace(/<[^>]+>/g, '');
+  const decodedShard = await decodeTelegramV3Shard(shardPlain);
+  assert.deepEqual(decodedShard, []);
+});
+
+test('formatTelegramIndexHtml stays <= 4080 plain-text chars and extractV3Meta preserves shardRefs', async () => {
+  const longManifest = `TELEDRIVE_IDX_V3:${JSON.stringify({
+    v: 3,
+    rev: 'rev999',
+    z: 'a'.repeat(3910),
+    s: [
+      { id: 101, h: 'h1' },
+      { id: 102, h: 'h2' },
+    ],
+  })}`;
+  const html = formatTelegramIndexHtml(longManifest, sampleItems);
+  const plainText = html.replace(/<[^>]+>/g, '');
+  assert.ok(plainText.length <= 4080, `Expected plain text <= 4080, got ${plainText.length}`);
+
+  const meta = extractV3Meta(plainText);
+  assert.equal(meta?.rev, 'rev999');
+  assert.deepEqual(meta?.shardRefs, [
+    { id: 101, h: 'h1' },
+    { id: 102, h: 'h2' },
+  ]);
 });
 
 

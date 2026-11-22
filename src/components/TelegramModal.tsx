@@ -32,6 +32,7 @@ interface TelegramModalProps {
   onClose: () => void;
   onSaveConfig: (next: TelegramConfigState, pulledItems?: DriveItem[]) => void;
   onPullRemoteItems: (items: DriveItem[], pinnedMessageId?: number) => void;
+  onSaveLocalVault?: (vaultCode: string) => void;
 }
 
 export function TelegramModal({
@@ -42,6 +43,7 @@ export function TelegramModal({
   onClose,
   onSaveConfig,
   onPullRemoteItems,
+  onSaveLocalVault,
 }: TelegramModalProps) {
   const [botToken, setBotToken] = useState(config.botToken || '');
   const [chatId, setChatId] = useState(config.chatId || '');
@@ -195,9 +197,10 @@ export function TelegramModal({
         vaultPin,
       );
       setGeneratedVault(code);
+      onSaveLocalVault?.(code);
       setFeedback({
         kind: 'success',
-        text: 'Kode brankas terenkripsi siap. Salin dan simpan ke GitHub Secret TELEGRAM_VAULT.',
+        text: 'PIN kunci tersimpan aman di perangkat ini! Anda juga bisa menyalin kodenya ke GitHub Secret TELEGRAM_VAULT jika ingin dipakai di HP/laptop lain.',
       });
     } catch (err) {
       setFeedback({
