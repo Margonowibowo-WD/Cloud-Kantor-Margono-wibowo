@@ -1,17 +1,11 @@
-import { useEffect, useState } from 'react';
-import {
-  Copy,
-  Download,
-  Pencil,
-  RotateCcw,
-  Star,
-  Trash2,
-} from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Star } from 'lucide-react';
 import type { DriveItem, TelegramConfigState } from '../types/drive';
 import {
   formatBytes,
   formatRelativeDateId,
   getFileCategory,
+  isPdfFile,
 } from '../utils/fileHelpers';
 import { getLocalBlob } from '../utils/localVault';
 import {
@@ -20,9 +14,11 @@ import {
 } from '../utils/dropUploadHelpers';
 import { DIRECT_TELEGRAM_MAX_BYTES, resolveTelegramFileUrl } from '../utils/telegramDirect';
 import { FileIcon } from './FileIcon';
+import { type HoveredItemAnchor, ItemHoverTooltip } from './ItemHoverTooltip';
 
 interface FileGridProps {
   items: DriveItem[];
+  allItems: DriveItem[];
   tgConfig: TelegramConfigState;
   folderCounts?: Record<string, number>;
   selectedIds: Set<string>;
@@ -35,13 +31,6 @@ interface FileGridProps {
   onContextMenuItem: (e: React.MouseEvent, item: DriveItem) => void;
   onOpenItem: (item: DriveItem) => void;
   onDoubleClickItem?: (item: DriveItem) => void;
-  onDownloadItem: (item: DriveItem) => void;
-  onCopyItem: (item: DriveItem) => void;
-  onToggleStar: (item: DriveItem) => void;
-  onRenameItem: (item: DriveItem) => void;
-  onTrashItem: (item: DriveItem) => void;
-  onRestoreItem: (item: DriveItem) => void;
-  onDeletePermanent: (item: DriveItem) => void;
   isTrashView: boolean;
 }
 
@@ -116,6 +105,7 @@ function ImageThumbnail({
 
 export function FileGrid({
   items,
+  allItems,
   tgConfig,
   folderCounts = {},
   selectedIds,
@@ -128,13 +118,6 @@ export function FileGrid({
   onContextMenuItem,
   onOpenItem,
   onDoubleClickItem,
-  onDownloadItem,
-  onCopyItem,
-  onToggleStar,
-  onRenameItem,
-  onTrashItem,
-  onRestoreItem,
-  onDeletePermanent,
   isTrashView,
 }: FileGridProps) {
   const [brokenThumbs, setBrokenThumbs] = useState<Set<string>>(() => new Set());
@@ -142,6 +125,46 @@ export function FileGrid({
     id: string;
     mode: 'move' | 'upload';
   } | null>(null);
+  const [hoverAnchor, setHoverAnchor] = useState<HoveredItemAnchor | null>(null);
+  const hoverTimerRef = useRef<number | null>(null);
+
+  const clearHoverTooltip = () => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+    setHoverAnchor(null);
+  };
+
+  const scheduleHoverTooltip = (item: DriveItem, el: HTMLElement) => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current);
+    }
+    const r = el.getBoundingClientRect();
+    const rectSnapshot = {
+      top: r.top,
+      left: r.left,
+      right: r.right,
+      bottom: r.bottom,
+      width: r.width,
+      height: r.height,
+    };
+    hoverTimerRef.current = window.setTimeout(() => {
+      hoverTimerRef.current = null;
+      setHoverAnchor({ item, rect: rectSnapshot });
+    }, 1800);
+  };
+
+  useEffect(() => {
+    const onScrollOrDrag = () => clearHoverTooltip();
+    window.addEventListener('scroll', onScrollOrDrag, true);
+    return () => {
+      window.removeEventListener('scroll', onScrollOrDrag, true);
+      if (hoverTimerRef.current !== null) {
+        window.clearTimeout(hoverTimerRef.current);
+      }
+    };
+  }, []);
 
   const folders = items.filter((i) => i.type === 'folder');
   const files = items.filter((i) => i.type === 'file');
@@ -174,12 +197,20 @@ export function FileGrid({
                   key={folder.id}
                   data-drive-item={folder.id}
                   draggable={!isTrashView}
+                  onPointerEnter={(e) => {
+                    if (e.pointerType === 'mouse') {
+                      scheduleHoverTooltip(folder, e.currentTarget);
+                    }
+                  }}
+                  onPointerLeave={() => clearHoverTooltip()}
                   onContextMenu={(e) => {
+                    clearHoverTooltip();
                     e.preventDefault();
                     e.stopPropagation();
                     onContextMenuItem(e, folder);
                   }}
                   onDragStart={(e) => {
+                    clearHoverTooltip();
                     if (isTrashView) return;
                     const ids = buildDragPayload(folder.id);
                     e.dataTransfer.setData('application/x-teledrive-ids', JSON.stringify(ids));
@@ -251,13 +282,13 @@ export function FileGrid({
                   <button
                     type="button"
                     onClick={(e) => {
+                      clearHoverTooltip();
                       if (e.ctrlKey || e.metaKey || e.shiftKey) {
                         onToggleSelect(folder.id, e.shiftKey);
                       } else {
                         onOpenItem(folder);
                       }
                     }}
-                    title={folder.name}
                     className="flex w-full min-w-0 items-start gap-2.5 rounded-xl text-left focus-visible:outline-2 focus-visible:outline-blue-600"
                   >
                     <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-100/90 ring-1 ring-amber-200/80 transition-transform duration-150 group-hover:scale-105 dark:bg-amber-950/70 dark:ring-amber-800/70">
@@ -296,79 +327,6 @@ export function FileGrid({
                       </div>
                     </div>
                   </button>
-
-                  {/* Dedicated Action Bar Below Folder Name (Never Squeezes Title) */}
-                  <div className="flex items-center justify-end gap-0.5 border-t border-amber-200/60 pt-1.5 dark:border-amber-900/40">
-                    {!isTrashView ? (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => onToggleStar(folder)}
-                          aria-label={
-                            folder.starred
-                              ? `Hapus bintang ${folder.name}`
-                              : `Bintangi ${folder.name}`
-                          }
-                          title={folder.starred ? 'Hapus bintang' : 'Favoritkan'}
-                          className={`flex h-6 w-6 items-center justify-center rounded-md transition-colors ${
-                            folder.starred
-                              ? 'text-amber-500 hover:bg-amber-100/70 dark:hover:bg-amber-950/40'
-                              : 'text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 dark:hover:bg-slate-700'
-                          }`}
-                        >
-                          <Star className={`h-3 w-3 ${folder.starred ? 'fill-amber-400' : ''}`} />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onCopyItem(folder)}
-                          aria-label={`Salin ${folder.name}`}
-                          title="Salin"
-                          className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 dark:hover:bg-slate-700"
-                        >
-                          <Copy className="h-3 w-3" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onRenameItem(folder)}
-                          aria-label={`Ubah nama ${folder.name}`}
-                          title="Ubah nama"
-                          className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 dark:hover:bg-slate-700"
-                        >
-                          <Pencil className="h-3 w-3" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onTrashItem(folder)}
-                          aria-label={`Buang ${folder.name}`}
-                          title="Pindahkan ke Sampah"
-                          className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-rose-100 hover:text-rose-700 dark:hover:bg-rose-950/50 dark:hover:text-rose-300"
-                        >
-                          <Trash2 className="h-3 w-3" />
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => onRestoreItem(folder)}
-                          aria-label={`Pulihkan ${folder.name}`}
-                          title="Pulihkan"
-                          className="flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-100 dark:text-blue-400 dark:hover:bg-blue-950/50"
-                        >
-                          <RotateCcw className="h-3 w-3" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onDeletePermanent(folder)}
-                          aria-label={`Hapus permanen ${folder.name}`}
-                          title="Hapus permanen"
-                          className="flex h-6 w-6 items-center justify-center rounded-md text-rose-600 hover:bg-rose-100 dark:text-rose-400 dark:hover:bg-rose-950/50"
-                        >
-                          <Trash2 className="h-3 w-3" />
-                        </button>
-                      </>
-                    )}
-                  </div>
                 </div>
               );
             })}
@@ -391,18 +349,27 @@ export function FileGrid({
               const selected = selectedIds.has(file.id);
               const category = getFileCategory(file.mimeType, file.name);
               const isImage = category === 'image' && !brokenThumbs.has(file.id);
+              const isPdf = isPdfFile(file.mimeType, file.name);
 
               return (
                 <article
                   key={file.id}
                   data-drive-item={file.id}
                   draggable={!isTrashView}
+                  onPointerEnter={(e) => {
+                    if (e.pointerType === 'mouse') {
+                      scheduleHoverTooltip(file, e.currentTarget);
+                    }
+                  }}
+                  onPointerLeave={() => clearHoverTooltip()}
                   onContextMenu={(e) => {
+                    clearHoverTooltip();
                     e.preventDefault();
                     e.stopPropagation();
                     onContextMenuItem(e, file);
                   }}
                   onDragStart={(e) => {
+                    clearHoverTooltip();
                     if (isTrashView) return;
                     const ids = buildDragPayload(file.id);
                     e.dataTransfer.setData('application/x-teledrive-ids', JSON.stringify(ids));
@@ -417,7 +384,13 @@ export function FileGrid({
                   }`}
                 >
                   {/* Compact Visual Preview Area */}
-                  <div className="relative h-24 w-full overflow-hidden border-b border-slate-100 bg-slate-100 dark:border-slate-800 dark:bg-slate-800/70">
+                  <div
+                    className={`relative h-24 w-full overflow-hidden border-b ${
+                      isPdf
+                        ? 'border-red-100 bg-red-50/75 dark:border-red-900/40 dark:bg-red-950/25'
+                        : 'border-slate-100 bg-slate-100 dark:border-slate-800 dark:bg-slate-800/70'
+                    }`}
+                  >
                     <button
                       type="button"
                       onClick={(e) => {
@@ -445,43 +418,37 @@ export function FileGrid({
                             type="file"
                             mimeType={file.mimeType}
                             filename={file.name}
-                            size="md"
+                            size={isPdf ? 'lg' : 'md'}
                           />
-                          <span className="font-mono text-[10px] font-medium text-slate-500 dark:text-slate-400">
-                            {file.name.split('.').pop()?.toUpperCase() || 'FILE'}
+                          <span
+                            className={`font-mono text-[10px] font-semibold ${
+                              isPdf
+                                ? 'text-red-600 dark:text-red-400'
+                                : 'text-slate-500 dark:text-slate-400'
+                            }`}
+                          >
+                            {isPdf ? 'PDF' : file.name.split('.').pop()?.toUpperCase() || 'FILE'}
                           </span>
                         </div>
                       )}
                     </button>
 
-                    {/* Top-right Star toggle */}
-                    {!isTrashView && (
-                      <button
-                        type="button"
-                        onClick={() => onToggleStar(file)}
-                        aria-label={
-                          file.starred ? `Hapus bintang ${file.name}` : `Bintangi ${file.name}`
-                        }
-                        className={`absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded bg-white/90 text-slate-600 transition-opacity dark:bg-slate-900/90 dark:text-slate-300 ${
-                          file.starred
-                            ? 'opacity-100 text-amber-500'
-                            : 'opacity-0 group-hover:opacity-100 focus:opacity-100'
-                        }`}
+                    {!isTrashView && file.starred && (
+                      <span
+                        aria-label="Berbintang"
+                        className="pointer-events-none absolute right-2 top-2 flex h-5 w-5 items-center justify-center rounded bg-white/90 text-amber-500 dark:bg-slate-900/90"
                       >
-                        <Star
-                          className={`h-3 w-3 ${
-                            file.starred ? 'fill-amber-400 text-amber-500' : ''
-                          }`}
-                        />
-                      </button>
+                        <Star className="h-3 w-3 fill-amber-400 text-amber-500" />
+                      </span>
                     )}
                   </div>
 
-                  {/* Compact Card Body */}
+                  {/* Clean Card Body (Actions via Right-Click) */}
                   <div className="flex flex-col gap-1 p-2.5">
                     <button
                       type="button"
                       onClick={(e) => {
+                        clearHoverTooltip();
                         if (e.ctrlKey || e.metaKey || e.shiftKey) {
                           onToggleSelect(file.id, e.shiftKey);
                         } else {
@@ -511,65 +478,6 @@ export function FileGrid({
                         {file.size > DIRECT_TELEGRAM_MAX_BYTES ? 'TG >20MB' : 'Cloud'}
                       </span>
                     </div>
-
-                    {/* Dedicated Action Strip (Zero Metadata Squeezing) */}
-                    <div className="mt-1 flex items-center justify-end gap-0.5 border-t border-slate-100 pt-1.5 dark:border-slate-800/80">
-                      {!isTrashView ? (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => onDownloadItem(file)}
-                            aria-label={`Unduh ${file.name}`}
-                            className="flex h-6 w-6 items-center justify-center rounded text-slate-500 hover:bg-slate-100 hover:text-blue-600 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-blue-400"
-                          >
-                            <Download className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onCopyItem(file)}
-                            aria-label={`Salin ${file.name}`}
-                            className="flex h-6 w-6 items-center justify-center rounded text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
-                          >
-                            <Copy className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onRenameItem(file)}
-                            aria-label={`Ubah nama ${file.name}`}
-                            className="flex h-6 w-6 items-center justify-center rounded text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
-                          >
-                            <Pencil className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onTrashItem(file)}
-                            aria-label={`Buang ${file.name}`}
-                            className="flex h-6 w-6 items-center justify-center rounded text-slate-500 hover:bg-rose-50 hover:text-rose-600 dark:text-slate-400 dark:hover:bg-rose-950/40 dark:hover:text-rose-400"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => onRestoreItem(file)}
-                            aria-label={`Pulihkan ${file.name}`}
-                            className="flex h-6 w-6 items-center justify-center rounded text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950/40"
-                          >
-                            <RotateCcw className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onDeletePermanent(file)}
-                            aria-label={`Hapus permanen ${file.name}`}
-                            className="flex h-6 w-6 items-center justify-center rounded text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </>
-                      )}
-                    </div>
                   </div>
                 </article>
               );
@@ -577,6 +485,11 @@ export function FileGrid({
           </div>
         </section>
       )}
+      <ItemHoverTooltip
+        anchor={hoverAnchor}
+        allItems={allItems}
+        folderCounts={folderCounts}
+      />
     </div>
   );
 }

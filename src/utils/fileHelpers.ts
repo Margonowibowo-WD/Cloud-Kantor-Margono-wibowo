@@ -136,6 +136,150 @@ export function getFileCategory(mimeType: string, filename: string): FileCategor
   return 'other';
 }
 
+export function getFileTypeLabel(
+  item: Pick<DriveItem, 'type' | 'name' | 'mimeType'>,
+): string {
+  if (item.type === 'folder') return 'Folder';
+  const ext = getFileExtension(item.name);
+  const mime = (item.mimeType || '').toLowerCase();
+
+  if (
+    ext === 'doc' ||
+    ext === 'docx' ||
+    ext === 'odt' ||
+    ext === 'rtf' ||
+    mime.includes('wordprocessingml') ||
+    mime === 'application/msword'
+  ) {
+    return 'Word';
+  }
+  if (
+    ext === 'xls' ||
+    ext === 'xlsx' ||
+    ext === 'xlsm' ||
+    ext === 'ods' ||
+    mime.includes('spreadsheetml') ||
+    mime.includes('ms-excel')
+  ) {
+    return 'Excel';
+  }
+  if (
+    ext === 'ppt' ||
+    ext === 'pptx' ||
+    ext === 'odp' ||
+    mime.includes('presentationml') ||
+    mime.includes('ms-powerpoint')
+  ) {
+    return 'PowerPoint';
+  }
+  if (ext === 'pdf' || mime === 'application/pdf') {
+    return 'PDF';
+  }
+  if (ext) {
+    return ext.toUpperCase();
+  }
+  if (mime.startsWith('image/')) return 'Gambar';
+  if (mime.startsWith('video/')) return 'Video';
+  if (mime.startsWith('audio/')) return 'Audio';
+  if (mime.startsWith('text/')) return 'Teks';
+  return 'File';
+}
+
+const MIME_BY_EXTENSION: Record<string, string> = {
+  pdf: 'application/pdf',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  xlsm: 'application/vnd.ms-excel.sheet.macroEnabled.12',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  odt: 'application/vnd.oasis.opendocument.text',
+  ods: 'application/vnd.oasis.opendocument.spreadsheet',
+  odp: 'application/vnd.oasis.opendocument.presentation',
+  rtf: 'application/rtf',
+  txt: 'text/plain',
+  md: 'text/markdown',
+  csv: 'text/csv',
+  json: 'application/json',
+  html: 'text/html',
+  css: 'text/css',
+  js: 'text/javascript',
+  ts: 'text/typescript',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  svg: 'image/svg+xml',
+  avif: 'image/avif',
+  bmp: 'image/bmp',
+  heic: 'image/heic',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mkv: 'video/x-matroska',
+  mov: 'video/quicktime',
+  avi: 'video/x-msvideo',
+  m4v: 'video/x-m4v',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  flac: 'audio/flac',
+  aac: 'audio/aac',
+  m4a: 'audio/mp4',
+  zip: 'application/zip',
+  rar: 'application/vnd.rar',
+  '7z': 'application/x-7z-compressed',
+  tar: 'application/x-tar',
+  gz: 'application/gzip',
+  apk: 'application/vnd.android.package-archive',
+};
+
+const EXTENSION_BY_MIME: Record<string, string> = {
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/vnd.ms-powerpoint': 'ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'video/mp4': 'mp4',
+  'audio/mpeg': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/ogg': 'ogg',
+  'application/zip': 'zip',
+  'text/plain': 'txt',
+};
+
+export function resolveMimeTypeForFilename(filename: string, fallbackMime?: string): string {
+  const ext = getFileExtension(filename);
+  if (ext && MIME_BY_EXTENSION[ext]) {
+    return MIME_BY_EXTENSION[ext];
+  }
+  const cleanFallback = (fallbackMime || '').split(';')[0].trim().toLowerCase();
+  if (cleanFallback && cleanFallback !== 'application/octet-stream') {
+    return cleanFallback;
+  }
+  return 'application/octet-stream';
+}
+
+export function sanitizeDownloadFilename(filename: string, mimeType?: string): string {
+  const cleaned = filename
+    .replace(/[\\/:*?"<>|\u0000-\u001F]+/g, '_')
+    .trim();
+  const base = cleaned || 'TeleDrive_File';
+  const existingExt = getFileExtension(base);
+  if (existingExt) return base;
+  const cleanMime = (mimeType || '').split(';')[0].trim().toLowerCase();
+  const inferredExt = EXTENSION_BY_MIME[cleanMime];
+  return inferredExt ? `${base}.${inferredExt}` : base;
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -226,6 +370,13 @@ export function buildBreadcrumbs(folderId: string | null, items: DriveItem[]): B
   return [root, ...trail];
 }
 
+export function getItemLocationPath(item: DriveItem, allItems: DriveItem[]): string {
+  const path = buildBreadcrumbs(item.parentId, allItems)
+    .map((node) => node.name)
+    .join(' / ');
+  return item.trashed ? `Sampah · ${path}` : path;
+}
+
 export function isDescendantOrSelf(
   targetFolderId: string | null,
   movingItemId: string,
@@ -300,7 +451,15 @@ export function filterAndSortItems(
       case 'documents': {
         if (item.type !== 'file') return false;
         const cat = getFileCategory(item.mimeType, item.name);
-        return cat === 'document' || cat === 'code' || cat === 'archive';
+        return cat === 'document' || cat === 'code';
+      }
+      case 'archives': {
+        if (item.type !== 'file') return false;
+        return getFileCategory(item.mimeType, item.name) === 'archive';
+      }
+      case 'others': {
+        if (item.type !== 'file') return false;
+        return getFileCategory(item.mimeType, item.name) === 'other';
       }
       default:
         return true;
@@ -343,6 +502,14 @@ export function computeStorageSummary(items: DriveItem[]): StorageSummary {
   let telegramSyncedCount = 0;
   let telegramSyncedBytes = 0;
 
+  const categories: StorageSummary['categories'] = {
+    image: { bytes: 0, count: 0 },
+    video: { bytes: 0, count: 0 },
+    document: { bytes: 0, count: 0 },
+    audio: { bytes: 0, count: 0 },
+    other: { bytes: 0, count: 0 },
+  };
+
   for (const item of items) {
     if (item.type === 'folder') {
       if (!item.trashed) folderCount += 1;
@@ -353,6 +520,23 @@ export function computeStorageSummary(items: DriveItem[]): StorageSummary {
     } else {
       activeBytes += item.size;
       fileCount += 1;
+      const cat = getFileCategory(item.mimeType, item.name);
+      if (cat === 'image') {
+        categories.image.bytes += item.size;
+        categories.image.count += 1;
+      } else if (cat === 'video') {
+        categories.video.bytes += item.size;
+        categories.video.count += 1;
+      } else if (cat === 'document' || cat === 'code') {
+        categories.document.bytes += item.size;
+        categories.document.count += 1;
+      } else if (cat === 'audio') {
+        categories.audio.bytes += item.size;
+        categories.audio.count += 1;
+      } else {
+        categories.other.bytes += item.size;
+        categories.other.count += 1;
+      }
     }
     if (item.storageBackend === 'telegram' && !item.trashed) {
       telegramSyncedCount += 1;
@@ -368,6 +552,7 @@ export function computeStorageSummary(items: DriveItem[]): StorageSummary {
     folderCount,
     telegramSyncedCount,
     telegramSyncedBytes,
+    categories,
   };
 }
 

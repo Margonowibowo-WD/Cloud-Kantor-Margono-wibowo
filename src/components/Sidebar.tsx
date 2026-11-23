@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  Archive,
   Clock,
   Cloud,
   FileText,
+  Files,
   Film,
   FolderPlus,
   HardDrive,
@@ -43,6 +45,8 @@ const NAV_ITEMS: Array<{ id: NavSection; label: string; icon: typeof HardDrive }
   { id: 'videos', label: 'Video', icon: Film },
   { id: 'music', label: 'Musik', icon: Music },
   { id: 'documents', label: 'Dokumen', icon: FileText },
+  { id: 'archives', label: 'Arsip', icon: Archive },
+  { id: 'others', label: 'File Lainnya', icon: Files },
   { id: 'trash', label: 'Sampah', icon: Trash2 },
 ];
 
@@ -74,7 +78,7 @@ export function Sidebar({
   }, []);
 
   const content = (
-    <div className="flex h-full flex-col justify-between bg-slate-50 px-4 py-5 dark:bg-slate-950">
+    <div className="flex h-full flex-col justify-between overflow-y-auto bg-slate-50 px-4 py-5 dark:bg-slate-950">
       <div>
         {/* Modern Brand Header */}
         <div className="mb-6 flex items-center justify-between px-1">
@@ -272,7 +276,7 @@ export function Sidebar({
         </nav>
       </div>
 
-      {/* Modern Cloud Storage Summary Card */}
+      {/* Detailed Multi-Color Cloud Storage Summary Card */}
       <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs dark:border-slate-800 dark:bg-slate-900">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
@@ -280,71 +284,119 @@ export function Sidebar({
               <Cloud className="h-3.5 w-3.5" />
             </div>
             <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
-              Cloud Storage
+              Penyimpanan
             </span>
           </div>
-          <span className="text-[11px] font-semibold text-blue-600 dark:text-blue-400">
+          <span className="text-[11px] font-semibold text-blue-600 whitespace-nowrap dark:text-blue-400">
             Tanpa Batas
           </span>
         </div>
 
         <div className="mt-3 flex items-baseline justify-between gap-2">
           <span className="font-display text-xl font-bold tracking-tight tabular-nums text-slate-900 dark:text-slate-100">
-            {formatBytes(summary.activeBytes)}
+            {formatBytes(summary.totalBytes)}
           </span>
           <span className="text-[11px] font-medium tabular-nums text-slate-500 whitespace-nowrap dark:text-slate-400">
             {summary.fileCount} file · {summary.folderCount} folder
           </span>
         </div>
 
-        {/* Cloud Telegram & Trash Segmented Bar */}
         {(() => {
-          const cloudBytes = summary.activeBytes;
-          const trashBytes = summary.trashedBytes;
-          const totalUsed = cloudBytes + trashBytes;
-          const cloudPct =
-            totalUsed > 0 ? Math.max(cloudBytes > 0 ? 5 : 0, (cloudBytes / totalUsed) * 100) : 0;
-          const trashPct =
-            totalUsed > 0 ? Math.max(trashBytes > 0 ? 5 : 0, (trashBytes / totalUsed) * 100) : 0;
+          const segments = [
+            {
+              key: 'image',
+              label: 'Foto',
+              bytes: summary.categories.image.bytes,
+              count: summary.categories.image.count,
+              colorClass: 'bg-sky-500',
+            },
+            {
+              key: 'video',
+              label: 'Video',
+              bytes: summary.categories.video.bytes,
+              count: summary.categories.video.count,
+              colorClass: 'bg-indigo-500',
+            },
+            {
+              key: 'document',
+              label: 'Dokumen',
+              bytes: summary.categories.document.bytes,
+              count: summary.categories.document.count,
+              colorClass: 'bg-emerald-500',
+            },
+            {
+              key: 'audio',
+              label: 'Musik',
+              bytes: summary.categories.audio.bytes,
+              count: summary.categories.audio.count,
+              colorClass: 'bg-amber-500',
+            },
+            {
+              key: 'other',
+              label: 'Arsip & Lainnya',
+              bytes: summary.categories.other.bytes,
+              count: summary.categories.other.count,
+              colorClass: 'bg-slate-400 dark:bg-slate-500',
+            },
+            {
+              key: 'trash',
+              label: 'Sampah',
+              bytes: summary.trashedBytes,
+              count: null as number | null,
+              colorClass: 'bg-rose-500',
+            },
+          ];
+
+          const grandTotal = summary.totalBytes;
+          const nonZeroSegments = segments.filter((s) => s.bytes > 0);
+          // Give small non-zero categories a minimum visual slice while normalizing to 100%
+          const rawWeights = nonZeroSegments.map((s) =>
+            grandTotal > 0 ? Math.max(4, (s.bytes / grandTotal) * 100) : 0,
+          );
+          const weightSum = rawWeights.reduce((acc, w) => acc + w, 0);
 
           return (
             <>
               <div
-                aria-label="Distribusi penggunaan penyimpanan cloud"
+                aria-label="Rincian ukuran penyimpanan berdasarkan tipe file"
                 className="mt-3 flex h-2.5 w-full gap-0.5 overflow-hidden rounded-full bg-slate-100 p-0.5 dark:bg-slate-800"
               >
-                {cloudPct > 0 && (
-                  <div
-                    className="h-full rounded-full bg-blue-600 transition-all duration-300"
-                    style={{ width: `${cloudPct}%` }}
-                  />
-                )}
-                {trashPct > 0 && (
-                  <div
-                    className="h-full rounded-full bg-amber-400 transition-all duration-300"
-                    style={{ width: `${trashPct}%` }}
-                  />
-                )}
+                {nonZeroSegments.map((seg, idx) => {
+                  const widthPct = weightSum > 0 ? (rawWeights[idx] / weightSum) * 100 : 0;
+                  return (
+                    <div
+                      key={seg.key}
+                      title={`${seg.label}: ${formatBytes(seg.bytes)}`}
+                      className={`h-full first:rounded-l-full last:rounded-r-full transition-all duration-300 ${seg.colorClass}`}
+                      style={{ width: `${widthPct}%` }}
+                    />
+                  );
+                })}
               </div>
 
-              <div className="mt-3 grid grid-cols-2 gap-2 border-t border-slate-100 pt-2.5 text-[11px] dark:border-slate-800">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
-                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-blue-600" />
-                    <span className="truncate">Cloud Telegram</span>
+              <div className="mt-3 space-y-1.5 border-t border-slate-100 pt-2.5 text-[11px] dark:border-slate-800">
+                {segments.map((seg) => (
+                  <div key={seg.key} className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-1.5 text-slate-600 dark:text-slate-300">
+                      <span className={`h-2 w-2 shrink-0 rounded-xs ${seg.colorClass}`} />
+                      <span className="truncate">{seg.label}</span>
+                      {seg.count !== null && seg.count > 0 && (
+                        <span className="shrink-0 tabular-nums text-[10px] text-slate-400 dark:text-slate-500">
+                          ({seg.count})
+                        </span>
+                      )}
+                    </div>
+                    <span className="shrink-0 font-mono font-medium tabular-nums text-slate-800 whitespace-nowrap dark:text-slate-200">
+                      {formatBytes(seg.bytes)}
+                    </span>
                   </div>
-                  <p className="mt-0.5 truncate font-mono font-semibold tabular-nums text-slate-800 dark:text-slate-200">
-                    {formatBytes(cloudBytes)}
-                  </p>
-                </div>
-                <div className="min-w-0">
-                  <div className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
-                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
-                    <span className="truncate">Sampah</span>
-                  </div>
-                  <p className="mt-0.5 truncate font-mono font-semibold tabular-nums text-slate-800 dark:text-slate-200">
-                    {formatBytes(trashBytes)}
-                  </p>
+                ))}
+
+                <div className="flex items-center justify-between gap-2 border-t border-slate-100 pt-1.5 font-semibold dark:border-slate-800">
+                  <span className="text-slate-700 dark:text-slate-200">Total</span>
+                  <span className="font-mono tabular-nums text-slate-900 whitespace-nowrap dark:text-white">
+                    {formatBytes(grandTotal)}
+                  </span>
                 </div>
               </div>
             </>

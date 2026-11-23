@@ -2,18 +2,12 @@ import { useState } from 'react';
 import {
   ArrowDown,
   ArrowUp,
-  CheckSquare,
   ChevronRight,
   ClipboardPaste,
-  Copy,
-  Download,
   PanelRight,
-  RotateCcw,
-  Star,
-  Trash2,
   X,
 } from 'lucide-react';
-import type { NavSection, SortDirection, SortField, TypeFilter } from '../types/drive';
+import type { NavSection, SortDirection, SortField } from '../types/drive';
 import {
   type CapturedDropPayload,
   captureDropEntriesSync,
@@ -24,22 +18,9 @@ interface ToolbarProps {
   section: NavSection;
   breadcrumbs: BreadcrumbNode[];
   onNavigateFolder: (folderId: string | null) => void;
-  typeFilter: TypeFilter;
-  onTypeFilterChange: (filter: TypeFilter) => void;
   sortField: SortField;
   sortDirection: SortDirection;
   onSortChange: (field: SortField) => void;
-  visibleCount: number;
-  selectedCount: number;
-  allSelected: boolean;
-  onToggleSelectAll: () => void;
-  onClearSelection: () => void;
-  onBulkDownload: () => void;
-  onBulkStar: () => void;
-  onBulkCopy: () => void;
-  onBulkTrash: () => void;
-  onBulkRestore: () => void;
-  onBulkDeletePermanent: () => void;
   clipboardCount: number;
   onPasteItems: () => void;
   onClearClipboard: () => void;
@@ -57,39 +38,19 @@ const SECTION_TITLES: Record<NavSection, string> = {
   photos: 'Foto',
   videos: 'Video',
   music: 'Musik',
-  documents: 'Dokumen & Arsip',
+  documents: 'Dokumen',
+  archives: 'Arsip',
+  others: 'File Lainnya',
   trash: 'Sampah',
 };
-
-const TYPE_FILTERS: Array<{ id: TypeFilter; label: string }> = [
-  { id: 'all', label: 'Semua' },
-  { id: 'image', label: 'Foto' },
-  { id: 'video', label: 'Video' },
-  { id: 'audio', label: 'Musik' },
-  { id: 'document', label: 'Dokumen' },
-  { id: 'archive', label: 'Arsip' },
-];
 
 export function Toolbar({
   section,
   breadcrumbs,
   onNavigateFolder,
-  typeFilter,
-  onTypeFilterChange,
   sortField,
   sortDirection,
   onSortChange,
-  visibleCount,
-  selectedCount,
-  allSelected,
-  onToggleSelectAll,
-  onClearSelection,
-  onBulkDownload,
-  onBulkStar,
-  onBulkCopy,
-  onBulkTrash,
-  onBulkRestore,
-  onBulkDeletePermanent,
   clipboardCount,
   onPasteItems,
   onClearClipboard,
@@ -183,105 +144,10 @@ export function Toolbar({
           </h1>
         )}
 
-        {/* Contextual Bulk Action Bar OR Filter, Paste & Sort */}
-        {selectedCount > 0 ? (
-          <div className="td-animate-pop flex flex-wrap items-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-1.5 dark:border-blue-900/70 dark:bg-blue-950/50">
-            <span className="text-xs font-semibold tabular-nums text-blue-800 whitespace-nowrap dark:text-blue-200">
-              {selectedCount} dipilih
-            </span>
-            {!allSelected && visibleCount > 0 && (
-              <button
-                type="button"
-                onClick={onToggleSelectAll}
-                className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium text-blue-700 hover:bg-white dark:text-blue-300 dark:hover:bg-slate-800 whitespace-nowrap"
-              >
-                <CheckSquare className="h-3.5 w-3.5" />
-                <span>Pilih Semua</span>
-              </button>
-            )}
-            <div className="h-4 w-px bg-blue-200 dark:bg-blue-800" />
-
-            {!isTrash ? (
-              <>
-                <button
-                  type="button"
-                  onClick={onBulkDownload}
-                  className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-white dark:text-slate-200 dark:hover:bg-slate-800 whitespace-nowrap"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  <span>Unduh</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={onBulkCopy}
-                  className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-white dark:text-slate-200 dark:hover:bg-slate-800 whitespace-nowrap"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                  <span>Salin</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={onBulkStar}
-                  className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-white dark:text-slate-200 dark:hover:bg-slate-800 whitespace-nowrap"
-                >
-                  <Star className="h-3.5 w-3.5" />
-                  <span>Bintang</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={onBulkTrash}
-                  className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-rose-700 hover:bg-rose-100 dark:text-rose-300 dark:hover:bg-rose-950/70 whitespace-nowrap"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                  <span>Buang</span>
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  onClick={onBulkRestore}
-                  className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-blue-700 hover:bg-white dark:text-blue-300 dark:hover:bg-slate-800 whitespace-nowrap"
-                >
-                  <RotateCcw className="h-3.5 w-3.5" />
-                  <span>Pulihkan</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={onBulkDeletePermanent}
-                  className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-rose-700 hover:bg-rose-100 dark:text-rose-300 dark:hover:bg-rose-950/70 whitespace-nowrap"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                  <span>Hapus Permanen</span>
-                </button>
-              </>
-            )}
-
-            <button
-              type="button"
-              onClick={onClearSelection}
-              aria-label="Batalkan semua pilihan"
-              className="ml-1 flex h-6 w-6 items-center justify-center rounded-md text-slate-500 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        ) : (
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Select All button visible across Grid & Table views */}
-            {visibleCount > 0 && (
-              <button
-                type="button"
-                onClick={onToggleSelectAll}
-                className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 whitespace-nowrap"
-              >
-                <CheckSquare className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
-                <span>{allSelected ? 'Batalkan Pilih' : 'Pilih Semua'}</span>
-              </button>
-            )}
-
-            {/* Paste Action when clipboard has copied items */}
-            {clipboardCount > 0 && !isTrash && (
+        {/* Paste & Sort Controls (Zero Bulk Selection Clutter Above Preview) */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Paste Action when clipboard has copied items */}
+          {clipboardCount > 0 && !isTrash && (
               <div className="flex items-center overflow-hidden rounded-lg border border-blue-200 bg-blue-50 dark:border-blue-900/70 dark:bg-blue-950/50">
                 <button
                   type="button"
@@ -301,28 +167,6 @@ export function Toolbar({
                 </button>
               </div>
             )}
-
-            {/* Segmented Type Filter */}
-            <div
-              role="group"
-              aria-label="Filter jenis file"
-              className="flex items-center gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-800"
-            >
-              {TYPE_FILTERS.map((f) => (
-                <button
-                  key={f.id}
-                  type="button"
-                  onClick={() => onTypeFilterChange(f.id)}
-                  className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap ${
-                    typeFilter === f.id
-                      ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-slate-100'
-                      : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100'
-                  }`}
-                >
-                  {f.label}
-                </button>
-              ))}
-            </div>
 
             {/* Sort Control */}
             <div className="flex items-center rounded-lg border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-800">
@@ -371,8 +215,7 @@ export function Toolbar({
                 <PanelRight className="h-4 w-4" />
               </button>
             )}
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );

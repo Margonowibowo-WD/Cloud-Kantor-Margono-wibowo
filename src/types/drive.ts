@@ -51,6 +51,7 @@ export interface TelegramConfigState {
   autoSync: boolean;
   pinnedIndexMessageId?: number;
   lastSyncedAt?: string;
+  corsProxyUrl?: string;
 }
 
 export interface TelegramPublicStatus {
@@ -66,6 +67,12 @@ export interface TelegramPublicStatus {
   autoSync: boolean;
   pinnedIndexMessageId?: number;
   lastCheckedAt?: string;
+  hasCorsProxy?: boolean;
+}
+
+export interface StorageCategoryStats {
+  bytes: number;
+  count: number;
 }
 
 export interface StorageSummary {
@@ -76,6 +83,13 @@ export interface StorageSummary {
   folderCount: number;
   telegramSyncedCount: number;
   telegramSyncedBytes: number;
+  categories: {
+    image: StorageCategoryStats;
+    video: StorageCategoryStats;
+    document: StorageCategoryStats;
+    audio: StorageCategoryStats;
+    other: StorageCategoryStats;
+  };
 }
 
 export type NavSection =
@@ -86,6 +100,8 @@ export type NavSection =
   | 'videos'
   | 'music'
   | 'documents'
+  | 'archives'
+  | 'others'
   | 'trash';
 
 export type TypeFilter = 'all' | 'image' | 'video' | 'audio' | 'document' | 'archive';

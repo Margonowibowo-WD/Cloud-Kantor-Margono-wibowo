@@ -5,6 +5,7 @@ import {
   Copy,
   Eye,
   EyeOff,
+  Globe,
   KeyRound,
   Loader2,
   Lock,
@@ -17,9 +18,11 @@ import {
 import type { DriveItem, TelegramConfigState } from '../types/drive';
 import { encryptTelegramVault } from '../utils/cryptoVault';
 import {
+  CLOUDFLARE_WORKER_CORS_SNIPPET,
   type DetectedChat,
   detectTelegramChatsDirect,
   maskTelegramToken,
+  normalizeCorsProxyUrl,
   pullIndexFromTelegramPinnedMessage,
   verifyTelegramDirect,
 } from '../utils/telegramDirect';
@@ -47,6 +50,7 @@ export function TelegramModal({
 }: TelegramModalProps) {
   const [botToken, setBotToken] = useState(config.botToken || '');
   const [chatId, setChatId] = useState(config.chatId || '');
+  const [corsProxyUrl, setCorsProxyUrl] = useState(config.corsProxyUrl || '');
   const [autoSync, setAutoSync] = useState(config.autoSync ?? true);
   const [showToken, setShowToken] = useState(false);
 
@@ -55,6 +59,9 @@ export function TelegramModal({
   const [pulling, setPulling] = useState(false);
   const [detectedChats, setDetectedChats] = useState<DetectedChat[]>([]);
   const [feedback, setFeedback] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
+
+  const [proxyGuideOpen, setProxyGuideOpen] = useState(false);
+  const [copiedWorker, setCopiedWorker] = useState(false);
 
   const [vaultSectionOpen, setVaultSectionOpen] = useState(false);
   const [vaultPin, setVaultPin] = useState('');
@@ -67,12 +74,14 @@ export function TelegramModal({
     if (open) {
       setBotToken(config.botToken || '');
       setChatId(config.chatId || '');
+      setCorsProxyUrl(config.corsProxyUrl || '');
       setAutoSync(config.autoSync ?? true);
       setFeedback(null);
       setGeneratedVault('');
       setCopiedVault(false);
+      setCopiedWorker(false);
     }
-  }, [open, config.botToken, config.chatId, config.autoSync]);
+  }, [open, config.botToken, config.chatId, config.corsProxyUrl, config.autoSync]);
 
   if (!open) return null;
 
@@ -146,6 +155,16 @@ export function TelegramModal({
     }
 
     const pulled = await pullIndexFromTelegramPinnedMessage(activeToken, verification.chatId || chatId);
+    const cleanProxy = normalizeCorsProxyUrl(corsProxyUrl);
+    if (corsProxyUrl.trim() && !cleanProxy) {
+      setSaving(false);
+      setFeedback({
+        kind: 'error',
+        text: 'Format URL Proxy tidak valid. Contoh: https://teledrive-proxy.akunanda.workers.dev',
+      });
+      return;
+    }
+
     const nextConfig: TelegramConfigState = {
       connected: true,
       botToken: activeToken,
@@ -157,6 +176,7 @@ export function TelegramModal({
       autoSync,
       pinnedIndexMessageId: pulled.pinnedMessageId ?? config.pinnedIndexMessageId,
       lastSyncedAt: new Date().toISOString(),
+      corsProxyUrl: cleanProxy,
     };
 
     onSaveConfig(nextConfig, pulled.items);
@@ -177,7 +197,21 @@ export function TelegramModal({
     onSaveConfig(next);
     setBotToken('');
     setChatId('');
+    setCorsProxyUrl('');
     setFeedback({ kind: 'success', text: 'Koneksi Cloud Telegram diputuskan.' });
+  };
+
+  const handleCopyWorker = async () => {
+    try {
+      await navigator.clipboard.writeText(CLOUDFLARE_WORKER_CORS_SNIPPET);
+      setCopiedWorker(true);
+      window.setTimeout(() => setCopiedWorker(false), 2000);
+    } catch {
+      setFeedback({
+        kind: 'error',
+        text: 'Gagal menyalin kode Worker. Pilih dan salin manual dari kotak kode.',
+      });
+    }
   };
 
   const handleGenerateVault = async () => {
@@ -193,7 +227,11 @@ export function TelegramModal({
     setCopiedVault(false);
     try {
       const code = await encryptTelegramVault(
-        { botToken: activeToken, chatId: chatId.trim() },
+        {
+          botToken: activeToken,
+          chatId: chatId.trim(),
+          corsProxyUrl: normalizeCorsProxyUrl(corsProxyUrl),
+        },
         vaultPin,
       );
       setGeneratedVault(code);
@@ -376,6 +414,83 @@ export function TelegramModal({
             />
             <span>Otomatis unggah file baru (≤20 MB) langsung ke Telegram & sinkron indeks</span>
           </label>
+
+          {/* Optional Free Cloudflare Worker CORS Proxy for Cross-Device PDF & Office Preview */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-800/40">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Globe className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                <label
+                  htmlFor="tg-cors-proxy"
+                  className="text-xs font-semibold text-slate-800 dark:text-slate-100"
+                >
+                  Proxy Pratinjau PDF &amp; Office Lintas Perangkat (Gratis, Opsional)
+                </label>
+              </div>
+              <button
+                type="button"
+                onClick={() => setProxyGuideOpen((v) => !v)}
+                className="text-xs font-semibold text-blue-600 hover:text-blue-700 dark:text-blue-400"
+              >
+                {proxyGuideOpen ? 'Tutup Panduan' : 'Cara Buat Gratis (Rp 0)'}
+              </button>
+            </div>
+
+            <input
+              id="tg-cors-proxy"
+              type="url"
+              value={corsProxyUrl}
+              onChange={(e) => setCorsProxyUrl(e.target.value)}
+              placeholder="Contoh: https://teledrive-proxy.akunanda.workers.dev"
+              className="mt-2 h-9 w-full rounded-lg border border-slate-200 bg-white px-3 font-mono text-xs text-slate-900 focus:border-blue-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+            />
+            <p className="mt-1.5 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+              Mengatasi batas CORS browser agar PDF, Word, Excel, dan PowerPoint bisa langsung dipratinjau dari HP atau laptop lain tanpa mengunduh dulu.
+            </p>
+
+            {proxyGuideOpen && (
+              <div className="mt-3 space-y-2.5 border-t border-slate-200 pt-3 dark:border-slate-700/70">
+                <ol className="list-inside list-decimal space-y-1 text-[11px] leading-relaxed text-slate-600 dark:text-slate-300">
+                  <li>
+                    Daftar/login gratis di <strong className="text-slate-800 dark:text-slate-100">workers.cloudflare.com</strong> (tanpa kartu kredit, gratis 100.000 akses/hari).
+                  </li>
+                  <li>
+                    Pilih <strong className="text-slate-800 dark:text-slate-100">Create Application</strong> → <strong className="text-slate-800 dark:text-slate-100">Create Worker</strong>, lalu ganti seluruh kodenya dengan kode di bawah dan klik <strong className="text-slate-800 dark:text-slate-100">Deploy</strong>.
+                  </li>
+                  <li>
+                    Salin URL Worker Anda (akhiran <code className="font-mono">.workers.dev</code>), tempel ke kolom di atas, lalu klik <strong className="text-slate-800 dark:text-slate-100">Simpan &amp; Aktifkan</strong>.
+                  </li>
+                </ol>
+                <div className="rounded-lg border border-slate-200 bg-white p-2.5 dark:border-slate-700 dark:bg-slate-900">
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                      Kode Cloudflare Worker (Hanya akses file Telegram Anda)
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleCopyWorker}
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                    >
+                      {copiedWorker ? (
+                        <>
+                          <Check className="h-3 w-3 text-emerald-600" />
+                          <span>Tersalin</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3 w-3" />
+                          <span>Salin Kode</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  <pre className="max-h-36 overflow-auto rounded bg-slate-50 p-2 font-mono text-[10px] leading-relaxed text-slate-800 dark:bg-slate-800 dark:text-slate-200">
+                    {CLOUDFLARE_WORKER_CORS_SNIPPET}
+                  </pre>
+                </div>
+              </div>
+            )}
+          </div>
 
           {/* Permanent GitHub Secrets Vault Section */}
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-800/40">

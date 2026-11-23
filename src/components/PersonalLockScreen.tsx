@@ -124,6 +124,7 @@ export function PersonalLockScreen({
         autoSync: true,
         pinnedIndexMessageId: pulled.pinnedMessageId ?? verification.pinnedMessageId,
         lastSyncedAt: new Date().toISOString(),
+        corsProxyUrl: creds.corsProxyUrl,
       };
 
       setSubmitting(false);
@@ -261,39 +262,6 @@ export function PersonalLockScreen({
           </span>
         </div>
 
-        {hasVault && (
-          <div className="mt-5 grid grid-cols-2 rounded-xl border border-slate-200 bg-slate-100/80 p-1 dark:border-slate-800 dark:bg-slate-800/70">
-            <button
-              type="button"
-              onClick={() => {
-                setMode('pin');
-                setError(null);
-              }}
-              className={`rounded-lg py-1.5 text-xs font-semibold transition-colors ${
-                mode === 'pin'
-                  ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-white'
-                  : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
-              }`}
-            >
-              Buka Pakai PIN
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setMode('manual');
-                setError(null);
-              }}
-              className={`rounded-lg py-1.5 text-xs font-semibold transition-colors ${
-                mode === 'manual'
-                  ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-white'
-                  : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
-              }`}
-            >
-              Masuk Token Manual
-            </button>
-          </div>
-        )}
-
         {mode === 'pin' && hasVault ? (
           <form onSubmit={handlePinUnlock} className="mt-5 space-y-4">
             <div>
@@ -360,9 +328,39 @@ export function PersonalLockScreen({
                   : 'Buka Kunci & Masuk Drive'}
               </span>
             </button>
+
+            <div className="pt-1 text-center">
+              <button
+                type="button"
+                onClick={() => {
+                  setMode('manual');
+                  setError(null);
+                }}
+                className="text-[11px] font-medium text-slate-400 transition-colors hover:text-slate-600 dark:text-slate-500 dark:hover:text-slate-300"
+              >
+                Ganti kunci atau atur ulang koneksi?
+              </button>
+            </div>
           </form>
         ) : (
           <form onSubmit={handleManualConnect} className="mt-5 space-y-4">
+            {hasVault && (
+              <div className="flex items-center justify-between border-b border-slate-100 pb-2 dark:border-slate-800">
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+                  Atur Ulang Koneksi
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode('pin');
+                    setError(null);
+                  }}
+                  className="text-xs font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400"
+                >
+                  ← Kembali ke PIN
+                </button>
+              </div>
+            )}
             <div>
               <label
                 htmlFor="lock-bot-token"

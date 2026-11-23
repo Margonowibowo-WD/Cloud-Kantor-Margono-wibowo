@@ -14,6 +14,7 @@ export interface CloudViewPrefs {
   v?: 'grid' | 'list';
   sf?: 'name' | 'updatedAt' | 'size';
   sd?: 'asc' | 'desc';
+  px?: string;
   u?: string;
 }
 
@@ -116,9 +117,10 @@ function toCompactRecord(item: DriveItem): CompactDriveRecord {
   };
   if (item.starred) rec.st = 1;
   if (item.trashed) rec.tr = 1;
-  if (item.chunks[0]?.telegramFileId) rec.fid = item.chunks[0].telegramFileId;
-  if (item.chunks[0]?.telegramUniqueId) rec.uid = item.chunks[0].telegramUniqueId;
-  if (item.chunks[0]?.telegramMessageId) rec.mid = item.chunks[0].telegramMessageId;
+  const firstChunk = item.chunks?.[0];
+  if (firstChunk?.telegramFileId) rec.fid = firstChunk.telegramFileId;
+  if (firstChunk?.telegramUniqueId) rec.uid = firstChunk.telegramUniqueId;
+  if (firstChunk?.telegramMessageId) rec.mid = firstChunk.telegramMessageId;
   return rec;
 }
 

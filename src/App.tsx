@@ -9,7 +9,6 @@ import type {
   TelegramConfigState,
   TelegramPublicStatus,
   TransferTask,
-  TypeFilter,
   ViewMode,
 } from './types/drive';
 import {
@@ -32,7 +31,6 @@ import {
   addDeletedTombstones,
   addDismissedTelegramMessageIds,
   deleteLocalBlob,
-  getLocalBlob,
   loadDeletedTombstones,
   loadDismissedTelegramMessageIds,
   loadLocalEncryptedVault,
@@ -52,10 +50,10 @@ import {
   checkTelegramMessageExists,
   deleteTelegramMessageDirect,
   fetchChannelMediaUpdates,
+  normalizeCorsProxyUrl,
   pullIndexFromTelegramPinnedMessage,
   pushIndexToTelegramPinnedMessage,
   toPublicStatus,
-  uploadFileDirectToTelegram,
   verifyTelegramDirect,
 } from './utils/telegramDirect';
 import {
@@ -135,7 +133,6 @@ export default function App() {
   const [section, setSection] = useState<NavSection>('my-drive');
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
   const [sortField, setSortField] = useState<SortField>(initialViewPrefs.sf || 'name');
   const [sortDirection, setSortDirection] = useState<SortDirection>(initialViewPrefs.sd || 'asc');
   const [viewMode, setViewMode] = useState<ViewMode>(initialViewPrefs.v || 'grid');
@@ -261,7 +258,9 @@ export default function App() {
     if (!remotePrefs) return;
     const localMs = viewPrefsRef.current.u ? Date.parse(viewPrefsRef.current.u) || 0 : 0;
     const remoteMs = remotePrefs.u ? Date.parse(remotePrefs.u) || 0 : 0;
-    if (remoteMs > localMs || (!viewPrefsRef.current.u && remotePrefs.u)) {
+    const remoteIsNewer = remoteMs > localMs || (!viewPrefsRef.current.u && Boolean(remotePrefs.u));
+
+    if (remoteIsNewer) {
       viewPrefsRef.current = remotePrefs;
       saveStoredViewPrefs(remotePrefs);
       if (remotePrefs.v === 'grid' || remotePrefs.v === 'list') setViewMode(remotePrefs.v);
@@ -269,6 +268,28 @@ export default function App() {
         setSortField(remotePrefs.sf);
       }
       if (remotePrefs.sd === 'asc' || remotePrefs.sd === 'desc') setSortDirection(remotePrefs.sd);
+    }
+
+    const shouldAdoptRemoteProxy =
+      remotePrefs.px !== undefined &&
+      (remoteIsNewer || (!viewPrefsRef.current.px && Boolean(normalizeCorsProxyUrl(remotePrefs.px))));
+
+    if (shouldAdoptRemoteProxy) {
+      const syncedProxy = normalizeCorsProxyUrl(remotePrefs.px);
+      if (!remoteIsNewer) {
+        const patched: CloudViewPrefs = { ...viewPrefsRef.current, px: syncedProxy || '' };
+        viewPrefsRef.current = patched;
+        saveStoredViewPrefs(patched);
+      }
+      setTgConfig((curr) => {
+        if ((curr.corsProxyUrl || undefined) === syncedProxy) return curr;
+        const nextCfg: TelegramConfigState = {
+          ...curr,
+          corsProxyUrl: syncedProxy,
+        };
+        saveStoredTelegramConfig(nextCfg);
+        return nextCfg;
+      });
     }
   }, []);
 
@@ -567,6 +588,17 @@ export default function App() {
           applyRemoteViewPrefs(res.prefs);
         }
 
+        const localProxy = normalizeCorsProxyUrl(cfg.corsProxyUrl);
+        if (localProxy && viewPrefsRef.current.px === undefined) {
+          const seededPrefs: CloudViewPrefs = {
+            ...viewPrefsRef.current,
+            px: localProxy,
+            u: new Date().toISOString(),
+          };
+          viewPrefsRef.current = seededPrefs;
+          saveStoredViewPrefs(seededPrefs);
+        }
+
         tombstonesRef.current = reconciled.tombstones;
         saveDeletedTombstones(reconciled.tombstones);
         saveStoredItems(reconciled.items);
@@ -584,10 +616,17 @@ export default function App() {
             res.rawPinnedText &&
             !res.rawPinnedText.includes('TeleDrive Cloud'),
         );
+        const needsProxyPush = Boolean(
+          res.hasIndex &&
+            !res.unchanged &&
+            viewPrefsRef.current.px &&
+            !res.prefs?.px,
+        );
         const remoteById = new Map(effectiveRemoteItems.map((i) => [i.id, i]));
         const localHasUnpushedChanges =
           !res.hasIndex ||
           needsFormattingUpgrade ||
+          needsProxyPush ||
           channelMedia.length > 0 ||
           deletedInTelegramItemIds.size > 0 ||
           reconciled.items.some((item) => {
@@ -831,11 +870,11 @@ export default function App() {
         section,
         currentFolderId,
         searchQuery,
-        typeFilter,
+        typeFilter: 'all',
         sortField,
         sortDirection,
       }),
-    [items, section, currentFolderId, searchQuery, typeFilter, sortField, sortDirection],
+    [items, section, currentFolderId, searchQuery, sortField, sortDirection],
   );
 
   const handleCopyIds = useCallback(
@@ -1361,12 +1400,21 @@ export default function App() {
       transferCancelMap.current.set(taskId, ctrl.cancel);
 
       ctrl.promise
-        .then(() => {
+        .then((res) => {
           transferCancelMap.current.delete(taskId);
-          pushNotification({
-            kind: 'success',
-            title: `Unduhan dimulai: ${item.name}`,
-          });
+          if (res?.usedRawFallback) {
+            pushNotification({
+              kind: 'info',
+              title: `Unduhan dialihkan ke Telegram: ${item.name}`,
+              detail:
+                'Aktifkan Proxy Cloudflare Worker di Pengaturan Telegram agar HP langsung menyimpan file dengan nama dan format asli.',
+            });
+          } else {
+            pushNotification({
+              kind: 'success',
+              title: `Unduhan dimulai: ${item.name}`,
+            });
+          }
         })
         .catch((err) => {
           transferCancelMap.current.delete(taskId);
@@ -1568,58 +1616,6 @@ export default function App() {
     }
   };
 
-  const handleSyncTelegram = async (item: DriveItem) => {
-    if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
-      throw new Error('Hubungkan Telegram terlebih dahulu.');
-    }
-
-    let fileBlob: Blob | null = null;
-    if (item.localBlobKey) {
-      fileBlob = await getLocalBlob(item.localBlobKey);
-    } else if (item.demoTextContent !== undefined) {
-      fileBlob = new Blob([item.demoTextContent], { type: item.mimeType || 'text/plain' });
-    } else if (item.thumbnailUrl) {
-      const res = await fetch(item.thumbnailUrl);
-      if (res.ok) fileBlob = await res.blob();
-    }
-
-    if (!fileBlob) {
-      throw new Error('Data file lokal tidak tersedia untuk disinkronkan.');
-    }
-
-    const op = uploadFileDirectToTelegram(
-      tgConfig.botToken,
-      tgConfig.chatId,
-      fileBlob,
-      item.name,
-      () => undefined,
-    );
-    const uploaded = await op.promise;
-    const now = new Date().toISOString();
-
-    const updatedItem: DriveItem = {
-      ...item,
-      storageBackend: 'telegram',
-      updatedAt: now,
-      chunks: [
-        {
-          index: 0,
-          size: fileBlob.size,
-          telegramFileId: uploaded.fileId,
-          telegramUniqueId: uploaded.fileUniqueId,
-          telegramMessageId: uploaded.messageId,
-        },
-      ],
-    };
-
-    commitItems((prev) => prev.map((i) => (i.id === item.id ? updatedItem : i)));
-    setPreviewItem(updatedItem);
-    pushNotification({
-      kind: 'success',
-      title: `Tersinkron ke Telegram: ${item.name}`,
-    });
-  };
-
   const handleToggleSelect = (id: string, shiftKey = false) => {
     if (shiftKey && lastSelectedIdRef.current) {
       const startIdx = visibleItems.findIndex((i) => i.id === lastSelectedIdRef.current);
@@ -1644,12 +1640,6 @@ export default function App() {
       else next.add(id);
       return next;
     });
-  };
-
-  const handleToggleSelectAll = () => {
-    const allSelected = visibleItems.length > 0 && visibleItems.every((i) => selectedIds.has(i.id));
-    if (allSelected) setSelectedIds(new Set());
-    else setSelectedIds(new Set(visibleItems.map((i) => i.id)));
   };
 
   const openTrashConfirmation = (targetItems: DriveItem[]) => {
@@ -1774,13 +1764,10 @@ export default function App() {
     };
   }, [isMarqueeSession]);
 
-  const selectedArray = Array.from(selectedIds);
   const selectedItemsList = useMemo(
     () => items.filter((i) => selectedIds.has(i.id)),
     [items, selectedIds],
   );
-  const allVisibleSelected =
-    visibleItems.length > 0 && visibleItems.every((i) => selectedIds.has(i.id));
   const isTrashView = section === 'trash';
 
   if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
@@ -1913,41 +1900,9 @@ export default function App() {
           section={section}
           breadcrumbs={breadcrumbs}
           onNavigateFolder={handleNavigateFolder}
-          typeFilter={typeFilter}
-          onTypeFilterChange={setTypeFilter}
           sortField={sortField}
           sortDirection={sortDirection}
           onSortChange={handleSortChange}
-          visibleCount={visibleItems.length}
-          selectedCount={selectedIds.size}
-          allSelected={allVisibleSelected}
-          onToggleSelectAll={handleToggleSelectAll}
-          onClearSelection={() => setSelectedIds(new Set())}
-          onBulkDownload={() => {
-            for (const id of selectedArray) {
-              const found = items.find((i) => i.id === id && i.type === 'file');
-              if (found) handleDownloadItem(found);
-            }
-          }}
-          onBulkStar={() => {
-            const now = new Date().toISOString();
-            const set = new Set(selectedArray);
-            commitItems((prev) =>
-              prev.map((i) => (set.has(i.id) ? { ...i, starred: true, updatedAt: now } : i)),
-            );
-            setSelectedIds(new Set());
-            pushNotification({
-              kind: 'info',
-              title: `${selectedArray.length} item dibintangi`,
-            });
-          }}
-          onBulkCopy={() => {
-            handleCopyIds(selectedArray);
-            setSelectedIds(new Set());
-          }}
-          onBulkTrash={() => openTrashConfirmation(selectedItemsList)}
-          onBulkRestore={() => handleTrashOrRestore(selectedArray, false)}
-          onBulkDeletePermanent={() => openPermanentDeleteConfirmation(selectedItemsList)}
           clipboardCount={clipboardIds.length}
           onPasteItems={handlePasteItems}
           onClearClipboard={() => setClipboardIds([])}
@@ -2006,11 +1961,15 @@ export default function App() {
                             ? 'Belum ada musik'
                             : section === 'documents'
                               ? 'Belum ada dokumen'
-                              : 'Folder ini masih kosong'}
+                              : section === 'archives'
+                                ? 'Belum ada arsip'
+                                : section === 'others'
+                                  ? 'Belum ada file lainnya'
+                                  : 'Folder ini masih kosong'}
                 </h2>
                 <p className="mt-1.5 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
                   {searchQuery
-                    ? 'Coba kata kunci lain atau ubah filter tipe file di atas.'
+                    ? 'Coba kata kunci lain.'
                     : isTrashView
                       ? 'File atau folder yang Anda buang akan muncul di sini sebelum dihapus permanen.'
                       : 'Seret dan lepas file ke area ini (atau tepat ke atas folder) atau klik Unggah File (maks. 20 MB per file).'}
@@ -2042,6 +2001,7 @@ export default function App() {
             ) : viewMode === 'grid' ? (
               <FileGrid
                 items={visibleItems}
+                allItems={items}
                 tgConfig={tgConfig}
                 folderCounts={folderCounts}
                 selectedIds={selectedIds}
@@ -2059,20 +2019,13 @@ export default function App() {
                 onContextMenuItem={handleContextMenuItem}
                 onOpenItem={handleOpenItem}
                 onDoubleClickItem={handleDoubleClickItem}
-                onDownloadItem={handleDownloadItem}
-                onCopyItem={(item) => handleCopyIds([item.id])}
-                onToggleStar={handleToggleStar}
-                onRenameItem={(item) =>
-                  setNameModal({ open: true, mode: 'rename', targetItem: item })
-                }
-                onTrashItem={(item) => openTrashConfirmation([item])}
-                onRestoreItem={(item) => handleTrashOrRestore([item.id], false)}
-                onDeletePermanent={(item) => openPermanentDeleteConfirmation([item])}
                 isTrashView={isTrashView}
               />
             ) : (
               <FileTable
                 items={visibleItems}
+                allItems={items}
+                folderCounts={folderCounts}
                 selectedIds={selectedIds}
                 draggingIds={draggingIds}
                 onDragStartIds={setDraggingIds}
@@ -2088,15 +2041,6 @@ export default function App() {
                 onContextMenuItem={handleContextMenuItem}
                 onOpenItem={handleOpenItem}
                 onDoubleClickItem={handleDoubleClickItem}
-                onDownloadItem={handleDownloadItem}
-                onCopyItem={(item) => handleCopyIds([item.id])}
-                onToggleStar={handleToggleStar}
-                onRenameItem={(item) =>
-                  setNameModal({ open: true, mode: 'rename', targetItem: item })
-                }
-                onTrashItem={(item) => openTrashConfirmation([item])}
-                onRestoreItem={(item) => handleTrashOrRestore([item.id], false)}
-                onDeletePermanent={(item) => openPermanentDeleteConfirmation([item])}
                 isTrashView={isTrashView}
               />
             )}
@@ -2125,11 +2069,7 @@ export default function App() {
             allItems={items}
             tgConfig={tgConfig}
             onOpenFolder={(folder) => handleNavigateFolder(folder.id)}
-            onExpandModal={(item) => setPreviewItem(item)}
-            onDownload={handleDownloadItem}
-            onToggleStar={handleToggleStar}
-            onCopyItems={(targetItems) => handleCopyIds(targetItems.map((i) => i.id))}
-            onTrashItems={(targetItems) => openTrashConfirmation(targetItems)}
+            onOpenTelegramSettings={() => setTelegramModalOpen(true)}
           />
         </div>
       </div>
@@ -2185,9 +2125,7 @@ export default function App() {
         item={previewItem}
         tgConfig={tgConfig}
         onClose={() => setPreviewItem(null)}
-        onDownload={handleDownloadItem}
-        onToggleStar={handleToggleStar}
-        onSyncTelegram={handleSyncTelegram}
+        onOpenTelegramSettings={() => setTelegramModalOpen(true)}
       />
 
       <TelegramModal
@@ -2206,6 +2144,14 @@ export default function App() {
           }
           setTgConfig(nextCfg);
           saveStoredTelegramConfig(nextCfg);
+          const nextProxy = normalizeCorsProxyUrl(nextCfg.corsProxyUrl) || '';
+          const updatedPrefs: CloudViewPrefs = {
+            ...viewPrefsRef.current,
+            px: nextProxy,
+            u: new Date().toISOString(),
+          };
+          viewPrefsRef.current = updatedPrefs;
+          saveStoredViewPrefs(updatedPrefs);
           pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
           setSyncState('synced');
           if (pulledItems && pulledItems.length > 0) {
@@ -2215,6 +2161,7 @@ export default function App() {
               return merged;
             });
           }
+          setCloudPushTick((t) => t + 1);
           pushNotification({
             kind: 'success',
             title: `Terhubung ke @${nextCfg.botUsername}`,

@@ -4,6 +4,7 @@ const PBKDF2_ITERATIONS = 100_000;
 export interface TelegramVaultPayload {
   botToken: string;
   chatId: string;
+  corsProxyUrl?: string;
 }
 
 function bytesToBase64Url(bytes: Uint8Array): string {
@@ -76,7 +77,12 @@ export async function encryptTelegramVault(
   const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
   const key = await deriveVaultKey(cleanPin, salt);
 
-  const plaintext = new TextEncoder().encode(JSON.stringify({ t: cleanToken, c: cleanChat }));
+  const cleanProxy = payload.corsProxyUrl?.trim();
+  const payloadObj: { t: string; c: string; p?: string } = { t: cleanToken, c: cleanChat };
+  if (cleanProxy) {
+    payloadObj.p = cleanProxy;
+  }
+  const plaintext = new TextEncoder().encode(JSON.stringify(payloadObj));
   const cipherBuffer = await globalThis.crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: toArrayBuffer(iv) },
     key,
@@ -123,6 +129,7 @@ export async function decryptTelegramVault(
     const parsed = JSON.parse(new TextDecoder().decode(plainBuffer)) as {
       t?: string;
       c?: string;
+      p?: string;
     };
     if (!parsed.t || !parsed.c) {
       throw new Error('Isi brankas kosong.');
@@ -130,6 +137,7 @@ export async function decryptTelegramVault(
     return {
       botToken: parsed.t,
       chatId: parsed.c,
+      corsProxyUrl: parsed.p?.trim() || undefined,
     };
   } catch {
     throw new Error('PIN salah atau kode brankas tidak cocok.');

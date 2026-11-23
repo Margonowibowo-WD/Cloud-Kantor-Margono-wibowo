@@ -1,23 +1,22 @@
-import { useState } from 'react';
-import {
-  Copy,
-  Download,
-  Pencil,
-  RotateCcw,
-  Star,
-  Trash2,
-} from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Star } from 'lucide-react';
 import type { DriveItem } from '../types/drive';
-import { formatBytes, formatRelativeDateId } from '../utils/fileHelpers';
+import {
+  formatBytes,
+  formatRelativeDateId,
+  getFileTypeLabel,
+} from '../utils/fileHelpers';
 import {
   type CapturedDropPayload,
   captureDropEntriesSync,
 } from '../utils/dropUploadHelpers';
-import { DIRECT_TELEGRAM_MAX_BYTES } from '../utils/telegramDirect';
 import { FileIcon } from './FileIcon';
+import { type HoveredItemAnchor, ItemHoverTooltip } from './ItemHoverTooltip';
 
 interface FileTableProps {
   items: DriveItem[];
+  allItems: DriveItem[];
+  folderCounts?: Record<string, number>;
   selectedIds: Set<string>;
   draggingIds: string[];
   onDragStartIds: (ids: string[]) => void;
@@ -28,18 +27,13 @@ interface FileTableProps {
   onContextMenuItem: (e: React.MouseEvent, item: DriveItem) => void;
   onOpenItem: (item: DriveItem) => void;
   onDoubleClickItem?: (item: DriveItem) => void;
-  onDownloadItem: (item: DriveItem) => void;
-  onCopyItem: (item: DriveItem) => void;
-  onToggleStar: (item: DriveItem) => void;
-  onRenameItem: (item: DriveItem) => void;
-  onTrashItem: (item: DriveItem) => void;
-  onRestoreItem: (item: DriveItem) => void;
-  onDeletePermanent: (item: DriveItem) => void;
   isTrashView: boolean;
 }
 
 export function FileTable({
   items,
+  allItems,
+  folderCounts = {},
   selectedIds,
   draggingIds,
   onDragStartIds,
@@ -50,19 +44,52 @@ export function FileTable({
   onContextMenuItem,
   onOpenItem,
   onDoubleClickItem,
-  onDownloadItem,
-  onCopyItem,
-  onToggleStar,
-  onRenameItem,
-  onTrashItem,
-  onRestoreItem,
-  onDeletePermanent,
   isTrashView,
 }: FileTableProps) {
   const [dropTargetFolder, setDropTargetFolder] = useState<{
     id: string;
     mode: 'move' | 'upload';
   } | null>(null);
+  const [hoverAnchor, setHoverAnchor] = useState<HoveredItemAnchor | null>(null);
+  const hoverTimerRef = useRef<number | null>(null);
+
+  const clearHoverTooltip = () => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+    setHoverAnchor(null);
+  };
+
+  const scheduleHoverTooltip = (item: DriveItem, el: HTMLElement) => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current);
+    }
+    const r = el.getBoundingClientRect();
+    const rectSnapshot = {
+      top: r.top,
+      left: r.left,
+      right: r.right,
+      bottom: r.bottom,
+      width: r.width,
+      height: r.height,
+    };
+    hoverTimerRef.current = window.setTimeout(() => {
+      hoverTimerRef.current = null;
+      setHoverAnchor({ item, rect: rectSnapshot });
+    }, 1800);
+  };
+
+  useEffect(() => {
+    const onScroll = () => clearHoverTooltip();
+    window.addEventListener('scroll', onScroll, true);
+    return () => {
+      window.removeEventListener('scroll', onScroll, true);
+      if (hoverTimerRef.current !== null) {
+        window.clearTimeout(hoverTimerRef.current);
+      }
+    };
+  }, []);
 
   const buildDragPayload = (itemId: string): string[] =>
     selectedIds.has(itemId) ? Array.from(selectedIds) : [itemId];
@@ -73,10 +100,9 @@ export function FileTable({
         <thead>
           <tr className="border-b border-slate-200 bg-slate-50/70 text-xs font-semibold text-slate-500 dark:border-slate-800 dark:bg-slate-900/80 dark:text-slate-400">
             <th className="px-4 py-2.5">Nama</th>
-            <th className="hidden px-3 py-2.5 sm:table-cell">Penyimpanan</th>
+            <th className="hidden px-3 py-2.5 sm:table-cell">Jenis File</th>
             <th className="hidden px-3 py-2.5 md:table-cell">Diubah</th>
-            <th className="px-3 py-2.5 text-right">Ukuran</th>
-            <th className="w-40 px-4 py-2.5 text-right">Aksi</th>
+            <th className="px-4 py-2.5 text-right">Ukuran</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
@@ -92,12 +118,20 @@ export function FileTable({
                 key={item.id}
                 data-drive-item={item.id}
                 draggable={!isTrashView}
+                onPointerEnter={(e) => {
+                  if (e.pointerType === 'mouse') {
+                    scheduleHoverTooltip(item, e.currentTarget);
+                  }
+                }}
+                onPointerLeave={() => clearHoverTooltip()}
                 onContextMenu={(e) => {
+                  clearHoverTooltip();
                   e.preventDefault();
                   e.stopPropagation();
                   onContextMenuItem(e, item);
                 }}
                 onDragStart={(e) => {
+                  clearHoverTooltip();
                   if (isTrashView) return;
                   const ids = buildDragPayload(item.id);
                   e.dataTransfer.setData('application/x-teledrive-ids', JSON.stringify(ids));
@@ -183,6 +217,7 @@ export function FileTable({
                   <button
                     type="button"
                     onClick={(e) => {
+                      clearHoverTooltip();
                       if (e.ctrlKey || e.metaKey || e.shiftKey) {
                         onToggleSelect(item.id, e.shiftKey);
                       } else {
@@ -203,6 +238,9 @@ export function FileTable({
                     <span className="truncate font-medium text-slate-900 dark:text-slate-100">
                       {item.name}
                     </span>
+                    {!isTrashView && item.starred && (
+                      <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-500" />
+                    )}
                   </button>
                 </td>
                 <td className="hidden whitespace-nowrap px-3 py-2 text-xs text-slate-500 sm:table-cell dark:text-slate-400">
@@ -210,104 +248,29 @@ export function FileTable({
                     <span className="font-semibold text-blue-600 dark:text-blue-400">
                       Lepas untuk unggah ke folder
                     </span>
-                  ) : isFolder ? (
-                    'Folder Cloud'
-                  ) : item.size > DIRECT_TELEGRAM_MAX_BYTES ? (
-                    <span className="font-medium text-amber-600 dark:text-amber-400">
-                      Telegram (&gt;20 MB)
-                    </span>
                   ) : (
-                    <span className="font-medium text-blue-600 dark:text-blue-400">
-                      Cloud Telegram
+                    <span className="font-medium text-slate-600 dark:text-slate-300">
+                      {getFileTypeLabel(item)}
                     </span>
                   )}
                 </td>
                 <td className="hidden whitespace-nowrap px-3 py-2 text-xs tabular-nums text-slate-500 md:table-cell dark:text-slate-400">
                   {formatRelativeDateId(item.updatedAt)}
                 </td>
-                <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs tabular-nums text-slate-600 dark:text-slate-300">
+                <td className="whitespace-nowrap px-4 py-2 text-right font-mono text-xs tabular-nums text-slate-600 dark:text-slate-300">
                   {isFolder ? '—' : formatBytes(item.size)}
-                </td>
-                <td className="px-4 py-2">
-                  <div className="flex items-center justify-end gap-0.5">
-                    {!isTrashView ? (
-                      <>
-                        {item.type === 'file' && (
-                          <button
-                            type="button"
-                            onClick={() => onDownloadItem(item)}
-                            aria-label={`Unduh ${item.name}`}
-                            className="flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-slate-200/70 hover:text-blue-600 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-blue-400"
-                          >
-                            <Download className="h-3.5 w-3.5" />
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => onCopyItem(item)}
-                          aria-label={`Salin ${item.name}`}
-                          className="flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-slate-200/70 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-700"
-                        >
-                          <Copy className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onToggleStar(item)}
-                          aria-label={
-                            item.starred ? `Hapus bintang ${item.name}` : `Bintangi ${item.name}`
-                          }
-                          className={`flex h-7 w-7 items-center justify-center rounded-md hover:bg-slate-200/70 dark:hover:bg-slate-700 ${
-                            item.starred
-                              ? 'text-amber-500'
-                              : 'text-slate-400 hover:text-slate-700 dark:text-slate-400'
-                          }`}
-                        >
-                          <Star className={`h-3.5 w-3.5 ${item.starred ? 'fill-amber-400' : ''}`} />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onRenameItem(item)}
-                          aria-label={`Ubah nama ${item.name}`}
-                          className="flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-slate-200/70 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-700"
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onTrashItem(item)}
-                          aria-label={`Buang ${item.name}`}
-                          className="flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-rose-100 hover:text-rose-600 dark:text-slate-400 dark:hover:bg-rose-950/50 dark:hover:text-rose-400"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => onRestoreItem(item)}
-                          aria-label={`Pulihkan ${item.name}`}
-                          className="flex h-7 w-7 items-center justify-center rounded-md text-blue-600 hover:bg-blue-100 dark:text-blue-400 dark:hover:bg-blue-950/50"
-                        >
-                          <RotateCcw className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onDeletePermanent(item)}
-                          aria-label={`Hapus permanen ${item.name}`}
-                          className="flex h-7 w-7 items-center justify-center rounded-md text-rose-600 hover:bg-rose-100 dark:text-rose-400 dark:hover:bg-rose-950/50"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </>
-                    )}
-                  </div>
                 </td>
               </tr>
             );
           })}
         </tbody>
       </table>
+
+      <ItemHoverTooltip
+        anchor={hoverAnchor}
+        allItems={allItems}
+        folderCounts={folderCounts}
+      />
     </div>
   );
 }

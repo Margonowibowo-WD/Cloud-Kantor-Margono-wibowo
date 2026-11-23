@@ -11,9 +11,13 @@ import {
   formatBytes,
   formatEta,
   getFileCategory,
+  getFileTypeLabel,
+  getItemLocationPath,
   getOfficePreviewType,
   isDescendantOrSelf,
   isPdfFile,
+  resolveMimeTypeForFilename,
+  sanitizeDownloadFilename,
 } from './fileHelpers';
 import {
   buildTelegramV3Plan,
@@ -202,14 +206,29 @@ test('filterAndSortItems scopes folders, search, starred, and trash properly', (
   );
 });
 
-test('computeStorageSummary aggregates active, trashed, and Telegram bytes', () => {
+test('computeStorageSummary aggregates active, trashed, Telegram bytes, and per-category breakdown', () => {
   const summary = computeStorageSummary(sampleItems);
   assert.equal(summary.activeBytes, 3_700_000);
   assert.equal(summary.trashedBytes, 5_000_000);
+  assert.equal(summary.totalBytes, 8_700_000);
   assert.equal(summary.fileCount, 2);
   assert.equal(summary.folderCount, 2);
   assert.equal(summary.telegramSyncedCount, 1);
   assert.equal(summary.telegramSyncedBytes, 2_500_000);
+  assert.deepEqual(summary.categories.image, { bytes: 2_500_000, count: 1 });
+  assert.deepEqual(summary.categories.document, { bytes: 1_200_000, count: 1 });
+  assert.deepEqual(summary.categories.video, { bytes: 0, count: 0 });
+  assert.deepEqual(summary.categories.audio, { bytes: 0, count: 0 });
+  assert.deepEqual(summary.categories.other, { bytes: 0, count: 0 });
+});
+
+test('getItemLocationPath resolves full folder hierarchy and trash label cleanly', () => {
+  assert.equal(getItemLocationPath(sampleItems[2], sampleItems), 'Drive Saya');
+  assert.equal(
+    getItemLocationPath(sampleItems[3], sampleItems),
+    'Drive Saya / Desain Produk / Mockup Final',
+  );
+  assert.equal(getItemLocationPath(sampleItems[4], sampleItems), 'Sampah · Drive Saya');
 });
 
 test('encodeTelegramIndex and decodeTelegramIndex round-trip items under 4096 chars', () => {
@@ -408,6 +427,71 @@ test('filterAndSortItems separates photos, videos, and music cleanly', () => {
     music.map((i) => i.id),
     ['aud-1'],
   );
+
+  const archiveAndOther: DriveItem[] = [
+    ...mediaDataset,
+    {
+      id: 'arc-1',
+      name: 'Backup_Data.zip',
+      type: 'file',
+      parentId: null,
+      size: 2048,
+      mimeType: 'application/zip',
+      starred: false,
+      trashed: false,
+      createdAt: '2026-11-16T11:00:00.000Z',
+      updatedAt: '2026-11-16T11:00:00.000Z',
+      storageBackend: 'telegram',
+      chunks: [],
+    },
+    {
+      id: 'oth-1',
+      name: 'Installer_Aplikasi.apk',
+      type: 'file',
+      parentId: null,
+      size: 4096,
+      mimeType: 'application/vnd.android.package-archive',
+      starred: false,
+      trashed: false,
+      createdAt: '2026-11-16T11:00:00.000Z',
+      updatedAt: '2026-11-16T11:00:00.000Z',
+      storageBackend: 'telegram',
+      chunks: [],
+    },
+  ];
+
+  assert.deepEqual(
+    filterAndSortItems(archiveAndOther, {
+      section: 'archives',
+      currentFolderId: null,
+      searchQuery: '',
+      typeFilter: 'all',
+      sortField: 'name',
+      sortDirection: 'asc',
+    }).map((i) => i.id),
+    ['arc-1'],
+  );
+
+  assert.deepEqual(
+    filterAndSortItems(archiveAndOther, {
+      section: 'others',
+      currentFolderId: null,
+      searchQuery: '',
+      typeFilter: 'all',
+      sortField: 'name',
+      sortDirection: 'asc',
+    }).map((i) => i.id),
+    ['oth-1'],
+  );
+});
+
+test('getFileTypeLabel returns human-readable type labels like Word, Excel, MP3, PDF, Folder', () => {
+  assert.equal(getFileTypeLabel({ type: 'folder', name: 'Kantor', mimeType: 'inode/directory' }), 'Folder');
+  assert.equal(getFileTypeLabel({ type: 'file', name: 'Surat.docx', mimeType: 'application/octet-stream' }), 'Word');
+  assert.equal(getFileTypeLabel({ type: 'file', name: 'Anggaran.xlsx', mimeType: 'application/octet-stream' }), 'Excel');
+  assert.equal(getFileTypeLabel({ type: 'file', name: 'Slide.pptx', mimeType: 'application/octet-stream' }), 'PowerPoint');
+  assert.equal(getFileTypeLabel({ type: 'file', name: 'Lagu.mp3', mimeType: 'audio/mpeg' }), 'MP3');
+  assert.equal(getFileTypeLabel({ type: 'file', name: 'Kontrak.pdf', mimeType: 'application/pdf' }), 'PDF');
 });
 
 test('isPdfFile detects PDF by mimeType or .pdf extension', () => {
@@ -771,6 +855,66 @@ test('formatTelegramIndexHtml stays <= 4080 plain-text chars and extractV3Meta p
     { id: 101, h: 'h1' },
     { id: 102, h: 'h2' },
   ]);
+});
+
+import { buildProxiedTelegramFileUrl, normalizeCorsProxyUrl } from './telegramDirect';
+
+test('normalizeCorsProxyUrl and buildProxiedTelegramFileUrl safely wrap Telegram file URLs', async () => {
+  assert.equal(normalizeCorsProxyUrl(''), undefined);
+  assert.equal(normalizeCorsProxyUrl('javascript:alert(1)'), undefined);
+  assert.equal(
+    normalizeCorsProxyUrl('https://my-proxy.workers.dev///'),
+    'https://my-proxy.workers.dev',
+  );
+
+  const tgUrl = 'https://api.telegram.org/file/bot123:ABC/documents/test.pdf';
+  assert.equal(buildProxiedTelegramFileUrl(tgUrl, undefined), tgUrl);
+  assert.equal(
+    buildProxiedTelegramFileUrl(tgUrl, 'https://my-proxy.workers.dev/'),
+    `https://my-proxy.workers.dev?url=${encodeURIComponent(tgUrl)}`,
+  );
+
+  assert.equal(
+    buildProxiedTelegramFileUrl(tgUrl, 'https://my-proxy.workers.dev/', {
+      filename: 'Laporan Akhir.pdf',
+      mimeType: 'application/pdf',
+    }),
+    `https://my-proxy.workers.dev?url=${encodeURIComponent(tgUrl)}&dl=1&filename=${encodeURIComponent('Laporan Akhir.pdf')}&mime=${encodeURIComponent('application/pdf')}`,
+  );
+
+  const vaultWithProxy = await encryptTelegramVault(
+    {
+      botToken: '987654321:AAH_token',
+      chatId: '-10011223344',
+      corsProxyUrl: 'https://my-proxy.workers.dev/',
+    },
+    '4321',
+  );
+  const decoded = await decryptTelegramVault(vaultWithProxy, '4321');
+  assert.equal(decoded.corsProxyUrl, 'https://my-proxy.workers.dev/');
+});
+
+test('resolveMimeTypeForFilename and sanitizeDownloadFilename preserve real extensions for mobile downloads', () => {
+  assert.equal(
+    resolveMimeTypeForFilename('Kontrak.pdf', 'application/octet-stream'),
+    'application/pdf',
+  );
+  assert.equal(
+    resolveMimeTypeForFilename('Rekap.xlsx', ''),
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  );
+  assert.equal(
+    resolveMimeTypeForFilename('Catatan_Tanpa_Ekstensi', 'text/plain; charset=utf-8'),
+    'text/plain',
+  );
+  assert.equal(
+    sanitizeDownloadFilename('Laporan:Q4/2026?.pdf', 'application/pdf'),
+    'Laporan_Q4_2026_.pdf',
+  );
+  assert.equal(
+    sanitizeDownloadFilename('RekamanSuara', 'audio/mpeg'),
+    'RekamanSuara.mp3',
+  );
 });
 
 

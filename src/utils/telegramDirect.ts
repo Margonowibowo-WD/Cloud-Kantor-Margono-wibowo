@@ -70,7 +70,72 @@ export function toPublicStatus(cfg: TelegramConfigState): TelegramPublicStatus {
     autoSync: cfg.autoSync,
     pinnedIndexMessageId: cfg.pinnedIndexMessageId,
     lastCheckedAt: cfg.lastSyncedAt,
+    hasCorsProxy: Boolean(cfg.corsProxyUrl?.trim()),
   };
+}
+
+export const CLOUDFLARE_WORKER_CORS_SNIPPET = `export default {
+  async fetch(request) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Max-Age': '86400',
+        },
+      });
+    }
+    const reqUrl = new URL(request.url);
+    const target = reqUrl.searchParams.get('url') || '';
+    if (!target.startsWith('https://api.telegram.org/file/bot')) {
+      return new Response('Forbidden', { status: 403 });
+    }
+    const upstream = await fetch(target);
+    const headers = new Headers(upstream.headers);
+    headers.set('Access-Control-Allow-Origin', '*');
+    const dl = reqUrl.searchParams.get('dl') === '1';
+    const filename = (reqUrl.searchParams.get('filename') || '').replace(/[\\r\\n"]/g, '_').trim();
+    const mime = (reqUrl.searchParams.get('mime') || '').trim();
+    if (dl && filename) {
+      const safeAscii = filename.replace(/[^\\x20-\\x7E]/g, '_');
+      headers.set('Content-Disposition', \`attachment; filename="\${safeAscii}"; filename*=UTF-8''\${encodeURIComponent(filename)}\`);
+      if (mime) headers.set('Content-Type', mime);
+    } else {
+      headers.delete('Content-Disposition');
+    }
+    return new Response(upstream.body, { status: upstream.status, headers });
+  },
+};`;
+
+export function normalizeCorsProxyUrl(raw?: string): string | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return undefined;
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return undefined;
+  }
+}
+
+export function buildProxiedTelegramFileUrl(
+  tgUrl: string,
+  corsProxyUrl?: string,
+  downloadOptions?: { filename: string; mimeType?: string },
+): string {
+  const cleanProxy = normalizeCorsProxyUrl(corsProxyUrl);
+  if (!cleanProxy) return tgUrl;
+  const sep = cleanProxy.includes('?') ? '&' : '?';
+  let result = `${cleanProxy}${sep}url=${encodeURIComponent(tgUrl)}`;
+  if (downloadOptions?.filename) {
+    result += `&dl=1&filename=${encodeURIComponent(downloadOptions.filename)}`;
+    if (downloadOptions.mimeType) {
+      result += `&mime=${encodeURIComponent(downloadOptions.mimeType)}`;
+    }
+  }
+  return result;
 }
 
 export async function verifyTelegramDirect(
@@ -532,7 +597,10 @@ function mergeNewerPrefs(local?: CloudViewPrefs, remote?: CloudViewPrefs): Cloud
   if (!remote) return local;
   const localMs = local.u ? Date.parse(local.u) || 0 : 0;
   const remoteMs = remote.u ? Date.parse(remote.u) || 0 : 0;
-  return remoteMs > localMs ? remote : local;
+  const winner = remoteMs > localMs ? remote : local;
+  const loser = remoteMs > localMs ? local : remote;
+  const px = winner.px !== undefined ? winner.px : loser.px;
+  return px !== undefined ? { ...winner, px } : winner;
 }
 
 async function postBotTextMessage(
@@ -709,9 +777,11 @@ export async function pushIndexToTelegramPinnedMessage(
     }
   }
 
-  // Delete obsolete overflow shard messages
+  // Delete obsolete overflow shard messages cleanly without duplicate requests
+  const deletedShardIds = new Set<number>();
   for (const oldRef of existingShardRefs) {
-    if (!reusedShardIds.has(oldRef.id)) {
+    if (!reusedShardIds.has(oldRef.id) && !deletedShardIds.has(oldRef.id)) {
+      deletedShardIds.add(oldRef.id);
       void deleteTelegramMessageDirect(botToken, chatId, oldRef.id);
     }
   }
