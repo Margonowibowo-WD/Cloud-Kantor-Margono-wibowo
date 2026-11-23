@@ -68,8 +68,8 @@ export function Toolbar({
       <div className="flex flex-wrap items-center justify-between gap-3">
         {/* Breadcrumbs or Section Title */}
         {searchQuery.trim() ? (
-          <h1 className="font-display text-lg font-semibold text-slate-900 dark:text-slate-100">
-            Hasil pencarian: <span className="text-blue-600 dark:text-blue-400">{searchQuery}</span>
+          <h1 className="min-w-0 break-words font-display text-base font-semibold text-slate-900 sm:text-lg dark:text-slate-100">
+            Hasil pencarian: <span className="break-all text-blue-600 dark:text-blue-400">{searchQuery}</span>
           </h1>
         ) : section === 'my-drive' ? (
           <nav aria-label="Jalur folder" className="flex min-w-0 flex-wrap items-center gap-1">

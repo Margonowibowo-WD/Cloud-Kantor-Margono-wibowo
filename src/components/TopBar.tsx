@@ -102,42 +102,79 @@ export function TopBar({
           : 'Menghubungkan sinkronisasi Cloud...';
 
   return (
-    <header className="flex h-16 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 sm:gap-4 sm:px-6 dark:border-slate-800 dark:bg-slate-900">
-      <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
+    <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-2.5 border-b border-slate-200 bg-white px-3 py-2.5 sm:h-16 sm:flex-nowrap sm:gap-4 sm:px-6 sm:py-0 dark:border-slate-800 dark:bg-slate-900">
+      {/* Mobile Left: Menu Button & Compact Brand */}
+      <div className="order-1 flex items-center gap-2 lg:hidden">
         <button
           type="button"
           onClick={onOpenMobileMenu}
           aria-label="Buka menu navigasi"
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-600 hover:bg-slate-100 lg:hidden dark:text-slate-300 dark:hover:bg-slate-800"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
         >
           <Menu className="h-5 w-5" />
         </button>
 
-        <div className="relative w-full max-w-xl">
+        <div className="flex items-center gap-2 sm:hidden">
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-slate-900 via-blue-700 to-cyan-500 text-white shadow-xs dark:from-blue-600 dark:via-indigo-600 dark:to-cyan-500">
+            <svg viewBox="0 0 28 28" fill="none" aria-hidden="true" className="h-4 w-4">
+              <path
+                d="M14 3.5 23.5 9v10L14 24.5 4.5 19V9L14 3.5Z"
+                fill="currentColor"
+                fillOpacity="0.18"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M20.2 10.2 9.4 14.3l3.6 1.6 1.5 3.8 5.7-9.5Z"
+                fill="currentColor"
+              />
+            </svg>
+          </div>
+          <span className="hidden font-display text-sm font-extrabold tracking-tight text-slate-900 min-[410px]:inline dark:text-white">
+            Tele<span className="text-blue-600 dark:text-blue-400">Drive</span>
+          </span>
+        </div>
+      </div>
+
+      {/* Search Bar: Full-width dedicated row on HP (<640px), inline row on sm+ */}
+      <div className="order-3 min-w-0 basis-full sm:order-2 sm:basis-auto sm:flex-1 sm:max-w-xl">
+        <div className="relative w-full">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <input
             ref={inputRef}
-            type="search"
+            type="text"
+            inputMode="search"
+            enterKeyHint="search"
+            autoComplete="off"
+            autoCorrect="off"
+            spellCheck={false}
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                e.currentTarget.blur();
+              }
+            }}
             placeholder="Cari file atau folder..."
             aria-label="Cari file atau folder"
-            className="h-9 w-full rounded-xl border border-slate-200 bg-slate-50 pl-9 pr-8 text-sm text-slate-900 placeholder:text-slate-400 transition-colors focus:border-blue-500 focus:bg-white focus:outline-none sm:h-10 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-blue-500 dark:focus:bg-slate-800"
+            className="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 pl-9 pr-10 text-base text-slate-900 placeholder:text-slate-400 transition-colors focus:border-blue-500 focus:bg-white focus:outline-none sm:text-sm dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-blue-500 dark:focus:bg-slate-800"
           />
           {searchQuery && (
             <button
               type="button"
               onClick={() => onSearchChange('')}
               aria-label="Hapus pencarian"
-              className="absolute right-2.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-slate-400 hover:bg-slate-200 hover:text-slate-600 dark:hover:bg-slate-700 dark:hover:text-slate-200"
+              className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-200 hover:text-slate-600 dark:hover:bg-slate-700 dark:hover:text-slate-200"
             >
-              <X className="h-3.5 w-3.5" />
+              <X className="h-4 w-4" />
             </button>
           )}
         </div>
       </div>
 
-      <div className="flex shrink-0 items-center gap-1.5 sm:gap-2.5">
+      <div className="order-2 ml-auto flex shrink-0 items-center gap-1 sm:order-3 sm:ml-0 sm:gap-2.5">
         {/* Segmented View Switcher */}
         <div
           role="group"
@@ -248,14 +285,14 @@ export function TopBar({
           </span>
         </button>
 
-        {/* Quick Lock Button */}
+        {/* Quick Lock Button (hidden on very narrow phones since accessible in Profile menu) */}
         {onLockDrive && (
           <button
             type="button"
             onClick={onLockDrive}
             title="Kunci layar & lindungi Drive"
             aria-label="Kunci layar TeleDrive"
-            className="td-press flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700 dark:hover:text-white"
+            className="td-press hidden h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900 sm:flex dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700 dark:hover:text-white"
           >
             <Lock className="h-4 w-4" />
           </button>

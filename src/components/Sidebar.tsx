@@ -80,44 +80,53 @@ export function Sidebar({
   const content = (
     <div className="flex h-full flex-col justify-between overflow-y-auto bg-slate-50 px-4 py-5 dark:bg-slate-950">
       <div>
-        {/* Modern Brand Header */}
-        <div className="mb-6 flex items-center justify-between px-1">
+        {/* Modern Executive Brand Header */}
+        <div className="mb-6 flex items-center justify-between gap-2 px-0.5">
           <button
             type="button"
             onClick={() => {
               onSelectSection('my-drive');
               onCloseMobile();
             }}
-            className="group flex items-center gap-3 rounded-xl text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
+            className="group flex min-w-0 flex-1 items-center gap-3 rounded-xl text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
           >
-            <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-600 via-blue-600 to-indigo-600 text-white shadow-sm ring-1 ring-blue-700/20 transition-transform duration-150 group-hover:scale-[1.03]">
+            <div className="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-slate-900 via-blue-700 to-cyan-500 text-white shadow-md shadow-blue-600/20 ring-1 ring-white/20 transition-transform duration-150 group-hover:scale-[1.03] dark:from-blue-600 dark:via-indigo-600 dark:to-cyan-500">
               <svg
-                viewBox="0 0 24 24"
+                viewBox="0 0 28 28"
                 fill="none"
                 aria-hidden="true"
-                className="h-5 w-5"
+                className="h-6 w-6"
               >
                 <path
-                  d="M7.5 18.5h9.25a4.25 4.25 0 0 0 .56-8.46A5.5 5.5 0 0 0 6.57 8.9 3.75 3.75 0 0 0 7.5 18.5Z"
+                  d="M14 3.5 23.5 9v10L14 24.5 4.5 19V9L14 3.5Z"
+                  fill="currentColor"
+                  fillOpacity="0.16"
                   stroke="currentColor"
-                  strokeWidth="1.75"
-                  strokeLinecap="round"
+                  strokeWidth="1.6"
                   strokeLinejoin="round"
                 />
                 <path
-                  d="m10 13.75 5.25-2.25-2 5.25-1.15-2-2.1-1Z"
+                  d="M20.2 10.2 9.4 14.3l3.6 1.6 1.5 3.8 5.7-9.5Z"
                   fill="currentColor"
+                />
+                <path
+                  d="m13 15.9 7.2-5.7"
+                  stroke="#0f172a"
+                  strokeOpacity="0.28"
+                  strokeWidth="1.2"
+                  strokeLinecap="round"
                 />
               </svg>
             </div>
-            <div className="min-w-0">
-              <div className="font-display text-[18px] font-extrabold leading-none tracking-[-0.03em] whitespace-nowrap text-slate-900 dark:text-white">
-                Tele<span className="text-blue-600 dark:text-blue-400">Drive</span>
+            <div className="min-w-0 flex-1">
+              <div className="font-display text-[22px] font-extrabold leading-none tracking-[-0.035em] whitespace-nowrap text-slate-950 dark:text-white">
+                Tele
+                <span className="bg-gradient-to-r from-blue-600 to-cyan-500 bg-clip-text text-transparent dark:from-blue-400 dark:to-cyan-300">
+                  Drive
+                </span>
               </div>
-              <div className="mt-1 flex items-center gap-1.5 text-[11px] font-semibold tracking-[0.01em] text-slate-500 whitespace-nowrap dark:text-slate-400">
-                <span>Kantor Margono</span>
-                <span aria-hidden="true">·</span>
-                <span className="text-slate-400 dark:text-slate-500">Cloud</span>
+              <div className="mt-1.5 font-display text-[12.5px] font-bold tracking-[0.03em] whitespace-nowrap text-slate-700 dark:text-slate-200">
+                Kantor Margono
               </div>
             </div>
           </button>
@@ -126,7 +135,7 @@ export function Sidebar({
             type="button"
             onClick={onCloseMobile}
             aria-label="Tutup menu samping"
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-200/70 lg:hidden dark:text-slate-400 dark:hover:bg-slate-800"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-200/70 lg:hidden dark:text-slate-400 dark:hover:bg-slate-800"
           >
             <X className="h-5 w-5" />
           </button>
