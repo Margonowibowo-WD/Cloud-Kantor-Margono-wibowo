@@ -164,6 +164,8 @@ export function TelegramModal({
       });
       return;
     }
+    const hadProxyBefore = Boolean(normalizeCorsProxyUrl(config.corsProxyUrl));
+    const effectiveProxy = cleanProxy || (!hadProxyBefore ? normalizeCorsProxyUrl(pulled.prefs?.px) : undefined);
 
     const nextConfig: TelegramConfigState = {
       connected: true,
@@ -176,8 +178,12 @@ export function TelegramModal({
       autoSync,
       pinnedIndexMessageId: pulled.pinnedMessageId ?? config.pinnedIndexMessageId,
       lastSyncedAt: new Date().toISOString(),
-      corsProxyUrl: cleanProxy,
+      corsProxyUrl: effectiveProxy,
     };
+
+    if (effectiveProxy && !cleanProxy) {
+      setCorsProxyUrl(effectiveProxy);
+    }
 
     onSaveConfig(nextConfig, pulled.items);
     setSaving(false);

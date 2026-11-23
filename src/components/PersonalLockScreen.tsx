@@ -18,16 +18,22 @@ import {
 import {
   type DetectedChat,
   detectTelegramChatsDirect,
+  normalizeCorsProxyUrl,
   pullIndexFromTelegramPinnedMessage,
   verifyTelegramDirect,
 } from '../utils/telegramDirect';
+import type { CloudViewPrefs } from '../utils/telegramIndex';
 
 interface PersonalLockScreenProps {
   vaultString: string;
   onUnlockSuccess: (
     config: TelegramConfigState,
     pulledItems: DriveItem[],
-    options?: { sessionOnly?: boolean; savedLocalVault?: string },
+    options?: {
+      sessionOnly?: boolean;
+      savedLocalVault?: string;
+      pulledPrefs?: CloudViewPrefs;
+    },
   ) => void;
 }
 
@@ -124,13 +130,16 @@ export function PersonalLockScreen({
         autoSync: true,
         pinnedIndexMessageId: pulled.pinnedMessageId ?? verification.pinnedMessageId,
         lastSyncedAt: new Date().toISOString(),
-        corsProxyUrl: creds.corsProxyUrl,
+        corsProxyUrl: normalizeCorsProxyUrl(creds.corsProxyUrl || pulled.prefs?.px),
       };
 
       setSubmitting(false);
       setPin('');
       setFailedAttempts(0);
-      onUnlockSuccess(nextCfg, pulled.items, { sessionOnly: !rememberDevice });
+      onUnlockSuccess(nextCfg, pulled.items, {
+        sessionOnly: !rememberDevice,
+        pulledPrefs: pulled.prefs,
+      });
     } catch (err) {
       setSubmitting(false);
       const nextAttempts = failedAttempts + 1;
@@ -204,10 +213,15 @@ export function PersonalLockScreen({
         prefetchedChatId: resolvedChat,
       });
 
+      const resolvedProxy = normalizeCorsProxyUrl(pulled.prefs?.px);
       let savedLocalVault: string | undefined;
       if (setupPin.trim()) {
         savedLocalVault = await encryptTelegramVault(
-          { botToken: cleanToken, chatId: resolvedChat },
+          {
+            botToken: cleanToken,
+            chatId: resolvedChat,
+            corsProxyUrl: resolvedProxy,
+          },
           setupPin.trim(),
         );
       }
@@ -223,12 +237,14 @@ export function PersonalLockScreen({
         autoSync: true,
         pinnedIndexMessageId: pulled.pinnedMessageId ?? verification.pinnedMessageId,
         lastSyncedAt: new Date().toISOString(),
+        corsProxyUrl: resolvedProxy,
       };
 
       setSubmitting(false);
       onUnlockSuccess(nextCfg, pulled.items, {
         sessionOnly: !rememberDevice,
         savedLocalVault,
+        pulledPrefs: pulled.prefs,
       });
     } catch (err) {
       setSubmitting(false);

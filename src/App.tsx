@@ -1781,6 +1781,9 @@ export default function App() {
           }
           setTgConfig(nextCfg);
           saveStoredTelegramConfig(nextCfg, opts?.sessionOnly);
+          if (opts?.pulledPrefs) {
+            applyRemoteViewPrefs(opts.pulledPrefs);
+          }
           pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
           didAutoSyncRef.current = false;
           hasSyncedOnceRef.current = false;

@@ -323,6 +323,7 @@ export function loadStoredTelegramConfig(): TelegramConfigState {
         autoSync: parsed.autoSync ?? true,
         pinnedIndexMessageId: parsed.pinnedIndexMessageId,
         lastSyncedAt: parsed.lastSyncedAt,
+        corsProxyUrl: parsed.corsProxyUrl || loadStoredViewPrefs().px || undefined,
       };
     }
   } catch {
