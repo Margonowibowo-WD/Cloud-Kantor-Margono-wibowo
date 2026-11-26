@@ -41,6 +41,7 @@ export interface DirectVerifyResult {
   pinnedIndexCaption?: string;
   pinnedMessageId?: number;
   error?: string;
+  isNetworkError?: boolean;
 }
 
 const fileUrlCache = new Map<string, { url: string; expiresAt: number }>();
@@ -226,6 +227,7 @@ export async function verifyTelegramDirect(
   } catch (err) {
     return {
       ok: false,
+      isNetworkError: true,
       error: err instanceof Error ? err.message : 'Gagal menghubungi server Telegram API.',
     };
   }

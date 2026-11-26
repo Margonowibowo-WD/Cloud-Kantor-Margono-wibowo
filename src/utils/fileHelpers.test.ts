@@ -44,7 +44,9 @@ import {
   formatTelegramShardHtml,
   formatTelegramV4IndexHtml,
   fromCatalogRecordStub,
+  fromCompactRecord,
   mergeDriveItems,
+  reconcileAuthoritativeRemoteItems,
   reconcileConcurrentDriveState,
   reconcileRemoteDriveItems,
   splitCatalogIntoVolumes,
@@ -1301,4 +1303,118 @@ test('buildTelegramMessageUrl generates valid t.me deep links for private channe
   assert.equal(buildTelegramMessageUrl('123456', 10), null);
 });
 
+test('planBlobCacheEviction never evicts pinned offline blobs or queued offline upload blobs', () => {
+  const manifest = {
+    'blob-pinned-old': { size: 150, lastAccessedAt: 10 },
+    'blob-queued-old': { size: 150, lastAccessedAt: 20 },
+    'blob-normal-old': { size: 180, lastAccessedAt: 30 },
+    'blob-fresh-upload': { size: 100, lastAccessedAt: 100 },
+  };
+  const extraProtected = new Set(['blob-pinned-old', 'blob-queued-old']);
+  const plan = planBlobCacheEviction(manifest, 'blob-fresh-upload', 420, extraProtected);
 
+  assert.deepEqual(plan.keysToEvict, ['blob-normal-old']);
+  assert.ok('blob-pinned-old' in plan.nextManifest);
+  assert.ok('blob-queued-old' in plan.nextManifest);
+  assert.ok('blob-fresh-upload' in plan.nextManifest);
+  assert.ok(!('blob-normal-old' in plan.nextManifest));
+  assert.equal(plan.totalBytesAfter, 400);
+});
+
+test('reconcileAuthoritativeRemoteItems drops stale local items missing from remote while preserving pending local uploads and channel media', () => {
+  const baseItem = sampleItems[1]; // file-1
+  const staleLocalOnly: DriveItem = {
+    ...baseItem,
+    id: 'file-stale-deleted-elsewhere',
+    name: 'Old_Browser_Ghost.pdf',
+  };
+  const pendingOffline: DriveItem = {
+    ...baseItem,
+    id: 'file-pending-offline',
+    name: 'Pending_Offline.pdf',
+    pendingOfflineUpload: true,
+    chunks: [],
+  };
+  const channelMedia: DriveItem = {
+    ...baseItem,
+    id: 'tg-msg-999',
+    name: 'Bot_Upload.png',
+  };
+
+  const reconciledItems = [baseItem, staleLocalOnly, pendingOffline, channelMedia];
+  const remoteAuthoritative = [baseItem];
+  const result = reconcileAuthoritativeRemoteItems(
+    reconciledItems,
+    remoteAuthoritative,
+    [channelMedia],
+    new Set(['file-pending-offline']),
+  );
+
+  assert.deepEqual(
+    result.map((i) => i.id),
+    [baseItem.id, pendingOffline.id, channelMedia.id],
+  );
+});
+
+test('mergeDriveItems adopts remote folderIdx even when local folder updatedAt is newer due to clock skew', () => {
+  const localFolder: DriveItem = {
+    ...sampleItems[0], // f-root-1
+    updatedAt: '2026-11-26T12:00:00.000Z',
+    folderIdx: { mid: 100, fid: 'doc-old', h: 'oldhash1' },
+  };
+  const remoteFolder: DriveItem = {
+    ...sampleItems[0],
+    updatedAt: '2026-11-26T10:00:00.000Z', // earlier timestamp due to device clock skew
+    folderIdx: { mid: 250, fid: 'doc-new', h: 'newhash2' },
+  };
+
+  const merged = mergeDriveItems([localFolder], [remoteFolder]);
+  assert.equal(merged.length, 1);
+  assert.deepEqual(merged[0].folderIdx, { mid: 250, fid: 'doc-new', h: 'newhash2' });
+});
+
+test('mergeDriveItems strips isCatalogStub and upgrades chunks when remote matches or trails stub updatedAt', () => {
+  const baseFile = sampleItems[2]; // file-1
+  const stub = fromCatalogRecordStub(toCatalogRecord(baseFile));
+  assert.equal(stub.isCatalogStub, true);
+  assert.equal(stub.chunks.length, 0);
+
+  // 1) remoteTime === localTime (exact same updatedAt when hydrating V4 folder doc)
+  const hydratedCompact = fromCompactRecord({
+    i: baseFile.id,
+    p: baseFile.parentId,
+    n: baseFile.name,
+    t: 'f',
+    s: baseFile.size,
+    m: baseFile.mimeType,
+    u: stub.updatedAt,
+    fid: 'tg_hydrated_1',
+    mid: 901,
+  });
+  const mergedSameTime = mergeDriveItems([stub], [hydratedCompact]);
+  assert.equal(mergedSameTime.length, 1);
+  assert.equal(mergedSameTime[0].isCatalogStub, undefined);
+  assert.equal(mergedSameTime[0].chunks.length, 1);
+  assert.equal(mergedSameTime[0].chunks[0].telegramFileId, 'tg_hydrated_1');
+
+  // 2) localTime > remoteTime (stub touched later, e.g. starred/moved before folder doc reloaded)
+  const newerStub: DriveItem = {
+    ...stub,
+    updatedAt: '2026-11-26T20:00:00.000Z',
+  };
+  const midOnlyHydrated = fromCompactRecord({
+    i: baseFile.id,
+    p: baseFile.parentId,
+    n: baseFile.name,
+    t: 'f',
+    s: baseFile.size,
+    m: baseFile.mimeType,
+    u: '2026-11-26T10:00:00.000Z',
+    mid: 902,
+  });
+  const mergedNewerStub = mergeDriveItems([newerStub], [midOnlyHydrated]);
+  assert.equal(mergedNewerStub.length, 1);
+  assert.equal(mergedNewerStub[0].isCatalogStub, undefined);
+  assert.equal(mergedNewerStub[0].chunks.length, 1);
+  assert.equal(mergedNewerStub[0].chunks[0].telegramMessageId, 902);
+});

@@ -44,6 +44,7 @@ export interface DriveItem {
     h: string;
   };
   isCatalogStub?: boolean;
+  pendingOfflineUpload?: boolean;
 }
 
 export interface TelegramConfigState {

@@ -136,7 +136,7 @@ export function toCompactRecord(item: DriveItem): CompactDriveRecord {
 
 export function fromCompactRecord(rec: CompactDriveRecord): DriveItem {
   const isFolder = rec.t === 'd';
-  const hasTg = Boolean(rec.fid);
+  const hasTg = Boolean(rec.fid || rec.mid);
   return {
     id: rec.i,
     name: rec.n,
@@ -301,36 +301,63 @@ export function mergeDriveItems(localItems: DriveItem[], remoteItems: DriveItem[
 
     const remoteTime = Date.parse(remote.updatedAt) || 0;
     const localTime = Date.parse(existing.updatedAt) || 0;
+    const upgradeFromStub = Boolean(existing.isCatalogStub && !remote.isCatalogStub);
 
     if (remoteTime > localTime) {
       const keepExistingChunks = Boolean(
         remote.isCatalogStub && !existing.isCatalogStub && existing.chunks.length > 0,
       );
-      byId.set(remote.id, {
+      const merged: DriveItem = {
         ...existing,
         ...remote,
         chunks: keepExistingChunks ? existing.chunks : remote.chunks,
-        isCatalogStub: keepExistingChunks ? false : remote.isCatalogStub,
         folderIdx: remote.folderIdx ?? existing.folderIdx,
         localBlobKey: existing.localBlobKey,
         thumbnailUrl: existing.thumbnailUrl,
         demoTextContent: existing.demoTextContent,
-      });
+      };
+      if (keepExistingChunks || !remote.isCatalogStub) {
+        delete merged.isCatalogStub;
+      }
+      byId.set(remote.id, merged);
     } else if (remoteTime === localTime) {
-      const upgradeFromStub = Boolean(existing.isCatalogStub && !remote.isCatalogStub);
       const upgradeFolderIdx = Boolean(
         remote.folderIdx && (!existing.folderIdx || existing.folderIdx.h !== remote.folderIdx.h),
       );
       if (upgradeFromStub || upgradeFolderIdx) {
-        byId.set(remote.id, {
+        const merged: DriveItem = {
           ...existing,
           ...(upgradeFromStub ? remote : {}),
           folderIdx: remote.folderIdx ?? existing.folderIdx,
           localBlobKey: existing.localBlobKey,
           thumbnailUrl: existing.thumbnailUrl,
           demoTextContent: existing.demoTextContent,
-        });
+        };
+        if (upgradeFromStub) {
+          delete merged.isCatalogStub;
+        }
+        byId.set(remote.id, merged);
       }
+    } else if (upgradeFromStub) {
+      const merged: DriveItem = {
+        ...existing,
+        storageBackend: remote.storageBackend,
+        chunks: remote.chunks.length > 0 ? remote.chunks : existing.chunks,
+        folderIdx: remote.folderIdx ?? existing.folderIdx,
+      };
+      delete merged.isCatalogStub;
+      byId.set(remote.id, merged);
+    } else if (
+      remote.type === 'folder' &&
+      remote.folderIdx &&
+      (!existing.folderIdx || existing.folderIdx.h !== remote.folderIdx.h)
+    ) {
+      // pushV4ChangesToTelegram updates folderIdx without bumping folder.updatedAt;
+      // adopt newer remote folderIdx even if local clock was slightly ahead.
+      byId.set(remote.id, {
+        ...existing,
+        folderIdx: remote.folderIdx,
+      });
     }
   }
 
@@ -379,6 +406,28 @@ export function reconcileRemoteDriveItems(
     const updatedMs = Date.parse(item.updatedAt) || 0;
     return updatedMs >= syncStartedAtMs - 5000;
   });
+}
+
+/**
+ * Prunes stale local cache items that no longer exist in an authoritative remote cloud index,
+ * preserving only truly pending local changes (dirty items / offline-queued uploads) and new channel media.
+ */
+export function reconcileAuthoritativeRemoteItems(
+  reconciledItems: DriveItem[],
+  effectiveRemoteItems: DriveItem[],
+  channelMediaItems: DriveItem[],
+  pendingLocalIds: Set<string>,
+): DriveItem[] {
+  const authoritativeIds = new Set<string>();
+  for (const item of effectiveRemoteItems) authoritativeIds.add(item.id);
+  for (const item of channelMediaItems) authoritativeIds.add(item.id);
+
+  return reconciledItems.filter(
+    (item) =>
+      authoritativeIds.has(item.id) ||
+      pendingLocalIds.has(item.id) ||
+      Boolean(item.pendingOfflineUpload),
+  );
 }
 
 export async function encodeTelegramV3Shard(items: DriveItem[]): Promise<{ text: string; hash: string }> {

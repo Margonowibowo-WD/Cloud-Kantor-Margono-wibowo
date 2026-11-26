@@ -8,6 +8,7 @@ import {
   Radar,
   Send,
   ShieldCheck,
+  WifiOff,
 } from 'lucide-react';
 import type { DriveItem, TelegramConfigState } from '../types/drive';
 import {
@@ -15,6 +16,8 @@ import {
   encryptTelegramVault,
   isVaultConfigured,
 } from '../utils/cryptoVault';
+import { loadIndexedCatalogState } from '../utils/indexedCatalog';
+import { loadStoredItems } from '../utils/localVault';
 import {
   type DetectedChat,
   detectTelegramChatsDirect,
@@ -23,6 +26,7 @@ import {
 } from '../utils/telegramDirect';
 import type { CloudViewPrefs } from '../utils/telegramIndex';
 import { pullCloudStateFromTelegram } from '../utils/telegramV4';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface PersonalLockScreenProps {
   vaultString: string;
@@ -33,6 +37,7 @@ interface PersonalLockScreenProps {
       sessionOnly?: boolean;
       savedLocalVault?: string;
       pulledPrefs?: CloudViewPrefs;
+      offlineMode?: boolean;
     },
   ) => void;
 }
@@ -101,8 +106,39 @@ export function PersonalLockScreen({
     setError(null);
     try {
       const creds = await decryptTelegramVault(vaultString, pin);
+
+      const unlockOfflineWithCache = async () => {
+        const idbState = await loadIndexedCatalogState();
+        const fallbackLocal = loadStoredItems();
+        const cachedItems = idbState.items.length > 0 ? idbState.items : fallbackLocal;
+        const offlineCfg: TelegramConfigState = {
+          connected: true,
+          botToken: creds.botToken,
+          chatId: creds.chatId,
+          autoSync: true,
+          corsProxyUrl: normalizeCorsProxyUrl(creds.corsProxyUrl || idbState.v4Manifest?.p?.px),
+        };
+        setSubmitting(false);
+        setPin('');
+        setFailedAttempts(0);
+        onUnlockSuccess(offlineCfg, cachedItems, {
+          sessionOnly: !rememberDevice,
+          pulledPrefs: idbState.v4Manifest?.p,
+          offlineMode: true,
+        });
+      };
+
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        await unlockOfflineWithCache();
+        return;
+      }
+
       const verification = await verifyTelegramDirect(creds.botToken, creds.chatId);
       if (!verification.ok) {
+        if (verification.isNetworkError) {
+          await unlockOfflineWithCache();
+          return;
+        }
         setSubmitting(false);
         setError(verification.error || 'PIN benar, tetapi koneksi ke Telegram gagal.');
         return;
@@ -276,6 +312,15 @@ export function PersonalLockScreen({
             koneksi Telegram Anda sebelum kunci dibuka.
           </span>
         </div>
+
+        {typeof navigator !== 'undefined' && navigator.onLine === false && (
+          <div className="mt-3 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50/80 px-3.5 py-2 text-xs text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
+            <WifiOff className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <span>
+              Perangkat sedang offline. Masukkan PIN Anda untuk membuka file yang tersimpan lokal.
+            </span>
+          </div>
+        )}
 
         {mode === 'pin' && hasVault ? (
           <form onSubmit={handlePinUnlock} className="mt-5 space-y-4">
@@ -514,6 +559,10 @@ export function PersonalLockScreen({
             </button>
           </form>
         )}
+
+        <div className="mt-4 flex justify-center">
+          <PWAInstallButton />
+        </div>
       </div>
     </div>
   );

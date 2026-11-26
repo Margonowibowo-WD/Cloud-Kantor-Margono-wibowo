@@ -21,6 +21,7 @@ import {
   computeStorageSummary,
   filterAndSortItems,
   formatBytes,
+  resolveMimeTypeForFilename,
 } from './utils/fileHelpers';
 import {
   type CapturedDropPayload,
@@ -33,20 +34,29 @@ import {
 } from './utils/dropUploadHelpers';
 import {
   type ObsoleteTelegramMsg,
+  type OfflineUploadJob,
   addDeletedTombstones,
   addDismissedTelegramMessageIds,
   addObsoleteTelegramMsgs,
   deleteLocalBlob,
+  enqueueOfflineUploadJobs,
+  getLocalBlob,
+  hasLocalBlob,
   loadDeletedTombstones,
   loadDismissedTelegramMessageIds,
   loadLocalEncryptedVault,
   loadObsoleteTelegramMsgs,
+  loadOfflinePinnedItemIds,
+  loadOfflineUploadQueue,
   loadStoredItems,
   loadStoredTelegramConfig,
   loadStoredViewPrefs,
+  removeOfflineUploadJob,
   saveDeletedTombstones,
+  saveLocalBlob,
   saveLocalEncryptedVault,
   saveObsoleteTelegramMsgs,
+  saveOfflinePinnedItemIds,
   saveStoredItems,
   saveStoredTelegramConfig,
   saveStoredViewPrefs,
@@ -66,6 +76,7 @@ import {
   type CloudViewPrefs,
   type TelegramV4Manifest,
   mergeDriveItems,
+  reconcileAuthoritativeRemoteItems,
   reconcileConcurrentDriveState,
   toCatalogRecord,
 } from './utils/telegramIndex';
@@ -86,7 +97,11 @@ import {
   pushV4ChangesToTelegram,
 } from './utils/telegramV4';
 import { isVaultConfigured } from './utils/cryptoVault';
-import { startDirectDownload, startDirectUpload } from './utils/uploadClient';
+import {
+  resolveItemArrayBuffer,
+  startDirectDownload,
+  startDirectUpload,
+} from './utils/uploadClient';
 import { Sidebar } from './components/Sidebar';
 import { type CloudSyncState, type ThemeMode, TopBar } from './components/TopBar';
 import { Toolbar } from './components/Toolbar';
@@ -100,6 +115,7 @@ import { TelegramModal } from './components/TelegramModal';
 import { PersonalLockScreen } from './components/PersonalLockScreen';
 import { ConfirmDeleteModal, FolderNameModal, MoveModal } from './components/ActionModals';
 import { DuplicateFinderModal } from './components/DuplicateFinderModal';
+import { OfflineIndicator } from './components/PWAInstallButton';
 
 const ENV_TELEGRAM_VAULT = ((import.meta.env.VITE_TELEGRAM_VAULT as string | undefined) || '').trim();
 
@@ -204,6 +220,12 @@ export default function App() {
   const [obsoleteChannelMsgs, setObsoleteChannelMsgs] = useState<ObsoleteTelegramMsg[]>(() =>
     loadObsoleteTelegramMsgs(),
   );
+  const [offlinePinnedIds, setOfflinePinnedIds] = useState<Set<string>>(
+    () => new Set(loadOfflinePinnedItemIds()),
+  );
+  const [offlineQueueCount, setOfflineQueueCount] = useState<number>(
+    () => loadOfflineUploadQueue().length,
+  );
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
@@ -246,6 +268,8 @@ export default function App() {
   >(new Map());
   const didAutoSyncRef = useRef(false);
   const syncInFlightRef = useRef(false);
+  const offlineFlushInFlightRef = useRef(false);
+  const initialRetryTimerRef = useRef<number | null>(null);
   const hasSyncedOnceRef = useRef(false);
   const pinBlockedRef = useRef(false);
   const autoCreateIndexAttemptedRef = useRef(false);
@@ -381,7 +405,7 @@ export default function App() {
   useEffect(() => {
     let active = true;
     void loadIndexedCatalogState().then((idbState) => {
-      if (!active) return;
+      if (!active || hasSyncedOnceRef.current) return;
       if (idbState.v4Manifest) {
         v4ManifestRef.current = idbState.v4Manifest;
       }
@@ -394,7 +418,7 @@ export default function App() {
       for (const fId of idbState.dirtyFolderIds) dirtyFolderIdsRef.current.add(fId);
       for (const iId of idbState.pendingDeltaIds) dirtyItemIdsRef.current.add(iId);
 
-      if (idbState.items.length > 0) {
+      if (idbState.items.length > 0 && !hasSyncedOnceRef.current) {
         setItems((prev) => mergeDriveItems(idbState.items, prev));
       }
     });
@@ -459,12 +483,37 @@ export default function App() {
   const ensureFolderLoaded = useCallback(
     async (folderId: string | null, cfgOverride?: TelegramConfigState): Promise<void> => {
       if (!folderId) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      if (!v4ManifestRef.current) {
+        const idbState = await loadIndexedCatalogState();
+        if (idbState.v4Manifest && !v4ManifestRef.current) {
+          v4ManifestRef.current = idbState.v4Manifest;
+        }
+      }
       const cfg = cfgOverride || tgConfig;
       const proxy = normalizeCorsProxyUrl(cfg.corsProxyUrl || v4ManifestRef.current?.p?.px);
       if (!cfg.connected || !cfg.botToken || !cfg.chatId || !proxy) return;
 
       const existingPromise = folderHydrationInFlightRef.current.get(folderId);
       if (existingPromise) return existingPromise;
+
+      const mergeFolderChildren = (prev: DriveItem[], fId: string, children: DriveItem[]) => {
+        const childIds = new Set(children.map((c) => c.id));
+        const pendingOfflineIds = new Set(loadOfflineUploadQueue().map((j) => j.itemId));
+        const prunedPrev = prev.filter((item) => {
+          if (item.parentId !== fId) return true;
+          if (childIds.has(item.id)) return true;
+          if (
+            dirtyItemIdsRef.current.has(item.id) ||
+            pendingOfflineIds.has(item.id) ||
+            item.pendingOfflineUpload
+          ) {
+            return true;
+          }
+          return false;
+        });
+        return mergeDriveItems(prunedPrev, children);
+      };
 
       const task = (async () => {
         const chain: string[] = [];
@@ -497,12 +546,10 @@ export default function App() {
             loadedFolderRevsRef.current[fId] = folderObj.folderIdx.h;
             void saveLoadedFolderRevsIdb(loadedFolderRevsRef.current);
 
-            setItems((prev) => {
-              const merged = mergeDriveItems(prev, children);
-              itemsRef.current = merged;
-              saveStoredItems(merged);
-              return merged;
-            });
+            const syncMerged = mergeFolderChildren(itemsRef.current, fId, children);
+            itemsRef.current = syncMerged;
+            saveStoredItems(syncMerged);
+            setItems((prev) => mergeFolderChildren(prev, fId, children));
             if (children.length > 0) {
               void upsertDriveItemsIdb(children);
             }
@@ -527,41 +574,113 @@ export default function App() {
   );
 
   const hydrateStubItem = useCallback(
-    async (item: DriveItem): Promise<void> => {
-      if (!item.isCatalogStub) return;
+    async (item: DriveItem): Promise<boolean> => {
+      const liveExisting = itemsRef.current.find((i) => i.id === item.id);
+      if (!item.isCatalogStub || (liveExisting && !liveExisting.isCatalogStub)) {
+        return true;
+      }
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        return hasLocalBlob(item.localBlobKey || `blob-${item.id}`);
+      }
+      if (!v4ManifestRef.current) {
+        const idbState = await loadIndexedCatalogState();
+        if (idbState.v4Manifest && !v4ManifestRef.current) {
+          v4ManifestRef.current = idbState.v4Manifest;
+        }
+      }
+
       if (item.parentId) {
         await ensureFolderLoaded(item.parentId);
-        return;
+        if (itemsRef.current.some((i) => i.id === item.id && !i.isCatalogStub)) {
+          return true;
+        }
+        // Fallback: if folderIdx was missing or stale, refresh V4 manifest from Telegram once
+        const proxy = normalizeCorsProxyUrl(tgConfig.corsProxyUrl || v4ManifestRef.current?.p?.px);
+        if (tgConfig.connected && tgConfig.botToken && tgConfig.chatId && proxy) {
+          try {
+            const pulled = await pullCloudStateFromTelegram(tgConfig.botToken, tgConfig.chatId, {
+              corsProxyUrl: proxy,
+              skipVerifyGetMe: true,
+            });
+            if (!pulled.error && pulled.v4Manifest) {
+              v4ManifestRef.current = pulled.v4Manifest;
+              void saveV4ManifestIdb(pulled.v4Manifest);
+            }
+            if (!pulled.error && pulled.items.length > 0) {
+              const refreshed = mergeDriveItems(itemsRef.current, pulled.items);
+              itemsRef.current = refreshed;
+              saveStoredItems(refreshed);
+              setItems((prev) => mergeDriveItems(prev, pulled.items));
+              await ensureFolderLoaded(item.parentId);
+            }
+          } catch {
+            // ignore fallback refresh error
+          }
+        }
+        if (itemsRef.current.some((i) => i.id === item.id && !i.isCatalogStub)) {
+          return true;
+        }
+        return hasLocalBlob(item.localBlobKey || `blob-${item.id}`);
       }
-      const proxy = normalizeCorsProxyUrl(tgConfig.corsProxyUrl || v4ManifestRef.current?.p?.px);
-      const rootRef = v4ManifestRef.current?.root;
+
+      let proxy = normalizeCorsProxyUrl(tgConfig.corsProxyUrl || v4ManifestRef.current?.p?.px);
+      let rootRef = v4ManifestRef.current?.root;
+      if (tgConfig.connected && tgConfig.botToken && tgConfig.chatId && (!proxy || !rootRef?.mid)) {
+        try {
+          const pulled = await pullCloudStateFromTelegram(tgConfig.botToken, tgConfig.chatId, {
+            corsProxyUrl: proxy,
+            skipVerifyGetMe: true,
+          });
+          if (!pulled.error && pulled.v4Manifest) {
+            v4ManifestRef.current = pulled.v4Manifest;
+            void saveV4ManifestIdb(pulled.v4Manifest);
+            rootRef = pulled.v4Manifest.root;
+            proxy = normalizeCorsProxyUrl(tgConfig.corsProxyUrl || pulled.v4Manifest.p?.px);
+          }
+          if (!pulled.error && pulled.items.length > 0) {
+            const refreshed = mergeDriveItems(itemsRef.current, pulled.items);
+            itemsRef.current = refreshed;
+            saveStoredItems(refreshed);
+            setItems((prev) => mergeDriveItems(prev, pulled.items));
+            if (refreshed.some((i) => i.id === item.id && !i.isCatalogStub)) {
+              return true;
+            }
+          }
+        } catch {
+          // fall through
+        }
+      }
       if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId || !proxy || !rootRef?.mid) {
-        return;
+        return hasLocalBlob(item.localBlobKey || `blob-${item.id}`);
       }
+
       const existing = folderHydrationInFlightRef.current.get('ROOT');
       if (existing) {
         await existing;
-        return;
+        return (
+          itemsRef.current.some((i) => i.id === item.id && !i.isCatalogStub) ||
+          hasLocalBlob(item.localBlobKey || `blob-${item.id}`)
+        );
       }
+      const resolvedRootRef = rootRef;
+      const resolvedProxy = proxy;
       const task = (async () => {
         try {
           const rootChildren = await loadFolderChildrenV4(
             tgConfig.botToken,
             tgConfig.chatId,
-            { ...item, id: 'ROOT', type: 'folder', folderIdx: rootRef },
-            proxy,
+            { ...item, id: 'ROOT', type: 'folder', folderIdx: resolvedRootRef },
+            resolvedProxy,
           );
           if (rootChildren.length > 0) {
-            setItems((prev) => {
-              const merged = mergeDriveItems(prev, rootChildren);
-              itemsRef.current = merged;
-              saveStoredItems(merged);
-              return merged;
-            });
+            const syncMerged = mergeDriveItems(itemsRef.current, rootChildren);
+            itemsRef.current = syncMerged;
+            saveStoredItems(syncMerged);
+            setItems((prev) => mergeDriveItems(prev, rootChildren));
             void upsertDriveItemsIdb(rootChildren);
           }
         } catch {
-          // ignore silent root hydration failure; UI timeout handles fallback message
+          // ignore silent root hydration failure; caller inspects hydrated state
         }
       })();
       folderHydrationInFlightRef.current.set('ROOT', task);
@@ -570,6 +689,10 @@ export default function App() {
       } finally {
         folderHydrationInFlightRef.current.delete('ROOT');
       }
+      return (
+        itemsRef.current.some((i) => i.id === item.id && !i.isCatalogStub) ||
+        hasLocalBlob(item.localBlobKey || `blob-${item.id}`)
+      );
     },
     [ensureFolderLoaded, tgConfig],
   );
@@ -577,6 +700,10 @@ export default function App() {
   useEffect(() => {
     if (cloudPushTick === 0) return;
     if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      setSyncState('error');
+      return;
+    }
 
     let active = true;
     const timer = window.setTimeout(() => {
@@ -740,6 +867,10 @@ export default function App() {
 
   const handleLockDrive = useCallback(
     (options?: { broadcast?: boolean; clearLocalVault?: boolean }) => {
+      if (initialRetryTimerRef.current) {
+        window.clearTimeout(initialRetryTimerRef.current);
+        initialRetryTimerRef.current = null;
+      }
       for (const cancel of transferCancelMap.current.values()) {
         try {
           cancel();
@@ -751,6 +882,7 @@ export default function App() {
       uploadQueueRef.current = [];
       failedUploadJobsRef.current.clear();
       activeUploadCountRef.current = 0;
+      offlineFlushInFlightRef.current = false;
 
       wipeUnlockedSessionData({ clearLocalVault: options?.clearLocalVault });
       if (options?.clearLocalVault) {
@@ -769,6 +901,8 @@ export default function App() {
       tombstonesRef.current = {};
 
       setItems([]);
+      setOfflinePinnedIds(new Set());
+      setOfflineQueueCount(0);
       setSearchQuery('');
       setDebouncedSearchQuery('');
       setTypeFilter('all');
@@ -836,6 +970,16 @@ export default function App() {
 
         if (res.error) {
           setSyncState('error');
+          if (
+            !hasSyncedOnceRef.current &&
+            !initialRetryTimerRef.current &&
+            (typeof navigator === 'undefined' || navigator.onLine !== false)
+          ) {
+            initialRetryTimerRef.current = window.setTimeout(() => {
+              initialRetryTimerRef.current = null;
+              void syncFromTelegram(true);
+            }, 6000);
+          }
           if (!silent || res.needsProxy) {
             pushNotification({
               kind: 'error',
@@ -844,6 +988,10 @@ export default function App() {
             });
           }
           return;
+        }
+        if (initialRetryTimerRef.current) {
+          window.clearTimeout(initialRetryTimerRef.current);
+          initialRetryTimerRef.current = null;
         }
 
         if (res.isV4 && res.v4Manifest) {
@@ -976,6 +1124,23 @@ export default function App() {
           effectiveRemoteTombstones,
         );
 
+        const pendingLocalIds = new Set<string>([
+          ...dirtyItemIdsRef.current,
+          ...loadOfflineUploadQueue().map((j) => j.itemId),
+        ]);
+        for (const item of itemsRef.current) {
+          if (item.pendingOfflineUpload) pendingLocalIds.add(item.id);
+        }
+        const authoritativeItems =
+          res.hasIndex && !res.unchanged
+            ? reconcileAuthoritativeRemoteItems(
+                reconciled.items,
+                effectiveRemoteItems,
+                channelMedia,
+                pendingLocalIds,
+              )
+            : reconciled.items;
+
         if (!res.unchanged && res.prefs) {
           applyRemoteViewPrefs(res.prefs);
         }
@@ -992,12 +1157,14 @@ export default function App() {
 
         tombstonesRef.current = reconciled.tombstones;
         saveDeletedTombstones(reconciled.tombstones);
-        saveStoredItems(reconciled.items);
+        saveStoredItems(authoritativeItems);
         if (res.isV4 && !res.unchanged) {
-          void replaceAllCatalogIdb(res.catalog.length > 0 ? res.catalog : reconciled.items.map(toCatalogRecord));
+          void replaceAllCatalogIdb(
+            res.catalog.length > 0 ? res.catalog : authoritativeItems.map(toCatalogRecord),
+          );
         }
-        itemsRef.current = reconciled.items;
-        setItems(reconciled.items);
+        itemsRef.current = authoritativeItems;
+        setItems(authoritativeItems);
         broadcastLocalStateToTabs();
 
         let nextPinnedId = res.pinnedMessageId ?? cfg.pinnedIndexMessageId;
@@ -1023,9 +1190,11 @@ export default function App() {
             !res.prefs?.px,
         );
         const remoteById = new Map(effectiveRemoteItems.map((i) => [i.id, i]));
-        const changedLocalItems = reconciled.items.filter((item) => {
+        const changedLocalItems = authoritativeItems.filter((item) => {
+          if (pendingLocalIds.has(item.id)) return true;
           const r = remoteById.get(item.id);
-          return !r || (Date.parse(item.updatedAt) || 0) > (Date.parse(r.updatedAt) || 0);
+          if (!r) return false;
+          return (Date.parse(item.updatedAt) || 0) > (Date.parse(r.updatedAt) || 0) + 1000;
         });
         const localHasUnpushedChanges =
           !res.hasIndex ||
@@ -1041,7 +1210,7 @@ export default function App() {
         const allowCreateNewIndex = !silent || !autoCreateIndexAttemptedRef.current;
         const shouldPushBack =
           localHasUnpushedChanges &&
-          reconciled.items.length + Object.keys(reconciled.tombstones).length > 0 &&
+          authoritativeItems.length + Object.keys(reconciled.tombstones).length > 0 &&
           !(pinBlockedRef.current && !res.hasIndex) &&
           (res.hasIndex || allowCreateNewIndex);
 
@@ -1069,7 +1238,7 @@ export default function App() {
               botToken: cfg.botToken,
               chatId: cfg.chatId,
               corsProxyUrl: localProxy,
-              allItems: reconciled.items,
+              allItems: authoritativeItems,
               dirtyFolderIds: pushDirtyFolders,
               dirtyItemIds: pushDirtyItems,
               tombstones: reconciled.tombstones,
@@ -1115,7 +1284,7 @@ export default function App() {
             const pushRes = await pushIndexToTelegramPinnedMessage(
               cfg.botToken,
               cfg.chatId,
-              reconciled.items,
+              authoritativeItems,
               nextPinnedId,
               reconciled.tombstones,
               {
@@ -1170,7 +1339,7 @@ export default function App() {
             detail:
               notes.length > 0
                 ? `${notes.join(' · ')}.`
-                : `${reconciled.items.length.toLocaleString('id-ID')} item tersinkron dari @${cfg.botUsername || 'Bot'}.`,
+                : `${authoritativeItems.length.toLocaleString('id-ID')} item tersinkron dari @${cfg.botUsername || 'Bot'}.`,
           });
         }
       } finally {
@@ -1242,13 +1411,150 @@ export default function App() {
     };
   }, [applyRemoteViewPrefs, handleLockDrive]);
 
-  // Google Drive calm background sync: startup, tab focus/visibility, and gentle 30s delta revision check
+  const updateTransferTask = useCallback((id: string, patch: Partial<TransferTask>) => {
+    setTransfers((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+    if (patch.status === 'completed' || patch.status === 'cancelled') {
+      const existingTimer = transferRemovalTimers.current.get(id);
+      if (existingTimer) window.clearTimeout(existingTimer);
+      const timer = window.setTimeout(() => {
+        transferRemovalTimers.current.delete(id);
+        setTransfers((prev) => prev.filter((t) => t.id !== id));
+      }, 5000);
+      transferRemovalTimers.current.set(id, timer);
+    }
+  }, []);
+
+  const flushOfflineUploadQueue = useCallback(async () => {
+    if (offlineFlushInFlightRef.current) return;
+    if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+    const jobs = loadOfflineUploadQueue();
+    setOfflineQueueCount(jobs.length);
+    if (jobs.length === 0) return;
+
+    offlineFlushInFlightRef.current = true;
+    let uploadedCount = 0;
+
+    try {
+      for (const job of jobs) {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) break;
+        if (tombstonesRef.current[job.itemId]) {
+          const remaining = removeOfflineUploadJob(job.taskId);
+          setOfflineQueueCount(remaining.length);
+          continue;
+        }
+
+        const blob = await getLocalBlob(job.blobKey);
+        if (!blob) {
+          const remaining = removeOfflineUploadJob(job.taskId);
+          setOfflineQueueCount(remaining.length);
+          continue;
+        }
+
+        const liveItem = itemsRef.current.find((i) => i.id === job.itemId);
+        const filename = liveItem?.name || job.filename;
+        const targetParent = liveItem ? liveItem.parentId : job.parentId;
+        const mimeType = job.mimeType || resolveMimeTypeForFilename(filename);
+        const file = new File([blob], filename, { type: mimeType });
+
+        setTransfers((prev) => {
+          const exists = prev.some((t) => t.id === job.taskId);
+          if (exists) {
+            return prev.map((t) =>
+              t.id === job.taskId
+                ? { ...t, status: 'active', errorMessage: undefined, canRetry: false }
+                : t,
+            );
+          }
+          const task: TransferTask = {
+            id: job.taskId,
+            kind: 'upload',
+            filename,
+            totalBytes: file.size,
+            loadedBytes: 0,
+            speedBytesPerSec: 0,
+            etaSeconds: 0,
+            completedChunks: 0,
+            totalChunks: 1,
+            status: 'active',
+            createdAt: Date.now(),
+          };
+          return [task, ...prev].slice(0, 200);
+        });
+
+        try {
+          const ctrl = startDirectUpload(
+            file,
+            targetParent,
+            tgConfig,
+            (progress) => updateTransferTask(job.taskId, progress),
+            { itemIdOverride: job.itemId },
+          );
+          transferCancelMap.current.set(job.taskId, ctrl.cancel);
+          const createdItem = await ctrl.promise;
+          transferCancelMap.current.delete(job.taskId);
+
+          const remaining = removeOfflineUploadJob(job.taskId);
+          setOfflineQueueCount(remaining.length);
+          uploadedCount += 1;
+
+          commitItems(
+            (prev) => {
+              const existing = prev.find((i) => i.id === job.itemId);
+              const finalized: DriveItem = existing
+                ? {
+                    ...createdItem,
+                    id: job.itemId,
+                    name: existing.name,
+                    parentId: existing.parentId,
+                    starred: existing.starred,
+                    trashed: existing.trashed,
+                    trashedAt: existing.trashedAt,
+                    pendingOfflineUpload: undefined,
+                  }
+                : createdItem;
+              return [
+                finalized,
+                ...prev.filter((i) => i.id !== job.itemId && i.id !== createdItem.id),
+              ];
+            },
+            {
+              deferIndexPush: true,
+              dirtyFolderIds: [targetParent || 'ROOT'],
+              dirtyItemIds: [job.itemId],
+            },
+          );
+        } catch (err) {
+          transferCancelMap.current.delete(job.taskId);
+          const msg = err instanceof Error ? err.message : 'Gagal mengunggah antrean offline.';
+          updateTransferTask(job.taskId, { status: 'error', errorMessage: msg });
+        }
+      }
+    } finally {
+      offlineFlushInFlightRef.current = false;
+      if (uploadedCount > 0) {
+        setCloudPushTick((t) => t + 1);
+        pushNotification({
+          kind: 'success',
+          title: `${uploadedCount} file antrean offline berhasil diunggah`,
+          detail: 'Semua perubahan lokal kini tersimpan aman di Cloud Telegram.',
+        });
+      }
+    }
+  }, [tgConfig, commitItems, updateTransferTask, pushNotification]);
+
+  // Google Drive calm background sync: startup, tab focus/visibility, online reconnect, and 30s delta check
   useEffect(() => {
     if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) return;
 
     if (!didAutoSyncRef.current) {
       didAutoSyncRef.current = true;
       void syncFromTelegram(true);
+    }
+
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+      void flushOfflineUploadQueue();
     }
 
     const onVisibilityOrFocus = () => {
@@ -1259,6 +1565,20 @@ export default function App() {
       ) {
         void syncFromTelegram(true);
       }
+    };
+
+    const onBackOnline = () => {
+      pushNotification({
+        kind: 'info',
+        title: 'Koneksi internet tersambung kembali',
+        detail: 'Mengunggah antrean offline & menyinkronkan data terbaru...',
+      });
+      void flushOfflineUploadQueue().then(() => {
+        if (dirtyFolderIdsRef.current.size > 0 || dirtyItemIdsRef.current.size > 0) {
+          setCloudPushTick((t) => t + 1);
+        }
+        void syncFromTelegram(true);
+      });
     };
 
     const intervalId = window.setInterval(() => {
@@ -1272,13 +1592,22 @@ export default function App() {
     }, 30_000);
 
     window.addEventListener('focus', onVisibilityOrFocus);
+    window.addEventListener('online', onBackOnline);
     document.addEventListener('visibilitychange', onVisibilityOrFocus);
     return () => {
       window.clearInterval(intervalId);
       window.removeEventListener('focus', onVisibilityOrFocus);
+      window.removeEventListener('online', onBackOnline);
       document.removeEventListener('visibilitychange', onVisibilityOrFocus);
     };
-  }, [tgConfig.connected, tgConfig.botToken, tgConfig.chatId, syncFromTelegram]);
+  }, [
+    tgConfig.connected,
+    tgConfig.botToken,
+    tgConfig.chatId,
+    syncFromTelegram,
+    flushOfflineUploadQueue,
+    pushNotification,
+  ]);
 
   // Automatic day/night clock check (06:00-17:59 Terang, 18:00-05:59 Gelap)
   useEffect(() => {
@@ -1710,19 +2039,6 @@ export default function App() {
     setCloudPushTick((t) => t + 1);
   };
 
-  const updateTransferTask = useCallback((id: string, patch: Partial<TransferTask>) => {
-    setTransfers((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
-    if (patch.status === 'completed' || patch.status === 'cancelled') {
-      const existingTimer = transferRemovalTimers.current.get(id);
-      if (existingTimer) window.clearTimeout(existingTimer);
-      const timer = window.setTimeout(() => {
-        transferRemovalTimers.current.delete(id);
-        setTransfers((prev) => prev.filter((t) => t.id !== id));
-      }, 5000);
-      transferRemovalTimers.current.set(id, timer);
-    }
-  }, []);
-
   const handlePreviewWidthChange = useCallback((nextWidth: number) => {
     const clamped = Math.round(Math.max(280, Math.min(740, nextWidth)));
     setPreviewPaneWidth(clamped);
@@ -2030,6 +2346,84 @@ export default function App() {
           return;
         }
 
+        const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+        if (isOffline) {
+          const nowIso = new Date().toISOString();
+          const offlineItems: DriveItem[] = [];
+          const offlineJobs: OfflineUploadJob[] = [];
+          const queuedTasks: TransferTask[] = [];
+          const dirtyFolders = new Set<string>();
+
+          for (const { entry, targetParent } of entriesToUpload) {
+            const taskId = `tr-${crypto.randomUUID()}`;
+            const itemId = `file-${crypto.randomUUID()}`;
+            const blobKey = `blob-${itemId}`;
+            const mimeType = resolveMimeTypeForFilename(
+              entry.file.name,
+              entry.file.type || 'application/octet-stream',
+            );
+            await saveLocalBlob(blobKey, entry.file);
+
+            offlineItems.push({
+              id: itemId,
+              name: entry.file.name,
+              type: 'file',
+              parentId: targetParent,
+              size: entry.file.size,
+              mimeType,
+              starred: false,
+              trashed: false,
+              createdAt: nowIso,
+              updatedAt: nowIso,
+              storageBackend: 'telegram',
+              localBlobKey: blobKey,
+              pendingOfflineUpload: true,
+              chunks: [],
+            });
+            offlineJobs.push({
+              taskId,
+              itemId,
+              parentId: targetParent,
+              blobKey,
+              filename: entry.file.name,
+              mimeType,
+              size: entry.file.size,
+              createdAt: Date.now(),
+            });
+            queuedTasks.push({
+              id: taskId,
+              kind: 'upload',
+              filename: entry.file.name,
+              totalBytes: entry.file.size,
+              loadedBytes: 0,
+              speedBytesPerSec: 0,
+              etaSeconds: 0,
+              completedChunks: 0,
+              totalChunks: 1,
+              status: 'queued',
+              errorMessage: 'Menunggu koneksi internet...',
+              createdAt: Date.now(),
+            });
+            dirtyFolders.add(targetParent || 'ROOT');
+          }
+
+          const updatedQueue = enqueueOfflineUploadJobs(offlineJobs);
+          setOfflineQueueCount(updatedQueue.length);
+
+          commitItems((prev) => [...offlineItems, ...prev], {
+            deferIndexPush: true,
+            dirtyFolderIds: Array.from(dirtyFolders),
+            dirtyItemIds: offlineItems.map((i) => i.id),
+          });
+          setTransfers((prev) => [...queuedTasks, ...prev].slice(0, 200));
+          pushNotification({
+            kind: 'info',
+            title: `${entriesToUpload.length} file masuk antrean offline`,
+            detail: `Disimpan lokal di perangkat & otomatis diunggah ke ${destLabel} saat internet tersambung.`,
+          });
+          return;
+        }
+
         const isBatch =
           entriesToUpload.length > 1 || createdFoldersCount > 0 || skippedDuplicateCount > 0;
         const skipNote =
@@ -2187,6 +2581,8 @@ export default function App() {
       cancelFn();
       transferCancelMap.current.delete(id);
     }
+    const remainingOffline = removeOfflineUploadJob(id);
+    setOfflineQueueCount(remainingOffline.length);
     updateTransferTask(id, { status: 'cancelled', errorMessage: 'Dibatalkan pengguna' });
   };
 
@@ -2227,6 +2623,104 @@ export default function App() {
       title: nextStar ? `Dibintangi: ${item.name}` : `Bintang dihapus: ${item.name}`,
     });
   };
+
+  const handleToggleOfflinePinItems = useCallback(
+    async (targetItems: DriveItem[]) => {
+      const validTargets = targetItems.filter((i) => !i.trashed);
+      if (validTargets.length === 0) return;
+
+      const allPinned = validTargets.every((i) => offlinePinnedIds.has(i.id));
+      if (allPinned) {
+        const removeIds = new Set<string>();
+        for (const item of validTargets) {
+          if (item.type === 'folder') {
+            for (const d of collectDescendantIds(item.id, itemsRef.current)) {
+              removeIds.add(d);
+            }
+          } else {
+            removeIds.add(item.id);
+          }
+        }
+        const nextList = Array.from(offlinePinnedIds).filter((id) => !removeIds.has(id));
+        const saved = saveOfflinePinnedItemIds(nextList);
+        setOfflinePinnedIds(new Set(saved));
+        pushNotification({
+          kind: 'info',
+          title: 'Dihapus dari simpanan offline',
+          detail: `${validTargets.length} item tidak lagi dikunci di memori perangkat.`,
+        });
+        return;
+      }
+
+      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      if (!isOffline) {
+        for (const item of validTargets) {
+          if (item.type === 'folder') {
+            await ensureFolderLoaded(item.id);
+          } else if (item.isCatalogStub) {
+            await hydrateStubItem(item);
+          }
+        }
+      }
+
+      const pinIds = new Set<string>(offlinePinnedIds);
+      const filesToDownload: DriveItem[] = [];
+      for (const target of validTargets) {
+        const latest = itemsRef.current.find((i) => i.id === target.id) || target;
+        if (latest.type === 'folder') {
+          for (const dId of collectDescendantIds(latest.id, itemsRef.current)) {
+            const node = itemsRef.current.find((x) => x.id === dId);
+            if (!node || node.trashed) continue;
+            pinIds.add(node.id);
+            if (node.type === 'file') filesToDownload.push(node);
+          }
+        } else {
+          pinIds.add(latest.id);
+          filesToDownload.push(latest);
+        }
+      }
+
+      const savedIds = saveOfflinePinnedItemIds(Array.from(pinIds));
+      setOfflinePinnedIds(new Set(savedIds));
+
+      let cachedCount = 0;
+      let downloadedCount = 0;
+      let skippedTooLargeOrOffline = 0;
+
+      for (const file of filesToDownload) {
+        const key = file.localBlobKey || `blob-${file.id}`;
+        const alreadyLocal = await hasLocalBlob(key);
+        if (alreadyLocal) {
+          cachedCount += 1;
+          continue;
+        }
+        if (isOffline || file.size > DIRECT_TELEGRAM_MAX_BYTES) {
+          skippedTooLargeOrOffline += 1;
+          continue;
+        }
+        try {
+          await resolveItemArrayBuffer(file, tgConfig);
+          downloadedCount += 1;
+        } catch {
+          skippedTooLargeOrOffline += 1;
+        }
+      }
+
+      const readyCount = cachedCount + downloadedCount;
+      pushNotification({
+        kind: readyCount > 0 ? 'success' : 'info',
+        title:
+          downloadedCount > 0
+            ? `${downloadedCount} file disimpan untuk akses offline`
+            : `${readyCount} file siap dibuka offline`,
+        detail:
+          skippedTooLargeOrOffline > 0
+            ? `${skippedTooLargeOrOffline} file tidak dapat diunduh sekarang (>20 MB atau sedang offline).`
+            : 'Tersimpan permanen di perangkat tanpa ikut terhapus cache otomatis.',
+      });
+    },
+    [offlinePinnedIds, tgConfig, ensureFolderLoaded, hydrateStubItem, pushNotification],
+  );
 
   const handleCreateOrRename = async (name: string) => {
     const now = new Date().toISOString();
@@ -2413,6 +2907,19 @@ export default function App() {
     }
 
     tombstonesRef.current = addDeletedTombstones(Array.from(expanded));
+    const currentPins = loadOfflinePinnedItemIds();
+    const nextPins = currentPins.filter((id) => !expanded.has(id));
+    if (nextPins.length !== currentPins.length) {
+      saveOfflinePinnedItemIds(nextPins);
+      setOfflinePinnedIds(new Set(nextPins));
+    }
+    const queue = loadOfflineUploadQueue();
+    for (const job of queue) {
+      if (expanded.has(job.itemId)) {
+        removeOfflineUploadJob(job.taskId);
+      }
+    }
+    setOfflineQueueCount(loadOfflineUploadQueue().length);
     commitItems((prev) => prev.filter((i) => !expanded.has(i.id)), {
       dirtyFolderIds: Array.from(affectedParentFolders),
       dirtyItemIds: Array.from(expanded),
@@ -2606,21 +3113,27 @@ export default function App() {
             applyRemoteViewPrefs(opts.pulledPrefs);
           }
           pinnedIndexIdRef.current = nextCfg.pinnedIndexMessageId;
-          didAutoSyncRef.current = false;
+          didAutoSyncRef.current = Boolean(opts?.offlineMode);
           hasSyncedOnceRef.current = false;
           lastSyncMsRef.current = 0;
-          setSyncState('synced');
+          setOfflinePinnedIds(new Set(loadOfflinePinnedItemIds()));
+          setOfflineQueueCount(loadOfflineUploadQueue().length);
+          setSyncState(opts?.offlineMode ? 'error' : 'synced');
           if (pulledItems.length > 0) {
             setItems(pulledItems);
             saveStoredItems(pulledItems);
             void replaceAllCatalogIdb(pulledItems.map(toCatalogRecord));
           }
           pushNotification({
-            kind: 'success',
-            title: `Terhubung ke @${nextCfg.botUsername || 'Bot'}`,
-            detail: opts?.savedLocalVault
-              ? 'PIN pengunci aktif & file Anda siap diakses.'
-              : 'Drive pribadi Anda siap digunakan.',
+            kind: opts?.offlineMode ? 'info' : 'success',
+            title: opts?.offlineMode
+              ? 'Mode Offline aktif'
+              : `Terhubung ke @${nextCfg.botUsername || 'Bot'}`,
+            detail: opts?.offlineMode
+              ? 'Membuka data tersimpan lokal. Perubahan baru otomatis disinkronkan saat online.'
+              : opts?.savedLocalVault
+                ? 'PIN pengunci aktif & file Anda siap diakses.'
+                : 'Drive pribadi Anda siap digunakan.',
           });
         }}
       />
@@ -2858,6 +3371,7 @@ export default function App() {
                 tgConfig={tgConfig}
                 folderCounts={folderCounts}
                 selectedIds={selectedIds}
+                offlinePinnedIds={offlinePinnedIds}
                 draggingIds={draggingIds}
                 onDragStartIds={setDraggingIds}
                 onDragEndIds={() => setDraggingIds([])}
@@ -2880,6 +3394,7 @@ export default function App() {
                 allItems={items}
                 folderCounts={folderCounts}
                 selectedIds={selectedIds}
+                offlinePinnedIds={offlinePinnedIds}
                 draggingIds={draggingIds}
                 onDragStartIds={setDraggingIds}
                 onDragEndIds={() => setDraggingIds([])}
@@ -3287,6 +3802,7 @@ export default function App() {
         selectedItems={selectedItemsList}
         isTrashView={isTrashView}
         clipboardCount={clipboardIds.length}
+        offlinePinnedIds={offlinePinnedIds}
         onClose={() => setContextMenu(null)}
         onOpenItem={handleOpenItem}
         onDownloadItems={(targetItems) => {
@@ -3321,6 +3837,9 @@ export default function App() {
               : `Bintang dihapus dari ${targetItems.length} item`,
           });
         }}
+        onToggleOfflinePinItems={(targetItems) => {
+          void handleToggleOfflinePinItems(targetItems);
+        }}
         onTrashItems={(targetItems) => openTrashConfirmation(targetItems)}
         onRestoreItems={(targetItems) =>
           handleTrashOrRestore(
@@ -3334,6 +3853,8 @@ export default function App() {
         onUploadFiles={() => fileInputRef.current?.click()}
         onPaste={handlePasteItems}
       />
+
+      <OfflineIndicator pendingQueueCount={offlineQueueCount} />
     </div>
   );
 }

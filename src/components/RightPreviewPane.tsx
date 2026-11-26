@@ -15,6 +15,7 @@ import {
   isPdfFile,
   isTextPreviewable,
 } from '../utils/fileHelpers';
+import { hasLocalBlob } from '../utils/localVault';
 import { DIRECT_TELEGRAM_MAX_BYTES, normalizeCorsProxyUrl } from '../utils/telegramDirect';
 import {
   PreviewCorsBlockedError,
@@ -36,7 +37,7 @@ interface RightPreviewPaneProps {
   tgConfig: TelegramConfigState;
   onOpenFolder: (folder: DriveItem) => void;
   onOpenTelegramSettings?: () => void;
-  onHydrateStub?: (item: DriveItem) => void;
+  onHydrateStub?: (item: DriveItem) => Promise<boolean> | void;
 }
 
 const MIN_WIDTH = 280;
@@ -70,6 +71,17 @@ export function RightPreviewPane({
 
   const singleItem = selectedItems.length === 1 ? selectedItems[0] : null;
   const singleFile = singleItem?.type === 'file' ? singleItem : null;
+  const latestFileRef = useRef(singleFile);
+  latestFileRef.current = singleFile;
+  const latestTgConfigRef = useRef(tgConfig);
+  latestTgConfigRef.current = tgConfig;
+  const lastPreviewIdRef = useRef<string | null>(null);
+
+  const firstChunk = singleFile?.chunks?.[0];
+  const singleFileKey = singleFile
+    ? `${singleFile.id}|${singleFile.isCatalogStub ? 'stub' : 'full'}|${singleFile.name}|${singleFile.mimeType}|${singleFile.size}|${singleFile.localBlobKey || ''}|${firstChunk?.telegramFileId || ''}|${firstChunk?.telegramMessageId || ''}|${singleFile.demoTextContent !== undefined ? 'demo' : ''}`
+    : '';
+  const tgKey = `${tgConfig.connected ? 1 : 0}|${tgConfig.botToken}|${tgConfig.chatId}|${tgConfig.corsProxyUrl || ''}`;
 
   useEffect(() => {
     const mq = window.matchMedia('(min-width: 1024px)');
@@ -101,7 +113,10 @@ export function RightPreviewPane({
   }, [isResizing, onWidthChange]);
 
   useEffect(() => {
-    if (!open || !singleFile) {
+    const target = latestFileRef.current;
+    const cfg = latestTgConfigRef.current;
+    if (!open || !target || !singleFileKey) {
+      lastPreviewIdRef.current = null;
       setMediaUrl(null);
       setTextContent(null);
       setOfficeBuffer(null);
@@ -116,39 +131,61 @@ export function RightPreviewPane({
     let revokeUrl: string | null = null;
     let stubTimer: number | null = null;
 
-    setMediaUrl(null);
-    setTextContent(null);
-    setOfficeBuffer(null);
-    setPdfBuffer(null);
+    if (lastPreviewIdRef.current !== target.id) {
+      lastPreviewIdRef.current = target.id;
+      setMediaUrl(null);
+      setTextContent(null);
+      setOfficeBuffer(null);
+      setPdfBuffer(null);
+    }
+    setLoading(false);
     setPreviewError(null);
     setCorsBlocked(false);
 
     const load = async () => {
-      if (singleFile.isCatalogStub) {
-        setLoading(true);
-        onHydrateStubRef.current?.(singleFile);
-        stubTimer = window.setTimeout(() => {
-          if (!active) return;
-          setLoading(false);
-          setPreviewError(
-            'Metadata file belum termuat dari Telegram. Pastikan Proxy Cloudflare Worker aktif dan coba Sinkronkan ulang.',
-          );
-        }, 12000);
-        return;
+      if (target.isCatalogStub) {
+        const hasCached = await hasLocalBlob(target.localBlobKey || `blob-${target.id}`);
+        if (!active) return;
+        if (!hasCached) {
+          setLoading(true);
+          stubTimer = window.setTimeout(() => {
+            if (!active) return;
+            setLoading(false);
+            setPreviewError(
+              'Metadata file belum termuat dari Telegram. Pastikan Proxy Cloudflare Worker aktif dan coba Sinkronkan ulang.',
+            );
+          }, 15000);
+          try {
+            const hydrated = await onHydrateStubRef.current?.(target);
+            if (!active) return;
+            if (hydrated === false) {
+              if (stubTimer !== null) window.clearTimeout(stubTimer);
+              setLoading(false);
+              setPreviewError(
+                typeof navigator !== 'undefined' && navigator.onLine === false
+                  ? 'Perangkat sedang offline dan file ini belum disimpan ke cache offline.'
+                  : 'Metadata file belum ditemukan di folder Telegram. Coba Sinkronkan ulang atau aktifkan Proxy Cloudflare Worker.',
+              );
+            }
+          } catch {
+            // safety timer handles unexpected failures
+          }
+          return;
+        }
       }
-      if (singleFile.size > DIRECT_TELEGRAM_MAX_BYTES && !singleFile.localBlobKey) {
+      if (target.size > DIRECT_TELEGRAM_MAX_BYTES && !target.localBlobKey) {
         return;
       }
 
-      const officeType = getOfficePreviewType(singleFile.mimeType, singleFile.name);
-      const textable = isTextPreviewable(singleFile.mimeType, singleFile.name);
-      const pdf = isPdfFile(singleFile.mimeType, singleFile.name);
-      const category = getFileCategory(singleFile.mimeType, singleFile.name);
+      const officeType = getOfficePreviewType(target.mimeType, target.name);
+      const textable = isTextPreviewable(target.mimeType, target.name);
+      const pdf = isPdfFile(target.mimeType, target.name);
+      const category = getFileCategory(target.mimeType, target.name);
 
       if (pdf) {
         setLoading(true);
         try {
-          const buf = await resolveItemArrayBuffer(singleFile, tgConfig);
+          const buf = await resolveItemArrayBuffer(target, cfg);
           if (active) setPdfBuffer(buf);
         } catch (err) {
           if (active) {
@@ -164,7 +201,7 @@ export function RightPreviewPane({
       if (officeType && officeType !== 'legacy-office') {
         setLoading(true);
         try {
-          const buf = await resolveItemArrayBuffer(singleFile, tgConfig);
+          const buf = await resolveItemArrayBuffer(target, cfg);
           if (active) setOfficeBuffer(buf);
         } catch (err) {
           if (active) {
@@ -177,10 +214,10 @@ export function RightPreviewPane({
         return;
       }
 
-      if (textable && singleFile.size <= 2 * 1024 * 1024) {
+      if (textable && target.size <= 2 * 1024 * 1024) {
         setLoading(true);
         try {
-          const text = await resolveItemTextContent(singleFile, tgConfig);
+          const text = await resolveItemTextContent(target, cfg);
           if (active) setTextContent(text);
         } catch (err) {
           if (active) {
@@ -196,7 +233,7 @@ export function RightPreviewPane({
       if (category === 'image' || category === 'video' || category === 'audio') {
         setLoading(true);
         try {
-          const resolved = await resolveItemPlayableUrl(singleFile, tgConfig);
+          const resolved = await resolveItemPlayableUrl(target, cfg);
           if (resolved && active) {
             if (resolved.isObjectUrl) revokeUrl = resolved.url;
             setMediaUrl(resolved.url);
@@ -222,7 +259,7 @@ export function RightPreviewPane({
         window.setTimeout(() => URL.revokeObjectURL(urlToRevoke), 600);
       }
     };
-  }, [open, singleFile, tgConfig]);
+  }, [open, singleFileKey, tgKey]);
 
   if (!open) return null;
 

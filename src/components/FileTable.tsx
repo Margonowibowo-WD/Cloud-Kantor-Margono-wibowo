@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Star } from 'lucide-react';
+import { CloudOff, Pin, Star } from 'lucide-react';
 import type { DriveItem } from '../types/drive';
 import {
   formatBytes,
@@ -28,6 +28,7 @@ interface FileTableProps {
   onOpenItem: (item: DriveItem) => void;
   onDoubleClickItem?: (item: DriveItem) => void;
   isTrashView: boolean;
+  offlinePinnedIds?: Set<string>;
 }
 
 export function FileTable({
@@ -45,6 +46,7 @@ export function FileTable({
   onOpenItem,
   onDoubleClickItem,
   isTrashView,
+  offlinePinnedIds,
 }: FileTableProps) {
   const [dropTargetFolder, setDropTargetFolder] = useState<{
     id: string;
@@ -238,6 +240,16 @@ export function FileTable({
                     <span className="truncate font-medium text-slate-900 dark:text-slate-100">
                       {item.name}
                     </span>
+                    {!isTrashView && item.pendingOfflineUpload && (
+                      <span title="Menunggu internet untuk diunggah">
+                        <CloudOff className="h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400" />
+                      </span>
+                    )}
+                    {!isTrashView && offlinePinnedIds?.has(item.id) && (
+                      <span title="Tersedia Offline">
+                        <Pin className="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                      </span>
+                    )}
                     {!isTrashView && item.starred && (
                       <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-500" />
                     )}

@@ -10,6 +10,8 @@ const VIEW_PREFS_KEY = 'teledrive_view_prefs_v1';
 const LOCAL_VAULT_KEY = 'teledrive_encrypted_vault_v1';
 const SHARD_CACHE_KEY = 'teledrive_shard_cache_v1';
 const OBSOLETE_MIDS_KEY = 'teledrive_obsolete_mids_v1';
+const OFFLINE_PINS_KEY = 'teledrive_offline_pins_v1';
+const OFFLINE_QUEUE_KEY = 'teledrive_offline_queue_v1';
 const IDB_NAME = 'TeleDriveBlobVault';
 const IDB_STORE = 'blobs';
 
@@ -49,10 +51,105 @@ export interface BlobCacheEntryMeta {
   lastAccessedAt: number;
 }
 
+export interface OfflineUploadJob {
+  taskId: string;
+  itemId: string;
+  parentId: string | null;
+  blobKey: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  createdAt: number;
+}
+
+export function loadOfflinePinnedItemIds(): string[] {
+  try {
+    const raw = localStorage.getItem(OFFLINE_PINS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string' && Boolean(x)) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveOfflinePinnedItemIds(ids: string[]): string[] {
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  try {
+    if (unique.length === 0) {
+      localStorage.removeItem(OFFLINE_PINS_KEY);
+    } else {
+      localStorage.setItem(OFFLINE_PINS_KEY, JSON.stringify(unique));
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return unique;
+}
+
+export function loadOfflineUploadQueue(): OfflineUploadJob[] {
+  try {
+    const raw = localStorage.getItem(OFFLINE_QUEUE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as OfflineUploadJob[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (j) => Boolean(j && typeof j.taskId === 'string' && typeof j.blobKey === 'string' && typeof j.filename === 'string'),
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function saveOfflineUploadQueue(jobs: OfflineUploadJob[]): void {
+  try {
+    if (jobs.length === 0) {
+      localStorage.removeItem(OFFLINE_QUEUE_KEY);
+    } else {
+      localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(jobs));
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function enqueueOfflineUploadJobs(newJobs: OfflineUploadJob[]): OfflineUploadJob[] {
+  if (newJobs.length === 0) return loadOfflineUploadQueue();
+  const current = loadOfflineUploadQueue();
+  const existingTaskIds = new Set(current.map((j) => j.taskId));
+  const merged = [...current];
+  for (const job of newJobs) {
+    if (!existingTaskIds.has(job.taskId)) {
+      merged.push(job);
+      existingTaskIds.add(job.taskId);
+    }
+  }
+  saveOfflineUploadQueue(merged);
+  return merged;
+}
+
+export function removeOfflineUploadJob(taskId: string): OfflineUploadJob[] {
+  const next = loadOfflineUploadQueue().filter((j) => j.taskId !== taskId);
+  saveOfflineUploadQueue(next);
+  return next;
+}
+
+export function getProtectedOfflineBlobKeys(): Set<string> {
+  const protectedKeys = new Set<string>();
+  for (const id of loadOfflinePinnedItemIds()) {
+    protectedKeys.add(`blob-${id}`);
+  }
+  for (const job of loadOfflineUploadQueue()) {
+    if (job.blobKey) protectedKeys.add(job.blobKey);
+  }
+  return protectedKeys;
+}
+
 export function planBlobCacheEviction(
   manifest: Record<string, BlobCacheEntryMeta>,
   protectedKey: string,
   maxBytes = MAX_LOCAL_BLOB_CACHE_BYTES,
+  extraProtectedKeys?: Set<string>,
 ): { keysToEvict: string[]; nextManifest: Record<string, BlobCacheEntryMeta>; totalBytesAfter: number } {
   const nextManifest: Record<string, BlobCacheEntryMeta> = { ...manifest };
   let totalBytes = Object.values(nextManifest).reduce((acc, m) => acc + (m.size || 0), 0);
@@ -63,7 +160,7 @@ export function planBlobCacheEviction(
   }
 
   const candidates = Object.entries(nextManifest)
-    .filter(([k]) => k !== protectedKey)
+    .filter(([k]) => k !== protectedKey && !extraProtectedKeys?.has(k))
     .sort(([, a], [, b]) => a.lastAccessedAt - b.lastAccessedAt);
 
   for (const [key, meta] of candidates) {
@@ -117,7 +214,12 @@ export async function saveLocalBlob(key: string, blob: Blob): Promise<void> {
 
     const manifest = loadBlobLruManifest();
     manifest[key] = { size: blob.size, lastAccessedAt: Date.now() };
-    const plan = planBlobCacheEviction(manifest, key, MAX_LOCAL_BLOB_CACHE_BYTES);
+    const plan = planBlobCacheEviction(
+      manifest,
+      key,
+      MAX_LOCAL_BLOB_CACHE_BYTES,
+      getProtectedOfflineBlobKeys(),
+    );
     saveBlobLruManifest(plan.nextManifest);
 
     if (plan.keysToEvict.length > 0) {
@@ -153,6 +255,20 @@ export async function getLocalBlob(key: string): Promise<Blob | null> {
     return blob;
   } catch {
     return null;
+  }
+}
+
+export async function hasLocalBlob(key: string): Promise<boolean> {
+  try {
+    const db = await openBlobDb();
+    return await new Promise<boolean>((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).count(key);
+      req.onsuccess = () => resolve((req.result || 0) > 0);
+      req.onerror = () => resolve(false);
+    });
+  } catch {
+    return false;
   }
 }
 
@@ -394,6 +510,8 @@ export function wipeUnlockedSessionData(options?: { clearLocalVault?: boolean })
     localStorage.removeItem(VIEW_PREFS_KEY);
     localStorage.removeItem(SHARD_CACHE_KEY);
     localStorage.removeItem(OBSOLETE_MIDS_KEY);
+    localStorage.removeItem(OFFLINE_PINS_KEY);
+    localStorage.removeItem(OFFLINE_QUEUE_KEY);
     if (options?.clearLocalVault) {
       localStorage.removeItem(LOCAL_VAULT_KEY);
     }

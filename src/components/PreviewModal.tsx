@@ -9,6 +9,7 @@ import {
   isPdfFile,
   isTextPreviewable,
 } from '../utils/fileHelpers';
+import { hasLocalBlob } from '../utils/localVault';
 import { DIRECT_TELEGRAM_MAX_BYTES, normalizeCorsProxyUrl } from '../utils/telegramDirect';
 import {
   PreviewCorsBlockedError,
@@ -25,7 +26,7 @@ interface PreviewModalProps {
   tgConfig: TelegramConfigState;
   onClose: () => void;
   onOpenTelegramSettings?: () => void;
-  onHydrateStub?: (item: DriveItem) => void;
+  onHydrateStub?: (item: DriveItem) => Promise<boolean> | void;
 }
 
 export function PreviewModal({
@@ -47,50 +48,102 @@ export function PreviewModal({
   const [corsBlocked, setCorsBlocked] = useState(false);
   const onHydrateStubRef = useRef(onHydrateStub);
   onHydrateStubRef.current = onHydrateStub;
+  const latestItemRef = useRef(item);
+  latestItemRef.current = item;
+  const latestTgConfigRef = useRef(tgConfig);
+  latestTgConfigRef.current = tgConfig;
+  const lastPreviewIdRef = useRef<string | null>(null);
+
+  const firstChunk = item?.chunks?.[0];
+  const itemPreviewKey = item
+    ? `${item.id}|${item.isCatalogStub ? 'stub' : 'full'}|${item.name}|${item.mimeType}|${item.size}|${item.localBlobKey || ''}|${firstChunk?.telegramFileId || ''}|${firstChunk?.telegramMessageId || ''}|${item.demoTextContent !== undefined ? 'demo' : ''}`
+    : '';
+  const tgKey = `${tgConfig.connected ? 1 : 0}|${tgConfig.botToken}|${tgConfig.chatId}|${tgConfig.corsProxyUrl || ''}`;
 
   useEffect(() => {
-    if (!item) return;
+    const target = latestItemRef.current;
+    const cfg = latestTgConfigRef.current;
+    if (!target || !itemPreviewKey) {
+      lastPreviewIdRef.current = null;
+      setMediaUrl(null);
+      setMediaLoading(false);
+      setTextContent(null);
+      setTextLoading(false);
+      setOfficeBuffer(null);
+      setOfficeLoading(false);
+      setPdfBuffer(null);
+      setPdfLoading(false);
+      setPreviewError(null);
+      setCorsBlocked(false);
+      return;
+    }
+
     let active = true;
     let revokeUrl: string | null = null;
     let stubTimer: number | null = null;
 
-    setMediaUrl(null);
+    if (lastPreviewIdRef.current !== target.id) {
+      lastPreviewIdRef.current = target.id;
+      setMediaUrl(null);
+      setTextContent(null);
+      setOfficeBuffer(null);
+      setPdfBuffer(null);
+    }
     setMediaLoading(false);
-    setTextContent(null);
     setTextLoading(false);
-    setOfficeBuffer(null);
     setOfficeLoading(false);
-    setPdfBuffer(null);
     setPdfLoading(false);
     setPreviewError(null);
     setCorsBlocked(false);
 
     const loadPreview = async () => {
-      if (item.isCatalogStub) {
-        onHydrateStubRef.current?.(item);
-        const category = getFileCategory(item.mimeType, item.name);
-        if (isPdfFile(item.mimeType, item.name)) setPdfLoading(true);
-        else if (getOfficePreviewType(item.mimeType, item.name)) setOfficeLoading(true);
-        else if (isTextPreviewable(item.mimeType, item.name)) setTextLoading(true);
-        else if (category === 'image' || category === 'video' || category === 'audio') {
-          setMediaLoading(true);
+      if (target.isCatalogStub) {
+        const hasCached = await hasLocalBlob(target.localBlobKey || `blob-${target.id}`);
+        if (!active) return;
+        if (!hasCached) {
+          const category = getFileCategory(target.mimeType, target.name);
+          if (isPdfFile(target.mimeType, target.name)) setPdfLoading(true);
+          else if (getOfficePreviewType(target.mimeType, target.name)) setOfficeLoading(true);
+          else if (isTextPreviewable(target.mimeType, target.name)) setTextLoading(true);
+          else if (category === 'image' || category === 'video' || category === 'audio') {
+            setMediaLoading(true);
+          }
+          stubTimer = window.setTimeout(() => {
+            if (!active) return;
+            setPdfLoading(false);
+            setOfficeLoading(false);
+            setTextLoading(false);
+            setMediaLoading(false);
+            setPreviewError(
+              'Metadata file belum termuat dari Telegram. Pastikan Proxy Cloudflare Worker aktif dan coba Sinkronkan ulang.',
+            );
+          }, 15000);
+          try {
+            const hydrated = await onHydrateStubRef.current?.(target);
+            if (!active) return;
+            if (hydrated === false) {
+              if (stubTimer !== null) window.clearTimeout(stubTimer);
+              setPdfLoading(false);
+              setOfficeLoading(false);
+              setTextLoading(false);
+              setMediaLoading(false);
+              setPreviewError(
+                typeof navigator !== 'undefined' && navigator.onLine === false
+                  ? 'Perangkat sedang offline dan file ini belum disimpan ke cache offline.'
+                  : 'Metadata file belum ditemukan di folder Telegram. Coba Sinkronkan ulang atau aktifkan Proxy Cloudflare Worker.',
+              );
+            }
+          } catch {
+            // safety timer handles unexpected failures
+          }
+          return;
         }
-        stubTimer = window.setTimeout(() => {
-          if (!active) return;
-          setPdfLoading(false);
-          setOfficeLoading(false);
-          setTextLoading(false);
-          setMediaLoading(false);
-          setPreviewError(
-            'Metadata file belum termuat dari Telegram. Pastikan Proxy Cloudflare Worker aktif dan coba Sinkronkan ulang.',
-          );
-        }, 12000);
-        return;
       }
-      if (isPdfFile(item.mimeType, item.name)) {
+
+      if (isPdfFile(target.mimeType, target.name)) {
         setPdfLoading(true);
         try {
-          const buf = await resolveItemArrayBuffer(item, tgConfig);
+          const buf = await resolveItemArrayBuffer(target, cfg);
           if (active) setPdfBuffer(buf);
         } catch (err) {
           if (active) {
@@ -103,11 +156,11 @@ export function PreviewModal({
         return;
       }
 
-      const officeType = getOfficePreviewType(item.mimeType, item.name);
+      const officeType = getOfficePreviewType(target.mimeType, target.name);
       if (officeType && officeType !== 'legacy-office') {
         setOfficeLoading(true);
         try {
-          const buf = await resolveItemArrayBuffer(item, tgConfig);
+          const buf = await resolveItemArrayBuffer(target, cfg);
           if (active) setOfficeBuffer(buf);
         } catch (err) {
           if (active) {
@@ -120,10 +173,10 @@ export function PreviewModal({
         return;
       }
 
-      if (isTextPreviewable(item.mimeType, item.name) && item.size <= 2 * 1024 * 1024) {
+      if (isTextPreviewable(target.mimeType, target.name) && target.size <= 2 * 1024 * 1024) {
         setTextLoading(true);
         try {
-          const text = await resolveItemTextContent(item, tgConfig);
+          const text = await resolveItemTextContent(target, cfg);
           if (active && text !== null) {
             setTextContent(text);
           }
@@ -138,11 +191,11 @@ export function PreviewModal({
         return;
       }
 
-      const cat = getFileCategory(item.mimeType, item.name);
+      const cat = getFileCategory(target.mimeType, target.name);
       if (cat === 'image' || cat === 'video' || cat === 'audio') {
         setMediaLoading(true);
         try {
-          const resolved = await resolveItemPlayableUrl(item, tgConfig);
+          const resolved = await resolveItemPlayableUrl(target, cfg);
           if (resolved && active) {
             if (resolved.isObjectUrl) revokeUrl = resolved.url;
             setMediaUrl(resolved.url);
@@ -168,7 +221,7 @@ export function PreviewModal({
         window.setTimeout(() => URL.revokeObjectURL(urlToRevoke), 600);
       }
     };
-  }, [item, tgConfig]);
+  }, [itemPreviewKey, tgKey]);
 
   if (!item) return null;
 

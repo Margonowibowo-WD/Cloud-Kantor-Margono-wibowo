@@ -4,8 +4,10 @@ import { getLocalBlob, saveLocalBlob } from './localVault';
 import {
   DIRECT_TELEGRAM_MAX_BYTES,
   buildProxiedTelegramFileUrl,
+  deleteTelegramMessageDirect,
   normalizeCorsProxyUrl,
   resolveTelegramFileUrl,
+  tgApi,
   uploadFileDirectToTelegram,
 } from './telegramDirect';
 
@@ -64,6 +66,7 @@ export function startDirectUpload(
   parentId: string | null,
   tgConfig: TelegramConfigState,
   onProgress: (update: TransferProgressUpdate) => void,
+  options?: { itemIdOverride?: string },
 ): UploadController {
   let cancelled = false;
   let tgCancel: (() => void) | null = null;
@@ -89,7 +92,7 @@ export function startDirectUpload(
       throw new Error(`"${file.name}" berupa folder atau tidak dapat dibaca langsung oleh browser.`);
     }
 
-    const id = `file-${crypto.randomUUID()}`;
+    const id = options?.itemIdOverride || `file-${crypto.randomUUID()}`;
     const blobKey = `blob-${id}`;
     const now = new Date().toISOString();
     const mimeType = file.type || 'application/octet-stream';
@@ -249,17 +252,110 @@ async function fetchTelegramFileResponse(
   return fetch(tgUrl);
 }
 
+async function refreshTelegramFileIdByMessageId(
+  botToken: string,
+  chatId: string,
+  messageId: number,
+): Promise<string | null> {
+  if (!botToken || !chatId || !messageId) return null;
+  try {
+    const res = await fetch(tgApi(botToken, 'forwardMessage'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId.trim(),
+        from_chat_id: chatId.trim(),
+        message_id: messageId,
+        disable_notification: true,
+      }),
+    });
+    const data = (await res.json()) as {
+      ok: boolean;
+      result?: {
+        message_id: number;
+        document?: { file_id: string };
+        video?: { file_id: string };
+        audio?: { file_id: string };
+        photo?: Array<{ file_id: string }>;
+      };
+    };
+    if (!data.ok || !data.result) return null;
+    const fileId =
+      data.result.document?.file_id ||
+      data.result.video?.file_id ||
+      data.result.audio?.file_id ||
+      (data.result.photo ? data.result.photo[data.result.photo.length - 1]?.file_id : undefined) ||
+      null;
+    if (data.result.message_id && data.result.message_id !== messageId) {
+      void deleteTelegramMessageDirect(botToken, chatId, data.result.message_id);
+    }
+    return fileId;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveEffectiveTelegramFileUrl(
+  item: DriveItem,
+  tgConfig: TelegramConfigState,
+): Promise<string> {
+  const firstChunk = item.chunks?.[0];
+  const tgFileId = firstChunk?.telegramFileId;
+  const tgMsgId = firstChunk?.telegramMessageId;
+
+  if (!tgConfig.botToken) {
+    throw new Error('Koneksi Bot Telegram belum tersedia dan file belum tersimpan di perangkat ini.');
+  }
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    throw new Error('Perangkat sedang offline dan file ini belum disimpan untuk akses offline.');
+  }
+
+  if (tgFileId) {
+    try {
+      return await resolveTelegramFileUrl(tgConfig.botToken, tgFileId);
+    } catch (err) {
+      if (tgMsgId && tgConfig.chatId) {
+        const refreshedId = await refreshTelegramFileIdByMessageId(
+          tgConfig.botToken,
+          tgConfig.chatId,
+          tgMsgId,
+        );
+        if (refreshedId) {
+          return await resolveTelegramFileUrl(tgConfig.botToken, refreshedId);
+        }
+      }
+      throw err;
+    }
+  }
+
+  if (tgMsgId && tgConfig.chatId) {
+    const refreshedId = await refreshTelegramFileIdByMessageId(
+      tgConfig.botToken,
+      tgConfig.chatId,
+      tgMsgId,
+    );
+    if (refreshedId) {
+      return await resolveTelegramFileUrl(tgConfig.botToken, refreshedId);
+    }
+  }
+
+  throw new Error('File belum memiliki ID Telegram yang valid. Coba sinkronkan ulang atau unggah ulang.');
+}
+
 export async function resolveItemPlayableUrl(
   item: DriveItem,
   tgConfig: TelegramConfigState,
   options?: { forceTypedBlob?: boolean; mimeOverride?: string },
 ): Promise<{ url: string; isObjectUrl: boolean } | null> {
-  const effectiveMime = options?.mimeOverride || item.mimeType || 'application/octet-stream';
+  const effectiveMime = resolveMimeTypeForFilename(
+    item.name,
+    options?.mimeOverride || item.mimeType || 'application/octet-stream',
+  );
 
   const cachedBlob = await getCachedBlobForItem(item);
   if (cachedBlob) {
     const typed =
-      options?.mimeOverride && cachedBlob.type !== options.mimeOverride
+      effectiveMime && cachedBlob.type !== effectiveMime
         ? new Blob([cachedBlob], { type: effectiveMime })
         : cachedBlob;
     return { url: URL.createObjectURL(typed), isObjectUrl: true };
@@ -268,32 +364,34 @@ export async function resolveItemPlayableUrl(
   if (item.size > DIRECT_TELEGRAM_MAX_BYTES) {
     throw new Error('File di atas 20 MB hanya bisa dibuka langsung di aplikasi Telegram.');
   }
-  const tgFileId = item.chunks?.[0]?.telegramFileId;
-  if (tgFileId && tgConfig.botToken) {
-    const tgUrl = await resolveTelegramFileUrl(tgConfig.botToken, tgFileId);
-    if (options?.forceTypedBlob) {
-      try {
-        const res = await fetchTelegramFileResponse(tgUrl, tgConfig.corsProxyUrl);
-        if (res.ok) {
-          const rawBlob = await res.blob();
-          await saveLocalBlob(`blob-${item.id}`, rawBlob);
-          const typedBlob = new Blob([rawBlob], { type: effectiveMime });
-          return { url: URL.createObjectURL(typedBlob), isObjectUrl: true };
-        }
-      } catch (err) {
-        if (!normalizeCorsProxyUrl(tgConfig.corsProxyUrl)) {
-          throw new PreviewCorsBlockedError(
-            'Pratinjau langsung PDF di perangkat lain dibatasi browser (CORS Telegram). Aktifkan Proxy Gratis (Cloudflare Worker) di Pengaturan Telegram.',
-          );
-        }
-        throw err instanceof Error
-          ? err
-          : new Error('Gagal mengunduh PDF untuk pratinjau.');
+
+  const tgUrl = await resolveEffectiveTelegramFileUrl(item, tgConfig);
+  const hasProxy = Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl));
+
+  // Whenever CORS proxy is available (or typed blob required), fetch & wrap with the real MIME type
+  // because Telegram sendDocument often serves files as application/octet-stream.
+  if (hasProxy || options?.forceTypedBlob) {
+    try {
+      const res = await fetchTelegramFileResponse(tgUrl, tgConfig.corsProxyUrl);
+      if (!res.ok) {
+        throw new Error(`Server file mengembalikan status HTTP ${res.status}.`);
       }
+      const rawBlob = await res.blob();
+      const typedBlob =
+        rawBlob.type === effectiveMime ? rawBlob : new Blob([rawBlob], { type: effectiveMime });
+      await saveLocalBlob(`blob-${item.id}`, typedBlob);
+      return { url: URL.createObjectURL(typedBlob), isObjectUrl: true };
+    } catch (err) {
+      if (!hasProxy) {
+        throw new PreviewCorsBlockedError(
+          'Pratinjau langsung di browser dibatasi aturan CORS Telegram. Aktifkan Proxy Gratis (Cloudflare Worker) di Pengaturan Telegram.',
+        );
+      }
+      throw err instanceof Error ? err : new Error('Gagal mengunduh file untuk pratinjau.');
     }
-    return { url: buildProxiedTelegramFileUrl(tgUrl, tgConfig.corsProxyUrl), isObjectUrl: false };
   }
-  return null;
+
+  return { url: buildProxiedTelegramFileUrl(tgUrl, tgConfig.corsProxyUrl), isObjectUrl: false };
 }
 
 export async function resolveItemArrayBuffer(
@@ -307,30 +405,29 @@ export async function resolveItemArrayBuffer(
   if (item.size > DIRECT_TELEGRAM_MAX_BYTES) {
     throw new Error('File di atas 20 MB hanya bisa dibuka langsung di aplikasi Telegram.');
   }
-  const tgFileId = item.chunks?.[0]?.telegramFileId;
-  if (tgFileId && tgConfig.botToken) {
-    const tgUrl = await resolveTelegramFileUrl(tgConfig.botToken, tgFileId);
-    let res: Response;
-    try {
-      res = await fetchTelegramFileResponse(tgUrl, tgConfig.corsProxyUrl);
-    } catch (err) {
-      if (!normalizeCorsProxyUrl(tgConfig.corsProxyUrl)) {
-        throw new PreviewCorsBlockedError(
-          'Pratinjau langsung file ini di perangkat lain dibatasi aturan CORS browser. Aktifkan Proxy Gratis (Cloudflare Worker) di Pengaturan Telegram.',
-        );
-      }
-      throw err instanceof Error
-        ? err
-        : new Error('Gagal membaca file dari Cloud Telegram melalui proxy.');
+
+  const tgUrl = await resolveEffectiveTelegramFileUrl(item, tgConfig);
+  let res: Response;
+  try {
+    res = await fetchTelegramFileResponse(tgUrl, tgConfig.corsProxyUrl);
+  } catch (err) {
+    if (!normalizeCorsProxyUrl(tgConfig.corsProxyUrl)) {
+      throw new PreviewCorsBlockedError(
+        'Pratinjau langsung file ini di perangkat lain dibatasi aturan CORS browser. Aktifkan Proxy Gratis (Cloudflare Worker) di Pengaturan Telegram.',
+      );
     }
-    if (!res.ok) {
-      throw new Error('Gagal mengunduh file dari Cloud Telegram untuk pratinjau.');
-    }
-    const rawBlob = await res.blob();
-    await saveLocalBlob(`blob-${item.id}`, rawBlob);
-    return rawBlob.arrayBuffer();
+    throw err instanceof Error
+      ? err
+      : new Error('Gagal membaca file dari Cloud Telegram melalui proxy.');
   }
-  return null;
+  if (!res.ok) {
+    throw new Error('Gagal mengunduh file dari Cloud Telegram untuk pratinjau.');
+  }
+  const rawBlob = await res.blob();
+  const mimeType = resolveMimeTypeForFilename(item.name, item.mimeType || rawBlob.type);
+  const typedBlob = rawBlob.type === mimeType ? rawBlob : new Blob([rawBlob], { type: mimeType });
+  await saveLocalBlob(`blob-${item.id}`, typedBlob);
+  return typedBlob.arrayBuffer();
 }
 
 export async function resolveItemTextContent(
@@ -345,31 +442,29 @@ export async function resolveItemTextContent(
     return cachedBlob.text();
   }
   if (item.size > DIRECT_TELEGRAM_MAX_BYTES) {
-    return null;
+    throw new Error('File teks di atas 20 MB hanya bisa dibuka di Telegram.');
   }
-  const tgFileId = item.chunks?.[0]?.telegramFileId;
-  if (tgFileId && tgConfig.botToken) {
-    const tgUrl = await resolveTelegramFileUrl(tgConfig.botToken, tgFileId);
-    try {
-      const res = await fetchTelegramFileResponse(tgUrl, tgConfig.corsProxyUrl);
-      if (res.ok) {
-        const text = await res.text();
-        await saveLocalBlob(
-          `blob-${item.id}`,
-          new Blob([text], { type: item.mimeType || 'text/plain' }),
-        );
-        return text;
-      }
-    } catch (err) {
-      if (!normalizeCorsProxyUrl(tgConfig.corsProxyUrl)) {
-        throw new PreviewCorsBlockedError(
-          'Pratinjau file teks di perangkat lain dibatasi aturan CORS browser. Aktifkan Proxy Gratis (Cloudflare Worker) di Pengaturan Telegram.',
-        );
-      }
-      throw err instanceof Error ? err : new Error('Gagal membaca file teks.');
+
+  const tgUrl = await resolveEffectiveTelegramFileUrl(item, tgConfig);
+  try {
+    const res = await fetchTelegramFileResponse(tgUrl, tgConfig.corsProxyUrl);
+    if (!res.ok) {
+      throw new Error(`Gagal memuat file teks (HTTP ${res.status}).`);
     }
+    const text = await res.text();
+    await saveLocalBlob(
+      `blob-${item.id}`,
+      new Blob([text], { type: resolveMimeTypeForFilename(item.name, item.mimeType || 'text/plain') }),
+    );
+    return text;
+  } catch (err) {
+    if (!normalizeCorsProxyUrl(tgConfig.corsProxyUrl)) {
+      throw new PreviewCorsBlockedError(
+        'Pratinjau file teks di perangkat lain dibatasi aturan CORS browser. Aktifkan Proxy Gratis (Cloudflare Worker) di Pengaturan Telegram.',
+      );
+    }
+    throw err instanceof Error ? err : new Error('Gagal membaca file teks.');
   }
-  return null;
 }
 
 function normalizeBlobForDownload(

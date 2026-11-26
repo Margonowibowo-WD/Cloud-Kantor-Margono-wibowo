@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Star } from 'lucide-react';
+import { CloudOff, Pin, Star } from 'lucide-react';
 import type { DriveItem, TelegramConfigState } from '../types/drive';
 import {
   formatBytes,
@@ -36,6 +36,7 @@ interface FileGridProps {
   onOpenItem: (item: DriveItem) => void;
   onDoubleClickItem?: (item: DriveItem) => void;
   isTrashView: boolean;
+  offlinePinnedIds?: Set<string>;
 }
 
 function ImageThumbnail({
@@ -60,13 +61,11 @@ function ImageThumbnail({
 
     (async () => {
       if (item.isCatalogStub) return;
-      if (item.localBlobKey) {
-        const blob = await getLocalBlob(item.localBlobKey);
-        if (blob && active) {
-          objectUrl = URL.createObjectURL(blob);
-          setSrc(objectUrl);
-          return;
-        }
+      const localBlob = await getLocalBlob(item.localBlobKey || `blob-${item.id}`);
+      if (localBlob && active) {
+        objectUrl = URL.createObjectURL(localBlob);
+        setSrc(objectUrl);
+        return;
       }
       const tgFileId = item.chunks[0]?.telegramFileId;
       if (tgFileId && tgConfig.botToken) {
@@ -124,6 +123,7 @@ export function FileGrid({
   onOpenItem,
   onDoubleClickItem,
   isTrashView,
+  offlinePinnedIds,
 }: FileGridProps) {
   const [brokenThumbs, setBrokenThumbs] = useState<Set<string>>(() => new Set());
   const [dropTargetFolder, setDropTargetFolder] = useState<{
@@ -309,9 +309,16 @@ export function FileGrid({
                         <span className="line-clamp-2 break-words font-display text-[13px] font-bold leading-snug text-slate-900 dark:text-slate-100">
                           {folder.name}
                         </span>
-                        {!isTrashView && folder.starred && (
-                          <Star className="mt-0.5 h-3 w-3 shrink-0 fill-amber-400 text-amber-500" />
-                        )}
+                        <div className="flex shrink-0 items-center gap-1 pt-0.5">
+                          {!isTrashView && offlinePinnedIds?.has(folder.id) && (
+                            <span title="Tersedia Offline">
+                              <Pin className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+                            </span>
+                          )}
+                          {!isTrashView && folder.starred && (
+                            <Star className="h-3 w-3 fill-amber-400 text-amber-500" />
+                          )}
+                        </div>
                       </div>
                       <div className="mt-0.5 flex items-center gap-1 text-[10.5px] font-medium tabular-nums text-slate-500 whitespace-nowrap dark:text-slate-400">
                         {isExternalUploadDrop ? (
@@ -438,13 +445,33 @@ export function FileGrid({
                       )}
                     </button>
 
-                    {!isTrashView && file.starred && (
-                      <span
-                        aria-label="Berbintang"
-                        className="pointer-events-none absolute right-2 top-2 flex h-5 w-5 items-center justify-center rounded bg-white/90 text-amber-500 dark:bg-slate-900/90"
-                      >
-                        <Star className="h-3 w-3 fill-amber-400 text-amber-500" />
-                      </span>
+                    {!isTrashView && (file.starred || offlinePinnedIds?.has(file.id) || file.pendingOfflineUpload) && (
+                      <div className="pointer-events-none absolute right-2 top-2 flex items-center gap-1">
+                        {file.pendingOfflineUpload && (
+                          <span
+                            title="Menunggu koneksi internet untuk diunggah"
+                            className="flex h-5 w-5 items-center justify-center rounded bg-amber-100/95 text-amber-700 dark:bg-amber-950/90 dark:text-amber-300"
+                          >
+                            <CloudOff className="h-3 w-3" />
+                          </span>
+                        )}
+                        {offlinePinnedIds?.has(file.id) && (
+                          <span
+                            title="Tersedia Offline"
+                            className="flex h-5 w-5 items-center justify-center rounded bg-white/90 text-emerald-600 dark:bg-slate-900/90 dark:text-emerald-400"
+                          >
+                            <Pin className="h-3 w-3" />
+                          </span>
+                        )}
+                        {file.starred && (
+                          <span
+                            aria-label="Berbintang"
+                            className="flex h-5 w-5 items-center justify-center rounded bg-white/90 text-amber-500 dark:bg-slate-900/90"
+                          >
+                            <Star className="h-3 w-3 fill-amber-400 text-amber-500" />
+                          </span>
+                        )}
+                      </div>
                     )}
                   </div>
 
@@ -479,8 +506,18 @@ export function FileGrid({
                       <span aria-hidden="true">·</span>
                       <span className="truncate">{formatRelativeDateId(file.updatedAt)}</span>
                       <span aria-hidden="true">·</span>
-                      <span className="font-medium text-blue-600 dark:text-blue-400">
-                        {file.size > DIRECT_TELEGRAM_MAX_BYTES ? 'TG >20MB' : 'Cloud'}
+                      <span
+                        className={`font-medium ${
+                          file.pendingOfflineUpload
+                            ? 'text-amber-600 dark:text-amber-400'
+                            : 'text-blue-600 dark:text-blue-400'
+                        }`}
+                      >
+                        {file.pendingOfflineUpload
+                          ? 'Antrean Offline'
+                          : file.size > DIRECT_TELEGRAM_MAX_BYTES
+                            ? 'TG >20MB'
+                            : 'Cloud'}
                       </span>
                     </div>
                   </div>

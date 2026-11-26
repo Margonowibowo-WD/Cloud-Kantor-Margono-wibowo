@@ -8,6 +8,8 @@ import {
   FolderInput,
   FolderPlus,
   Pencil,
+  Pin,
+  PinOff,
   RotateCcw,
   Star,
   Trash2,
@@ -26,6 +28,7 @@ interface ContextMenuProps {
   selectedItems: DriveItem[];
   isTrashView: boolean;
   clipboardCount: number;
+  offlinePinnedIds?: Set<string>;
   onClose: () => void;
   onOpenItem: (item: DriveItem) => void;
   onDownloadItems: (items: DriveItem[]) => void;
@@ -33,6 +36,7 @@ interface ContextMenuProps {
   onMoveItems: (items: DriveItem[]) => void;
   onRenameItem: (item: DriveItem) => void;
   onToggleStarItems: (items: DriveItem[]) => void;
+  onToggleOfflinePinItems?: (items: DriveItem[]) => void;
   onTrashItems: (items: DriveItem[]) => void;
   onRestoreItems: (items: DriveItem[]) => void;
   onDeletePermanentItems: (items: DriveItem[]) => void;
@@ -47,6 +51,7 @@ export function ContextMenu({
   selectedItems,
   isTrashView,
   clipboardCount,
+  offlinePinnedIds,
   onClose,
   onOpenItem,
   onDownloadItems,
@@ -54,6 +59,7 @@ export function ContextMenu({
   onMoveItems,
   onRenameItem,
   onToggleStarItems,
+  onToggleOfflinePinItems,
   onTrashItems,
   onRestoreItems,
   onDeletePermanentItems,
@@ -94,6 +100,10 @@ export function ContextMenu({
   const singleItem = effectiveItems.length === 1 ? effectiveItems[0] : undefined;
   const downloadableFiles = effectiveItems.filter((i) => i.type === 'file');
   const allStarred = effectiveItems.length > 0 && effectiveItems.every((i) => i.starred);
+  const allOfflinePinned =
+    Boolean(offlinePinnedIds) &&
+    effectiveItems.length > 0 &&
+    effectiveItems.every((i) => offlinePinnedIds!.has(i.id));
 
   return (
     <div
@@ -210,6 +220,24 @@ export function ContextMenu({
               />
               <span>{allStarred ? 'Hapus Bintang' : 'Tambah Bintang'}</span>
             </button>
+            {onToggleOfflinePinItems && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  onClose();
+                  onToggleOfflinePinItems(effectiveItems);
+                }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+              >
+                {allOfflinePinned ? (
+                  <PinOff className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                ) : (
+                  <Pin className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                )}
+                <span>{allOfflinePinned ? 'Hapus dari Offline' : 'Simpan untuk Offline'}</span>
+              </button>
+            )}
             <button
               type="button"
               role="menuitem"

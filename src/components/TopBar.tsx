@@ -18,6 +18,7 @@ import {
   X,
 } from 'lucide-react';
 import type { TelegramPublicStatus, ViewMode } from '../types/drive';
+import { PWAInstallButton } from './PWAInstallButton';
 
 export type ThemeMode = 'auto' | 'light' | 'dark';
 export type CloudSyncState = 'syncing' | 'synced' | 'error' | 'disconnected';
@@ -284,6 +285,9 @@ export function TopBar({
                 : 'Belum Sinkron'}
           </span>
         </button>
+
+        {/* PWA Install Prompt Button (automatically hides when already installed) */}
+        <PWAInstallButton compact />
 
         {/* Quick Lock Button (hidden on very narrow phones since accessible in Profile menu) */}
         {onLockDrive && (
