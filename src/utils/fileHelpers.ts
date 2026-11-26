@@ -2,6 +2,8 @@ import type {
   DriveItem,
   FileCategory,
   NavSection,
+  SearchScope,
+  SearchSizeFilter,
   SortDirection,
   SortField,
   StorageSummary,
@@ -27,6 +29,8 @@ export interface FilterItemsOptions {
   typeFilter: TypeFilter;
   sortField: SortField;
   sortDirection: SortDirection;
+  searchScope?: SearchScope;
+  sizeFilter?: SearchSizeFilter;
 }
 
 const IMAGE_EXTENSIONS = new Set([
@@ -405,6 +409,7 @@ export function isDescendantOrSelf(
 
 export function matchesTypeFilter(item: DriveItem, typeFilter: TypeFilter): boolean {
   if (typeFilter === 'all') return true;
+  if (typeFilter === 'folder') return item.type === 'folder';
   if (item.type === 'folder') return false;
   const cat = getFileCategory(item.mimeType, item.name);
   if (typeFilter === 'document') {
@@ -413,20 +418,107 @@ export function matchesTypeFilter(item: DriveItem, typeFilter: TypeFilter): bool
   return cat === typeFilter;
 }
 
+function matchesSizeFilter(item: DriveItem, sizeFilter: SearchSizeFilter): boolean {
+  if (sizeFilter === 'all') return true;
+  if (item.type === 'folder') return false;
+  const ONE_MB = 1024 * 1024;
+  const TEN_MB = 10 * ONE_MB;
+  if (sizeFilter === 'small') return item.size < ONE_MB;
+  if (sizeFilter === 'medium') return item.size >= ONE_MB && item.size <= TEN_MB;
+  if (sizeFilter === 'large') return item.size > TEN_MB;
+  return true;
+}
+
+function parseEverythingSearch(rawQuery: string): {
+  terms: string[];
+  extSet: Set<string> | null;
+} {
+  const tokens = rawQuery.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const terms: string[] = [];
+  let extSet: Set<string> | null = null;
+
+  for (const token of tokens) {
+    if (token.startsWith('ext:') && token.length > 4) {
+      const exts = token
+        .slice(4)
+        .split(',')
+        .map((e) => e.replace(/^\./, '').trim())
+        .filter(Boolean);
+      if (exts.length > 0) {
+        if (!extSet) extSet = new Set<string>();
+        for (const e of exts) extSet.add(e);
+      }
+      continue;
+    }
+    terms.push(token);
+  }
+  return { terms, extSet };
+}
+
+function collectSubtreeFolderIds(rootFolderId: string, items: DriveItem[]): Set<string> {
+  const result = new Set<string>([rootFolderId]);
+  const childrenMap = new Map<string, string[]>();
+  for (const item of items) {
+    if (item.type === 'folder' && !item.trashed && item.parentId) {
+      const list = childrenMap.get(item.parentId);
+      if (list) list.push(item.id);
+      else childrenMap.set(item.parentId, [item.id]);
+    }
+  }
+  const stack = [rootFolderId];
+  while (stack.length > 0) {
+    const curr = stack.pop()!;
+    const children = childrenMap.get(curr);
+    if (!children) continue;
+    for (const childId of children) {
+      if (!result.has(childId)) {
+        result.add(childId);
+        stack.push(childId);
+      }
+    }
+  }
+  return result;
+}
+
 export function filterAndSortItems(
   items: DriveItem[],
   options: FilterItemsOptions,
 ): DriveItem[] {
   const query = options.searchQuery.trim().toLowerCase();
+  const parsedSearch = query ? parseEverythingSearch(query) : null;
+  const scopedFolderIds =
+    query && options.searchScope === 'folder' && options.currentFolderId
+      ? collectSubtreeFolderIds(options.currentFolderId, items)
+      : null;
 
   let filtered = items.filter((item) => {
     if (options.section === 'trash') {
-      return item.trashed;
+      if (!item.trashed) return false;
+      if (parsedSearch) {
+        const lowerName = item.name.toLowerCase();
+        if (parsedSearch.terms.some((t) => !lowerName.includes(t))) return false;
+        if (parsedSearch.extSet) {
+          if (item.type === 'folder') return false;
+          if (!parsedSearch.extSet.has(getFileExtension(item.name))) return false;
+        }
+      }
+      return true;
     }
     if (item.trashed) return false;
 
-    if (query) {
-      return item.name.toLowerCase().includes(query);
+    if (parsedSearch) {
+      if (scopedFolderIds && (!item.parentId || !scopedFolderIds.has(item.parentId))) {
+        return false;
+      }
+      if (parsedSearch.extSet) {
+        if (item.type === 'folder') return false;
+        if (!parsedSearch.extSet.has(getFileExtension(item.name))) return false;
+      }
+      const lowerName = item.name.toLowerCase();
+      for (const term of parsedSearch.terms) {
+        if (!lowerName.includes(term)) return false;
+      }
+      return true;
     }
 
     switch (options.section) {
@@ -470,6 +562,10 @@ export function filterAndSortItems(
     filtered = filtered.filter((item) => matchesTypeFilter(item, options.typeFilter));
   }
 
+  if (options.sizeFilter && options.sizeFilter !== 'all') {
+    filtered = filtered.filter((item) => matchesSizeFilter(item, options.sizeFilter!));
+  }
+
   const dir = options.sortDirection === 'asc' ? 1 : -1;
 
   return [...filtered].sort((a, b) => {
@@ -483,6 +579,14 @@ export function filterAndSortItems(
     }
 
     switch (options.sortField) {
+      case 'type': {
+        const typeA = getFileTypeLabel(a);
+        const typeB = getFileTypeLabel(b);
+        return (
+          typeA.localeCompare(typeB, 'id', { sensitivity: 'base' }) * dir ||
+          a.name.localeCompare(b.name, 'id', { sensitivity: 'base' })
+        );
+      }
       case 'size':
         return (a.size - b.size) * dir || a.name.localeCompare(b.name, 'id');
       case 'updatedAt':
@@ -759,3 +863,64 @@ export function applyMoveItems(
 
   return { nextItems, movedCount };
 }
+
+export interface DuplicateGroup {
+  key: string;
+  filename: string;
+  size: number;
+  wastedBytes: number;
+  items: DriveItem[];
+}
+
+export function findCrossFolderDuplicates(items: DriveItem[]): {
+  groups: DuplicateGroup[];
+  totalDuplicateFiles: number;
+  totalWastedBytes: number;
+} {
+  const buckets = new Map<string, DriveItem[]>();
+  for (const item of items) {
+    if (item.type !== 'file' || item.trashed) continue;
+    const normalizedName = item.name.trim().toLowerCase();
+    if (!normalizedName) continue;
+    const key = `${normalizedName}::${Number(item.size) || 0}`;
+    const list = buckets.get(key);
+    if (list) list.push(item);
+    else buckets.set(key, [item]);
+  }
+
+  const groups: DuplicateGroup[] = [];
+  let totalDuplicateFiles = 0;
+  let totalWastedBytes = 0;
+
+  for (const [key, list] of buckets.entries()) {
+    if (list.length < 2) continue;
+    // Order primary candidate first: starred -> non-stub -> oldest created/updated
+    const sorted = [...list].sort((a, b) => {
+      if (a.starred !== b.starred) return a.starred ? -1 : 1;
+      if (Boolean(a.isCatalogStub) !== Boolean(b.isCatalogStub)) {
+        return a.isCatalogStub ? 1 : -1;
+      }
+      return (Date.parse(a.createdAt || a.updatedAt) || 0) - (Date.parse(b.createdAt || b.updatedAt) || 0);
+    });
+    const size = Number(sorted[0].size) || 0;
+    const extraCount = sorted.length - 1;
+    const wastedBytes = size * extraCount;
+    totalDuplicateFiles += extraCount;
+    totalWastedBytes += wastedBytes;
+    groups.push({
+      key,
+      filename: sorted[0].name,
+      size,
+      wastedBytes,
+      items: sorted,
+    });
+  }
+
+  groups.sort((a, b) => {
+    if (b.wastedBytes !== a.wastedBytes) return b.wastedBytes - a.wastedBytes;
+    return a.filename.localeCompare(b.filename, 'id', { sensitivity: 'base' });
+  });
+
+  return { groups, totalDuplicateFiles, totalWastedBytes };
+}
+

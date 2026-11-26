@@ -237,3 +237,48 @@ export function materializeFolderTree(
     resolveParentId: (folderPath: string[]) => ensurePath(folderPath),
   };
 }
+
+export function buildUploadDuplicateKey(
+  parentId: string | null,
+  filename: string,
+  size: number,
+): string {
+  return `${parentId ?? 'ROOT'}::${filename.trim().toLowerCase()}::${Number(size) || 0}`;
+}
+
+export function filterDuplicateUploadEntries(
+  entries: DroppedUploadEntry[],
+  resolveParentId: (folderPath: string[]) => string | null,
+  existingItems: DriveItem[],
+  queuedItems: Array<{ filename: string; size: number; targetParent: string | null }> = [],
+): {
+  entriesToUpload: Array<{ entry: DroppedUploadEntry; targetParent: string | null }>;
+  skippedDuplicateCount: number;
+} {
+  const seenKeys = new Set<string>();
+  for (const item of existingItems) {
+    if (item.type === 'file' && !item.trashed) {
+      seenKeys.add(buildUploadDuplicateKey(item.parentId, item.name, item.size));
+    }
+  }
+  for (const queued of queuedItems) {
+    seenKeys.add(buildUploadDuplicateKey(queued.targetParent, queued.filename, queued.size));
+  }
+
+  const entriesToUpload: Array<{ entry: DroppedUploadEntry; targetParent: string | null }> = [];
+  let skippedDuplicateCount = 0;
+
+  for (const entry of entries) {
+    const targetParent = resolveParentId(entry.folderPath);
+    const key = buildUploadDuplicateKey(targetParent, entry.file.name, entry.file.size);
+    if (seenKeys.has(key)) {
+      skippedDuplicateCount += 1;
+      continue;
+    }
+    seenKeys.add(key);
+    entriesToUpload.push({ entry, targetParent });
+  }
+
+  return { entriesToUpload, skippedDuplicateCount };
+}
+

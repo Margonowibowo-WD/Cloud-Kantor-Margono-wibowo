@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
-import { Folder, HardDrive, X } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { ChevronDown, ChevronRight, Folder, HardDrive, Search, X } from 'lucide-react';
 import type { DriveItem } from '../types/drive';
-import { isDescendantOrSelf } from '../utils/fileHelpers';
+import { getItemLocationPath, isDescendantOrSelf } from '../utils/fileHelpers';
 
 interface FolderNameModalProps {
   open: boolean;
@@ -124,20 +124,135 @@ interface MoveModalProps {
   open: boolean;
   movingIds: string[];
   items: DriveItem[];
+  currentFolderId?: string | null;
   onClose: () => void;
   onMove: (targetParentId: string | null) => Promise<void>;
 }
 
-export function MoveModal({ open, movingIds, items, onClose, onMove }: MoveModalProps) {
+export function MoveModal({
+  open,
+  movingIds,
+  items,
+  currentFolderId = null,
+  onClose,
+  onMove,
+}: MoveModalProps) {
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
   const [submitting, setSubmitting] = useState(false);
+
+  const validFolders = useMemo(
+    () =>
+      items
+        .filter((i) => {
+          if (i.type !== 'folder' || i.trashed) return false;
+          return !movingIds.some((mid) => isDescendantOrSelf(i.id, mid, items));
+        })
+        .sort((a, b) => a.name.localeCompare(b.name, 'id', { sensitivity: 'base' })),
+    [items, movingIds],
+  );
+
+  const childrenMap = useMemo(() => {
+    const map = new Map<string, DriveItem[]>();
+    for (const folder of validFolders) {
+      const key = folder.parentId ?? 'ROOT';
+      const list = map.get(key);
+      if (list) list.push(folder);
+      else map.set(key, [folder]);
+    }
+    return map;
+  }, [validFolders]);
+
+  useEffect(() => {
+    if (!open) return;
+    setSearchQuery('');
+    setSelectedFolder(currentFolderId ?? null);
+    // Auto-expand ancestor chain of currentFolderId so user starts oriented
+    const nextExpanded = new Set<string>();
+    const byId = new Map(items.map((i) => [i.id, i]));
+    let cursor = currentFolderId;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      const node = byId.get(cursor);
+      if (node?.parentId) nextExpanded.add(node.parentId);
+      cursor = node?.parentId ?? null;
+    }
+    setExpandedIds(nextExpanded);
+  }, [open, currentFolderId, items]);
+
+  const trimmedQuery = searchQuery.trim().toLowerCase();
+  const filteredSearchFolders = useMemo(() => {
+    if (!trimmedQuery) return [];
+    return validFolders.filter((f) => f.name.toLowerCase().includes(trimmedQuery)).slice(0, 120);
+  }, [validFolders, trimmedQuery]);
 
   if (!open) return null;
 
-  const folders = items.filter((i) => {
-    if (i.type !== 'folder' || i.trashed) return false;
-    return !movingIds.some((mid) => isDescendantOrSelf(i.id, mid, items));
-  });
+  const toggleExpand = (folderId: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(folderId)) next.delete(folderId);
+      else next.add(folderId);
+      return next;
+    });
+  };
+
+  const renderTreeNodes = (parentKey: string, depth: number) => {
+    const nodes = childrenMap.get(parentKey);
+    if (!nodes || nodes.length === 0) return null;
+
+    return (
+      <div className={depth > 0 ? 'ml-3.5 border-l border-slate-200 pl-2 dark:border-slate-800' : ''}>
+        {nodes.map((folder) => {
+          const hasChildren = (childrenMap.get(folder.id)?.length || 0) > 0;
+          const isExpanded = expandedIds.has(folder.id);
+          const isSelected = selectedFolder === folder.id;
+
+          return (
+            <div key={folder.id}>
+              <div className="flex items-center gap-0.5">
+                {hasChildren ? (
+                  <button
+                    type="button"
+                    onClick={() => toggleExpand(folder.id)}
+                    aria-label={isExpanded ? `Tutup cabang ${folder.name}` : `Buka cabang ${folder.name}`}
+                    className="flex h-7 w-6 shrink-0 items-center justify-center rounded text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                  >
+                    {isExpanded ? (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    )}
+                  </button>
+                ) : (
+                  <span className="h-7 w-6 shrink-0" />
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => setSelectedFolder(folder.id)}
+                  onDoubleClick={() => {
+                    if (hasChildren) toggleExpand(folder.id);
+                  }}
+                  className={`flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs ${
+                    isSelected
+                      ? 'bg-blue-50 font-semibold text-blue-700 dark:bg-blue-950/60 dark:text-blue-300'
+                      : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'
+                  }`}
+                >
+                  <Folder className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
+                  <span className="truncate">{folder.name}</span>
+                </button>
+              </div>
+              {hasChildren && isExpanded && renderTreeNodes(folder.id, depth + 1)}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
 
   const handleConfirm = async () => {
     setSubmitting(true);
@@ -159,7 +274,7 @@ export function MoveModal({ open, movingIds, items, onClose, onMove }: MoveModal
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="td-animate-pop w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+      <div className="td-animate-pop w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
         <div className="flex items-center justify-between">
           <h2
             id="move-modal-title"
@@ -177,35 +292,82 @@ export function MoveModal({ open, movingIds, items, onClose, onMove }: MoveModal
           </button>
         </div>
 
-        <div className="mt-4 max-h-64 space-y-1 overflow-y-auto rounded-xl border border-slate-200 p-2 dark:border-slate-800">
-          <button
-            type="button"
-            onClick={() => setSelectedFolder(null)}
-            className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm ${
-              selectedFolder === null
-                ? 'bg-blue-50 font-semibold text-blue-700 dark:bg-blue-950/50 dark:text-blue-300'
-                : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'
-            }`}
-          >
-            <HardDrive className="h-4 w-4 shrink-0" />
-            <span>Drive Saya (Utama)</span>
-          </button>
-
-          {folders.map((folder) => (
+        <div className="relative mt-3.5">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Cari nama folder tujuan..."
+            aria-label="Cari nama folder tujuan"
+            className="h-9 w-full rounded-lg border border-slate-200 bg-slate-50 pl-8.5 pr-8 text-xs text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+          />
+          {searchQuery && (
             <button
-              key={folder.id}
               type="button"
-              onClick={() => setSelectedFolder(folder.id)}
-              className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm ${
-                selectedFolder === folder.id
-                  ? 'bg-blue-50 font-semibold text-blue-700 dark:bg-blue-950/50 dark:text-blue-300'
-                  : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'
-              }`}
+              onClick={() => setSearchQuery('')}
+              aria-label="Hapus pencarian folder"
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
             >
-              <Folder className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
-              <span className="truncate">{folder.name}</span>
+              <X className="h-3.5 w-3.5" />
             </button>
-          ))}
+          )}
+        </div>
+
+        <div className="mt-3 max-h-72 space-y-1 overflow-y-auto rounded-xl border border-slate-200 p-2 dark:border-slate-800">
+          {!trimmedQuery ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setSelectedFolder(null)}
+                className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs ${
+                  selectedFolder === null
+                    ? 'bg-blue-50 font-semibold text-blue-700 dark:bg-blue-950/60 dark:text-blue-300'
+                    : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'
+                }`}
+              >
+                <HardDrive className="h-4 w-4 shrink-0" />
+                <span>Drive Saya (Utama)</span>
+              </button>
+              {renderTreeNodes('ROOT', 0)}
+              {validFolders.length === 0 && (
+                <p className="px-2.5 py-2 text-xs text-slate-400 dark:text-slate-500">
+                  Belum ada subfolder lain.
+                </p>
+              )}
+            </>
+          ) : filteredSearchFolders.length > 0 ? (
+            filteredSearchFolders.map((folder) => {
+              const loc = getItemLocationPath(folder, items);
+              const isSelected = selectedFolder === folder.id;
+              return (
+                <button
+                  key={folder.id}
+                  type="button"
+                  onClick={() => setSelectedFolder(folder.id)}
+                  className={`flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left ${
+                    isSelected
+                      ? 'bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300'
+                      : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'
+                  }`}
+                >
+                  <Folder className="mt-0.5 h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
+                  <div className="min-w-0 flex-1">
+                    <div className={`truncate text-xs ${isSelected ? 'font-semibold' : 'font-medium'}`}>
+                      {folder.name}
+                    </div>
+                    <div className="truncate text-[10px] text-slate-400 dark:text-slate-500">
+                      {loc}
+                    </div>
+                  </div>
+                </button>
+              );
+            })
+          ) : (
+            <p className="px-3 py-4 text-center text-xs text-slate-400 dark:text-slate-500">
+              Folder "{searchQuery}" tidak ditemukan.
+            </p>
+          )}
         </div>
 
         <div className="mt-5 flex justify-end gap-2">

@@ -1,4 +1,5 @@
 import type { DriveItem, TelegramConfigState } from '../types/drive';
+import { replaceAllDriveItemsIdb, wipeIndexedCatalog } from './indexedCatalog';
 import type { CloudViewPrefs } from './telegramIndex';
 
 const ITEMS_KEY = 'teledrive_items_v2';
@@ -8,6 +9,7 @@ const TOMBSTONES_KEY = 'teledrive_tombstones_v1';
 const VIEW_PREFS_KEY = 'teledrive_view_prefs_v1';
 const LOCAL_VAULT_KEY = 'teledrive_encrypted_vault_v1';
 const SHARD_CACHE_KEY = 'teledrive_shard_cache_v1';
+const OBSOLETE_MIDS_KEY = 'teledrive_obsolete_mids_v1';
 const IDB_NAME = 'TeleDriveBlobVault';
 const IDB_STORE = 'blobs';
 
@@ -205,10 +207,26 @@ export function loadStoredItems(): DriveItem[] {
 }
 
 export function saveStoredItems(items: DriveItem[]): void {
+  void replaceAllDriveItemsIdb(items);
   try {
-    localStorage.setItem(ITEMS_KEY, JSON.stringify(items));
+    // Keep localStorage fast-paint seed only when dataset is small (< ~2,500 items);
+    // larger libraries live safely in IndexedDB without hitting the 5 MB localStorage ceiling.
+    if (items.length > 2500) {
+      localStorage.removeItem(ITEMS_KEY);
+      return;
+    }
+    const serialized = JSON.stringify(items);
+    if (serialized.length > 1_500_000) {
+      localStorage.removeItem(ITEMS_KEY);
+      return;
+    }
+    localStorage.setItem(ITEMS_KEY, serialized);
   } catch {
-    // ignore storage quota errors
+    try {
+      localStorage.removeItem(ITEMS_KEY);
+    } catch {
+      // ignore storage quota errors
+    }
   }
 }
 
@@ -307,6 +325,8 @@ export function isSessionOnlyLogin(): boolean {
   }
 }
 
+const ENV_CORS_PROXY_URL = ((import.meta.env?.VITE_CORS_PROXY_URL as string | undefined) || '').trim() || undefined;
+
 export function loadStoredTelegramConfig(): TelegramConfigState {
   try {
     const raw = sessionStorage.getItem(TG_CONFIG_KEY) || localStorage.getItem(TG_CONFIG_KEY);
@@ -323,7 +343,7 @@ export function loadStoredTelegramConfig(): TelegramConfigState {
         autoSync: parsed.autoSync ?? true,
         pinnedIndexMessageId: parsed.pinnedIndexMessageId,
         lastSyncedAt: parsed.lastSyncedAt,
-        corsProxyUrl: parsed.corsProxyUrl || loadStoredViewPrefs().px || undefined,
+        corsProxyUrl: parsed.corsProxyUrl || loadStoredViewPrefs().px || ENV_CORS_PROXY_URL,
       };
     }
   } catch {
@@ -335,6 +355,7 @@ export function loadStoredTelegramConfig(): TelegramConfigState {
     botToken: '',
     chatId: '',
     autoSync: true,
+    corsProxyUrl: ENV_CORS_PROXY_URL,
   };
 }
 
@@ -363,6 +384,7 @@ export function saveStoredTelegramConfig(
 }
 
 export function wipeUnlockedSessionData(options?: { clearLocalVault?: boolean }): void {
+  void wipeIndexedCatalog();
   try {
     sessionStorage.removeItem(TG_CONFIG_KEY);
     localStorage.removeItem(TG_CONFIG_KEY);
@@ -371,6 +393,7 @@ export function wipeUnlockedSessionData(options?: { clearLocalVault?: boolean })
     localStorage.removeItem(DISMISSED_TG_MSGS_KEY);
     localStorage.removeItem(VIEW_PREFS_KEY);
     localStorage.removeItem(SHARD_CACHE_KEY);
+    localStorage.removeItem(OBSOLETE_MIDS_KEY);
     if (options?.clearLocalVault) {
       localStorage.removeItem(LOCAL_VAULT_KEY);
     }
@@ -397,3 +420,60 @@ export function saveStoredViewPrefs(prefs: CloudViewPrefs): void {
     // ignore
   }
 }
+
+export interface ObsoleteTelegramMsg {
+  mid: number;
+  label: string;
+  recordedAt: string;
+  lastError?: string;
+}
+
+export function loadObsoleteTelegramMsgs(): ObsoleteTelegramMsg[] {
+  try {
+    const raw = localStorage.getItem(OBSOLETE_MIDS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as ObsoleteTelegramMsg[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((m) => m && typeof m.mid === 'number' && m.mid > 0);
+  } catch {
+    return [];
+  }
+}
+
+export function saveObsoleteTelegramMsgs(list: ObsoleteTelegramMsg[]): void {
+  try {
+    const dedup = new Map<number, ObsoleteTelegramMsg>();
+    for (const item of list) {
+      if (item && typeof item.mid === 'number' && item.mid > 0) {
+        dedup.set(item.mid, item);
+      }
+    }
+    const sorted = Array.from(dedup.values())
+      .sort((a, b) => Date.parse(b.recordedAt) - Date.parse(a.recordedAt))
+      .slice(0, 400);
+    if (sorted.length === 0) {
+      localStorage.removeItem(OBSOLETE_MIDS_KEY);
+    } else {
+      localStorage.setItem(OBSOLETE_MIDS_KEY, JSON.stringify(sorted));
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function addObsoleteTelegramMsgs(items: ObsoleteTelegramMsg[]): ObsoleteTelegramMsg[] {
+  if (items.length === 0) return loadObsoleteTelegramMsgs();
+  const map = new Map<number, ObsoleteTelegramMsg>();
+  for (const prev of loadObsoleteTelegramMsgs()) {
+    map.set(prev.mid, prev);
+  }
+  for (const next of items) {
+    if (next && typeof next.mid === 'number' && next.mid > 0) {
+      map.set(next.mid, next);
+    }
+  }
+  const merged = Array.from(map.values());
+  saveObsoleteTelegramMsgs(merged);
+  return loadObsoleteTelegramMsgs();
+}
+

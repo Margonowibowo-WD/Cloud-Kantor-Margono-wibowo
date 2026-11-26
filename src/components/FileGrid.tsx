@@ -12,7 +12,11 @@ import {
   type CapturedDropPayload,
   captureDropEntriesSync,
 } from '../utils/dropUploadHelpers';
-import { DIRECT_TELEGRAM_MAX_BYTES, resolveTelegramFileUrl } from '../utils/telegramDirect';
+import {
+  DIRECT_TELEGRAM_MAX_BYTES,
+  buildProxiedTelegramFileUrl,
+  resolveTelegramFileUrl,
+} from '../utils/telegramDirect';
 import { FileIcon } from './FileIcon';
 import { type HoveredItemAnchor, ItemHoverTooltip } from './ItemHoverTooltip';
 
@@ -55,6 +59,7 @@ function ImageThumbnail({
     }
 
     (async () => {
+      if (item.isCatalogStub) return;
       if (item.localBlobKey) {
         const blob = await getLocalBlob(item.localBlobKey);
         if (blob && active) {
@@ -67,7 +72,7 @@ function ImageThumbnail({
       if (tgFileId && tgConfig.botToken) {
         try {
           const url = await resolveTelegramFileUrl(tgConfig.botToken, tgFileId);
-          if (active) setSrc(url);
+          if (active) setSrc(buildProxiedTelegramFileUrl(url, tgConfig.corsProxyUrl));
         } catch {
           if (active) onBroken();
         }
@@ -78,7 +83,7 @@ function ImageThumbnail({
       active = false;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [item.id, item.thumbnailUrl, item.localBlobKey, item.chunks, tgConfig.botToken, onBroken]);
+  }, [item.id, item.isCatalogStub, item.thumbnailUrl, item.localBlobKey, item.chunks, tgConfig.botToken, tgConfig.corsProxyUrl, onBroken]);
 
   if (!src) {
     return (

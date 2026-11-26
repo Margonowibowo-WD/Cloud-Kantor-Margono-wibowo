@@ -11,6 +11,7 @@ import {
   Image,
   Music,
   Plus,
+  SearchCheck,
   Star,
   Trash2,
   Upload,
@@ -35,6 +36,7 @@ interface SidebarProps {
   canDropOnRoot?: boolean;
   onDropOnRoot?: (ids: string[]) => void;
   onDropExternalFilesToRoot?: (payload: CapturedDropPayload) => void;
+  onOpenDuplicateFinder?: () => void;
 }
 
 const NAV_ITEMS: Array<{ id: NavSection; label: string; icon: typeof HardDrive }> = [
@@ -62,6 +64,7 @@ export function Sidebar({
   canDropOnRoot = false,
   onDropOnRoot,
   onDropExternalFilesToRoot,
+  onOpenDuplicateFinder,
 }: SidebarProps) {
   const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [rootDragOver, setRootDragOver] = useState(false);
@@ -283,6 +286,22 @@ export function Sidebar({
             );
           })}
         </nav>
+
+        {onOpenDuplicateFinder && (
+          <div className="mt-3 border-t border-slate-200/80 pt-3 dark:border-slate-800">
+            <button
+              type="button"
+              onClick={() => {
+                onOpenDuplicateFinder();
+                onCloseMobile();
+              }}
+              className="td-press flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200/60 whitespace-nowrap dark:text-slate-300 dark:hover:bg-slate-800/70"
+            >
+              <SearchCheck className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <span>Cari Duplikat</span>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Detailed Multi-Color Cloud Storage Summary Card */}

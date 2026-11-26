@@ -291,7 +291,7 @@ export async function resolveItemPlayableUrl(
           : new Error('Gagal mengunduh PDF untuk pratinjau.');
       }
     }
-    return { url: tgUrl, isObjectUrl: false };
+    return { url: buildProxiedTelegramFileUrl(tgUrl, tgConfig.corsProxyUrl), isObjectUrl: false };
   }
   return null;
 }

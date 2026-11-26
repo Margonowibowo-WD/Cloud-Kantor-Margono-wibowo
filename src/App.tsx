@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FolderPlus, Trash2, UploadCloud } from 'lucide-react';
+import { FolderPlus, Loader2, Trash2, UploadCloud } from 'lucide-react';
 import type {
   DriveItem,
   NavSection,
+  SearchScope,
+  SearchSizeFilter,
   SortDirection,
   SortField,
   StorageSummary,
   TelegramConfigState,
   TelegramPublicStatus,
   TransferTask,
+  TypeFilter,
   ViewMode,
 } from './types/drive';
 import {
@@ -25,20 +28,25 @@ import {
   captureDropEntriesSync,
   extractDroppedTree,
   extractTreeFromFileList,
+  filterDuplicateUploadEntries,
   materializeFolderTree,
 } from './utils/dropUploadHelpers';
 import {
+  type ObsoleteTelegramMsg,
   addDeletedTombstones,
   addDismissedTelegramMessageIds,
+  addObsoleteTelegramMsgs,
   deleteLocalBlob,
   loadDeletedTombstones,
   loadDismissedTelegramMessageIds,
   loadLocalEncryptedVault,
+  loadObsoleteTelegramMsgs,
   loadStoredItems,
   loadStoredTelegramConfig,
   loadStoredViewPrefs,
   saveDeletedTombstones,
   saveLocalEncryptedVault,
+  saveObsoleteTelegramMsgs,
   saveStoredItems,
   saveStoredTelegramConfig,
   saveStoredViewPrefs,
@@ -51,16 +59,32 @@ import {
   deleteTelegramMessageDirect,
   fetchChannelMediaUpdates,
   normalizeCorsProxyUrl,
-  pullIndexFromTelegramPinnedMessage,
   pushIndexToTelegramPinnedMessage,
   toPublicStatus,
-  verifyTelegramDirect,
 } from './utils/telegramDirect';
 import {
   type CloudViewPrefs,
+  type TelegramV4Manifest,
   mergeDriveItems,
   reconcileConcurrentDriveState,
+  toCatalogRecord,
 } from './utils/telegramIndex';
+import {
+  buildOfflineBackupBlob,
+  loadIndexedCatalogState,
+  parseOfflineBackupFile,
+  replaceAllCatalogIdb,
+  saveDirtyTrackingIdb,
+  saveLoadedFolderRevsIdb,
+  saveV4ManifestIdb,
+  upsertDriveItemsIdb,
+} from './utils/indexedCatalog';
+import {
+  cleanupObsoleteTelegramMessages,
+  loadFolderChildrenV4,
+  pullCloudStateFromTelegram,
+  pushV4ChangesToTelegram,
+} from './utils/telegramV4';
 import { isVaultConfigured } from './utils/cryptoVault';
 import { startDirectDownload, startDirectUpload } from './utils/uploadClient';
 import { Sidebar } from './components/Sidebar';
@@ -74,7 +98,8 @@ import { PreviewModal } from './components/PreviewModal';
 import { RightPreviewPane } from './components/RightPreviewPane';
 import { TelegramModal } from './components/TelegramModal';
 import { PersonalLockScreen } from './components/PersonalLockScreen';
-import { ConfirmDeleteModal, FolderNameModal } from './components/ActionModals';
+import { ConfirmDeleteModal, FolderNameModal, MoveModal } from './components/ActionModals';
+import { DuplicateFinderModal } from './components/DuplicateFinderModal';
 
 const ENV_TELEGRAM_VAULT = ((import.meta.env.VITE_TELEGRAM_VAULT as string | undefined) || '').trim();
 
@@ -133,6 +158,12 @@ export default function App() {
   const [section, setSection] = useState<NavSection>('my-drive');
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
+  const [renderLimit, setRenderLimit] = useState(100);
+  const [loadingFolderId, setLoadingFolderId] = useState<string | null>(null);
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
+  const [searchScope, setSearchScope] = useState<SearchScope>('all');
+  const [sizeFilter, setSizeFilter] = useState<SearchSizeFilter>('all');
   const [sortField, setSortField] = useState<SortField>(initialViewPrefs.sf || 'name');
   const [sortDirection, setSortDirection] = useState<SortDirection>(initialViewPrefs.sd || 'asc');
   const [viewMode, setViewMode] = useState<ViewMode>(initialViewPrefs.v || 'grid');
@@ -166,6 +197,14 @@ export default function App() {
     ids: string[];
     label?: string;
   }>({ open: false, variant: 'permanent', ids: [] });
+  const [moveModal, setMoveModal] = useState<{ open: boolean; ids: string[] }>({
+    open: false,
+    ids: [],
+  });
+  const [duplicatesModalOpen, setDuplicatesModalOpen] = useState(false);
+  const [obsoleteChannelMsgs, setObsoleteChannelMsgs] = useState<ObsoleteTelegramMsg[]>(() =>
+    loadObsoleteTelegramMsgs(),
+  );
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
@@ -218,9 +257,16 @@ export default function App() {
   const lastSelectedIdRef = useRef<string | null>(null);
   const tombstonesRef = useRef<Record<string, string>>(loadDeletedTombstones());
   const viewPrefsRef = useRef<CloudViewPrefs>(initialViewPrefs);
+  const v4ManifestRef = useRef<TelegramV4Manifest | undefined>(undefined);
+  const loadedFolderRevsRef = useRef<Record<string, string>>({});
+  const dirtyFolderIdsRef = useRef<Set<string>>(new Set());
+  const dirtyItemIdsRef = useRef<Set<string>>(new Set());
+  const obsoleteV3ShardsRef = useRef<number[]>([]);
+  const folderHydrationInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
   const itemsRef = useRef<DriveItem[]>(items);
   itemsRef.current = items;
   const mainRef = useRef<HTMLElement>(null);
+  const loadMoreSentinelRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -239,6 +285,23 @@ export default function App() {
       window.setTimeout(() => {
         setNotifications((prev) => prev.filter((n) => n.id !== id));
       }, 5000);
+    },
+    [],
+  );
+
+  const recordFailedChannelDeletes = useCallback(
+    (failed: Array<{ mid: number; label: string; error?: string }>) => {
+      if (!failed || failed.length === 0) return;
+      const nowIso = new Date().toISOString();
+      const updated = addObsoleteTelegramMsgs(
+        failed.map((f) => ({
+          mid: f.mid,
+          label: f.label,
+          recordedAt: nowIso,
+          lastError: f.error,
+        })),
+      );
+      setObsoleteChannelMsgs(updated);
     },
     [],
   );
@@ -264,7 +327,12 @@ export default function App() {
       viewPrefsRef.current = remotePrefs;
       saveStoredViewPrefs(remotePrefs);
       if (remotePrefs.v === 'grid' || remotePrefs.v === 'list') setViewMode(remotePrefs.v);
-      if (remotePrefs.sf === 'name' || remotePrefs.sf === 'updatedAt' || remotePrefs.sf === 'size') {
+      if (
+        remotePrefs.sf === 'name' ||
+        remotePrefs.sf === 'updatedAt' ||
+        remotePrefs.sf === 'size' ||
+        remotePrefs.sf === 'type'
+      ) {
         setSortField(remotePrefs.sf);
       }
       if (remotePrefs.sd === 'asc' || remotePrefs.sd === 'desc') setSortDirection(remotePrefs.sd);
@@ -297,9 +365,84 @@ export default function App() {
   const pinnedIndexIdRef = useRef<number | undefined>(tgConfig.pinnedIndexMessageId);
   pinnedIndexIdRef.current = tgConfig.pinnedIndexMessageId;
 
+  const markDirtyScope = useCallback((folderIds: Array<string | null | undefined>, itemIds: string[] = []) => {
+    for (const fId of folderIds) {
+      dirtyFolderIdsRef.current.add(fId || 'ROOT');
+    }
+    for (const iId of itemIds) {
+      if (iId) dirtyItemIdsRef.current.add(iId);
+    }
+    void saveDirtyTrackingIdb(
+      Array.from(dirtyFolderIdsRef.current),
+      Array.from(dirtyItemIdsRef.current),
+    );
+  }, []);
+
+  // Hydrate full IndexedDB catalog on startup (supports > 2,500 items cleanly without localStorage quota)
+  useEffect(() => {
+    let active = true;
+    void loadIndexedCatalogState().then((idbState) => {
+      if (!active) return;
+      if (idbState.v4Manifest) {
+        v4ManifestRef.current = idbState.v4Manifest;
+      }
+      if (Object.keys(idbState.loadedFolderRevs).length > 0) {
+        loadedFolderRevsRef.current = {
+          ...idbState.loadedFolderRevs,
+          ...loadedFolderRevsRef.current,
+        };
+      }
+      for (const fId of idbState.dirtyFolderIds) dirtyFolderIdsRef.current.add(fId);
+      for (const iId of idbState.pendingDeltaIds) dirtyItemIdsRef.current.add(iId);
+
+      if (idbState.items.length > 0) {
+        setItems((prev) => mergeDriveItems(idbState.items, prev));
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Debounce search query (150ms) so typing feels instant even at 100k–1M catalog entries
+  useEffect(() => {
+    if (!searchQuery) {
+      setDebouncedSearchQuery('');
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery);
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
+
+  // Reset paginated render window (100 items/batch) whenever view scope changes
+  useEffect(() => {
+    setRenderLimit(100);
+  }, [
+    section,
+    currentFolderId,
+    debouncedSearchQuery,
+    typeFilter,
+    searchScope,
+    sizeFilter,
+    sortField,
+    sortDirection,
+  ]);
+
   // Persist items cleanly & push index to Telegram pinned message outside React state updaters
   const commitItems = useCallback(
-    (updater: (prev: DriveItem[]) => DriveItem[], options?: { deferIndexPush?: boolean }) => {
+    (
+      updater: (prev: DriveItem[]) => DriveItem[],
+      options?: {
+        deferIndexPush?: boolean;
+        dirtyFolderIds?: Array<string | null | undefined>;
+        dirtyItemIds?: string[];
+      },
+    ) => {
+      if (options?.dirtyFolderIds || options?.dirtyItemIds) {
+        markDirtyScope(options.dirtyFolderIds || [], options.dirtyItemIds || []);
+      }
       setItems((prev) => {
         const next = updater(prev);
         saveStoredItems(next);
@@ -310,7 +453,129 @@ export default function App() {
         setCloudPushTick((t) => t + 1);
       }
     },
-    [broadcastLocalStateToTabs],
+    [broadcastLocalStateToTabs, markDirtyScope],
+  );
+
+  // Lazy per-folder hydration: walks ancestor chain from Root down and fetches only missing/stale folder docs
+  const ensureFolderLoaded = useCallback(
+    async (folderId: string | null, cfgOverride?: TelegramConfigState): Promise<void> => {
+      if (!folderId) return;
+      const cfg = cfgOverride || tgConfig;
+      const proxy = normalizeCorsProxyUrl(cfg.corsProxyUrl || v4ManifestRef.current?.p?.px);
+      if (!cfg.connected || !cfg.botToken || !cfg.chatId || !proxy) return;
+
+      const existingPromise = folderHydrationInFlightRef.current.get(folderId);
+      if (existingPromise) return existingPromise;
+
+      const task = (async () => {
+        const chain: string[] = [];
+        const visited = new Set<string>();
+        let cursor: string | null = folderId;
+        while (cursor && !visited.has(cursor)) {
+          visited.add(cursor);
+          chain.unshift(cursor);
+          const node = itemsRef.current.find((i) => i.id === cursor);
+          cursor = node?.parentId ?? null;
+        }
+
+        for (const fId of chain) {
+          const folderObj = itemsRef.current.find((i) => i.id === fId && i.type === 'folder');
+          if (!folderObj?.folderIdx?.mid) continue;
+
+          const revMatches = loadedFolderRevsRef.current[fId] === folderObj.folderIdx.h;
+          const hasStubChildren = itemsRef.current.some(
+            (i) => i.parentId === fId && i.isCatalogStub,
+          );
+          if (revMatches && !hasStubChildren) continue;
+
+          setLoadingFolderId(fId);
+          try {
+            const children = await loadFolderChildrenV4(
+              cfg.botToken,
+              cfg.chatId,
+              folderObj,
+              proxy,
+            );
+            loadedFolderRevsRef.current[fId] = folderObj.folderIdx.h;
+            void saveLoadedFolderRevsIdb(loadedFolderRevsRef.current);
+
+            setItems((prev) => {
+              const merged = mergeDriveItems(prev, children);
+              itemsRef.current = merged;
+              saveStoredItems(merged);
+              return merged;
+            });
+            if (children.length > 0) {
+              void upsertDriveItemsIdb(children);
+            }
+          } catch (err) {
+            pushNotification({
+              kind: 'error',
+              title: `Gagal memuat isi folder ${folderObj.name}`,
+              detail: err instanceof Error ? err.message : 'Periksa koneksi atau Proxy Cloudflare Worker.',
+            });
+          } finally {
+            setLoadingFolderId((curr) => (curr === fId ? null : curr));
+          }
+        }
+      })();
+
+      folderHydrationInFlightRef.current.set(folderId, task);
+      try {
+        await task;
+      } finally {
+        folderHydrationInFlightRef.current.delete(folderId);
+      }
+    },
+    [tgConfig, pushNotification],
+  );
+
+  const hydrateStubItem = useCallback(
+    async (item: DriveItem): Promise<void> => {
+      if (!item.isCatalogStub) return;
+      if (item.parentId) {
+        await ensureFolderLoaded(item.parentId);
+        return;
+      }
+      const proxy = normalizeCorsProxyUrl(tgConfig.corsProxyUrl || v4ManifestRef.current?.p?.px);
+      const rootRef = v4ManifestRef.current?.root;
+      if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId || !proxy || !rootRef?.mid) {
+        return;
+      }
+      const existing = folderHydrationInFlightRef.current.get('ROOT');
+      if (existing) {
+        await existing;
+        return;
+      }
+      const task = (async () => {
+        try {
+          const rootChildren = await loadFolderChildrenV4(
+            tgConfig.botToken,
+            tgConfig.chatId,
+            { ...item, id: 'ROOT', type: 'folder', folderIdx: rootRef },
+            proxy,
+          );
+          if (rootChildren.length > 0) {
+            setItems((prev) => {
+              const merged = mergeDriveItems(prev, rootChildren);
+              itemsRef.current = merged;
+              saveStoredItems(merged);
+              return merged;
+            });
+            void upsertDriveItemsIdb(rootChildren);
+          }
+        } catch {
+          // ignore silent root hydration failure; UI timeout handles fallback message
+        }
+      })();
+      folderHydrationInFlightRef.current.set('ROOT', task);
+      try {
+        await task;
+      } finally {
+        folderHydrationInFlightRef.current.delete('ROOT');
+      }
+    },
+    [ensureFolderLoaded, tgConfig],
   );
 
   useEffect(() => {
@@ -320,7 +585,100 @@ export default function App() {
     let active = true;
     const timer = window.setTimeout(() => {
       const currentPinId = pinnedIndexIdRef.current;
+      const proxyUrl = normalizeCorsProxyUrl(tgConfig.corsProxyUrl || v4ManifestRef.current?.p?.px);
       setSyncState('syncing');
+
+      if (proxyUrl) {
+        const snapshotDirtyFolders = new Set(dirtyFolderIdsRef.current);
+        const snapshotDirtyItems = new Set(dirtyItemIdsRef.current);
+        if (snapshotDirtyFolders.size === 0 && snapshotDirtyItems.size === 0 && !v4ManifestRef.current) {
+          snapshotDirtyFolders.add('ALL');
+        }
+        const obsoleteShards = [...obsoleteV3ShardsRef.current];
+
+        void pushV4ChangesToTelegram({
+          botToken: tgConfig.botToken,
+          chatId: tgConfig.chatId,
+          corsProxyUrl: proxyUrl,
+          allItems: itemsRef.current,
+          dirtyFolderIds: snapshotDirtyFolders,
+          dirtyItemIds: snapshotDirtyItems,
+          tombstones: tombstonesRef.current,
+          currentManifest: v4ManifestRef.current,
+          pinnedMessageId: currentPinId,
+          prefs: viewPrefsRef.current,
+          obsoleteV3ShardIds: obsoleteShards,
+        })
+          .then((v4Res) => {
+            if (!active) return;
+            hasSyncedOnceRef.current = true;
+            v4ManifestRef.current = v4Res.manifest;
+            void saveV4ManifestIdb(v4Res.manifest);
+
+            for (const f of snapshotDirtyFolders) dirtyFolderIdsRef.current.delete(f);
+            for (const id of snapshotDirtyItems) dirtyItemIdsRef.current.delete(id);
+            obsoleteV3ShardsRef.current = [];
+            void saveDirtyTrackingIdb(
+              Array.from(dirtyFolderIdsRef.current),
+              Array.from(dirtyItemIdsRef.current),
+            );
+
+            // Record updated folder hashes as loaded cleanly
+            for (const item of v4Res.updatedItems) {
+              if (item.type === 'folder' && item.folderIdx?.h) {
+                loadedFolderRevsRef.current[item.id] = item.folderIdx.h;
+              }
+            }
+            void saveLoadedFolderRevsIdb(loadedFolderRevsRef.current);
+
+            if (v4Res.manifest.rev) lastSyncedRevRef.current = v4Res.manifest.rev;
+            tombstonesRef.current = v4Res.tombstones;
+            saveDeletedTombstones(v4Res.tombstones);
+            saveStoredItems(v4Res.updatedItems);
+            void replaceAllCatalogIdb(v4Res.catalog);
+            setItems(v4Res.updatedItems);
+            broadcastLocalStateToTabs();
+
+            const nextPinId = v4Res.pinnedMessageId ?? pinnedIndexIdRef.current;
+            if (nextPinId) {
+              pinnedIndexIdRef.current = nextPinId;
+            }
+            const nowIso = new Date().toISOString();
+            setTgConfig((curr) => {
+              const updatedCfg: TelegramConfigState = {
+                ...curr,
+                pinnedIndexMessageId: nextPinId,
+                lastSyncedAt: nowIso,
+              };
+              saveStoredTelegramConfig(updatedCfg);
+              return updatedCfg;
+            });
+            if (v4Res.failedDeleteMids.length > 0) {
+              recordFailedChannelDeletes(v4Res.failedDeleteMids);
+            }
+            if (v4Res.pinBlocked && !pinBlockedRef.current) {
+              pinBlockedRef.current = true;
+              pushNotification({
+                kind: 'error',
+                title: 'Bot belum diizinkan Pin Pesan di Channel',
+                detail:
+                  'Buka Info Channel Telegram -> Admin -> aktifkan izin "Pin Messages" & "Edit Messages" untuk Bot agar tidak membuat pesan baru.',
+              });
+            }
+            setSyncState('synced');
+          })
+          .catch((err) => {
+            if (!active) return;
+            setSyncState('error');
+            pushNotification({
+              kind: 'error',
+              title: 'Sinkronisasi V4 gagal',
+              detail: err instanceof Error ? err.message : 'Gagal memperbarui indeks Telegram.',
+            });
+          });
+        return;
+      }
+
       void pushIndexToTelegramPinnedMessage(
         tgConfig.botToken,
         tgConfig.chatId,
@@ -378,8 +736,10 @@ export default function App() {
     tgConfig.connected,
     tgConfig.botToken,
     tgConfig.chatId,
+    tgConfig.corsProxyUrl,
     applyRemoteViewPrefs,
     broadcastLocalStateToTabs,
+    pushNotification,
   ]);
 
   const handleLockDrive = useCallback(
@@ -405,14 +765,28 @@ export default function App() {
       hasSyncedOnceRef.current = false;
       lastSyncedRevRef.current = undefined;
       pinnedIndexIdRef.current = undefined;
+      v4ManifestRef.current = undefined;
+      loadedFolderRevsRef.current = {};
+      dirtyFolderIdsRef.current = new Set();
+      dirtyItemIdsRef.current = new Set();
+      obsoleteV3ShardsRef.current = [];
       tombstonesRef.current = {};
 
       setItems([]);
+      setSearchQuery('');
+      setDebouncedSearchQuery('');
+      setTypeFilter('all');
+      setSearchScope('all');
+      setSizeFilter('all');
+      setRenderLimit(100);
       setTransfers([]);
       setSelectedIds(new Set());
       setClipboardIds([]);
       setPreviewItem(null);
       setTelegramModalOpen(false);
+      setMoveModal({ open: false, ids: [] });
+      setDuplicatesModalOpen(false);
+      setObsoleteChannelMsgs([]);
       setContextMenu(null);
       setSyncState('disconnected');
       setTgConfig({
@@ -456,24 +830,31 @@ export default function App() {
       }
 
       try {
-        const res = await pullIndexFromTelegramPinnedMessage(cfg.botToken, cfg.chatId, {
+        const res = await pullCloudStateFromTelegram(cfg.botToken, cfg.chatId, {
+          corsProxyUrl: cfg.corsProxyUrl,
           skipVerifyGetMe: Boolean(cfg.connected),
           cachedRev: silent && hasSyncedOnceRef.current ? lastSyncedRevRef.current : undefined,
           prefetchedPinnedText: prefetched?.pinnedIndexText,
           prefetchedPinnedMessageId: prefetched?.pinnedMessageId,
-          prefetchedChatId: cfg.chatId,
         });
 
         if (res.error) {
           setSyncState('error');
-          if (!silent) {
+          if (!silent || res.needsProxy) {
             pushNotification({
               kind: 'error',
-              title: 'Sinkronisasi gagal',
+              title: res.needsProxy ? 'Proxy diperlukan untuk indeks V4' : 'Sinkronisasi gagal',
               detail: res.error,
             });
           }
           return;
+        }
+
+        if (res.isV4 && res.v4Manifest) {
+          v4ManifestRef.current = res.v4Manifest;
+          void saveV4ManifestIdb(res.v4Manifest);
+        } else if (res.v3ShardRefs?.length) {
+          obsoleteV3ShardsRef.current = res.v3ShardRefs.map((s) => s.id);
         }
 
         const shouldScanUpdates =
@@ -494,7 +875,6 @@ export default function App() {
           return;
         }
 
-        // If remote index changed on another device while silent, gently ensure local view updates
         const knownMsgIds = new Set<number>();
         for (const item of itemsRef.current) {
           for (const c of item.chunks) {
@@ -512,7 +892,12 @@ export default function App() {
         if (shouldScanUpdates) {
           lastChannelUpdatesMsRef.current = nowMs;
           const dismissedIds = loadDismissedTelegramMessageIds();
-          const activeShardIds = new Set((res.shardRefs || []).map((s) => s.id));
+          const activeShardIds = new Set((res.v3ShardRefs || []).map((s) => s.id));
+          if (res.v4Manifest?.root?.mid) activeShardIds.add(res.v4Manifest.root.mid);
+          if (res.v4Manifest?.delta?.mid) activeShardIds.add(res.v4Manifest.delta.mid);
+          for (const c of res.v4Manifest?.cat || []) {
+            if (c.mid) activeShardIds.add(c.mid);
+          }
           channelMedia = await fetchChannelMediaUpdates(
             cfg.botToken,
             cfg.chatId,
@@ -525,7 +910,7 @@ export default function App() {
           );
         }
 
-        // Probe Telegram channel deletions only on manual sync or every 5 minutes (prevents 20-call polling storms)
+        // Probe Telegram channel deletions only on manual sync or every 5 minutes
         const shouldProbeDeletions = !silent || nowMs - lastProbeMsRef.current >= 300_000;
         const deletedInTelegramItemIds = new Set<string>();
         const deletedInTelegramMsgIds: number[] = [];
@@ -534,6 +919,7 @@ export default function App() {
           const probeCandidates = [...remoteItemsForScan, ...itemsRef.current]
             .filter(
               (i, idx, arr) =>
+                !i.isCatalogStub &&
                 i.type === 'file' &&
                 i.storageBackend === 'telegram' &&
                 Boolean(i.chunks[0]?.telegramMessageId) &&
@@ -560,7 +946,17 @@ export default function App() {
           }
         }
 
-        if (res.unchanged && channelMedia.length === 0 && deletedInTelegramItemIds.size === 0) {
+        const localProxy = normalizeCorsProxyUrl(cfg.corsProxyUrl || res.prefs?.px);
+        const needsV4Migration = Boolean(
+          localProxy && !res.isV4 && (res.hasIndex || itemsRef.current.length > 0),
+        );
+
+        if (
+          res.unchanged &&
+          channelMedia.length === 0 &&
+          deletedInTelegramItemIds.size === 0 &&
+          !needsV4Migration
+        ) {
           hasSyncedOnceRef.current = true;
           setSyncState('synced');
           if (!silent) {
@@ -588,7 +984,6 @@ export default function App() {
           applyRemoteViewPrefs(res.prefs);
         }
 
-        const localProxy = normalizeCorsProxyUrl(cfg.corsProxyUrl);
         if (localProxy && viewPrefsRef.current.px === undefined) {
           const seededPrefs: CloudViewPrefs = {
             ...viewPrefsRef.current,
@@ -602,6 +997,10 @@ export default function App() {
         tombstonesRef.current = reconciled.tombstones;
         saveDeletedTombstones(reconciled.tombstones);
         saveStoredItems(reconciled.items);
+        if (res.isV4 && !res.unchanged) {
+          void replaceAllCatalogIdb(res.catalog.length > 0 ? res.catalog : reconciled.items.map(toCatalogRecord));
+        }
+        itemsRef.current = reconciled.items;
         setItems(reconciled.items);
         broadcastLocalStateToTabs();
 
@@ -610,9 +1009,14 @@ export default function App() {
           lastSyncedRevRef.current = res.rev;
         }
 
-        // Push back whenever local had items/updates not yet reflected in the remote index (or raw index needs clean HTML formatting)
+        // Re-check currently opened folder if remote V4 revision changed
+        if (res.isV4 && !res.unchanged && currentFolderId) {
+          void ensureFolderLoaded(currentFolderId, cfg);
+        }
+
         const needsFormattingUpgrade = Boolean(
-          res.hasIndex &&
+          !res.isV4 &&
+            res.hasIndex &&
             res.rawPinnedText &&
             !res.rawPinnedText.includes('TeleDrive Cloud'),
         );
@@ -623,16 +1027,20 @@ export default function App() {
             !res.prefs?.px,
         );
         const remoteById = new Map(effectiveRemoteItems.map((i) => [i.id, i]));
+        const changedLocalItems = reconciled.items.filter((item) => {
+          const r = remoteById.get(item.id);
+          return !r || (Date.parse(item.updatedAt) || 0) > (Date.parse(r.updatedAt) || 0);
+        });
         const localHasUnpushedChanges =
           !res.hasIndex ||
+          needsV4Migration ||
           needsFormattingUpgrade ||
           needsProxyPush ||
           channelMedia.length > 0 ||
           deletedInTelegramItemIds.size > 0 ||
-          reconciled.items.some((item) => {
-            const r = remoteById.get(item.id);
-            return !r || (Date.parse(item.updatedAt) || 0) > (Date.parse(r.updatedAt) || 0);
-          });
+          changedLocalItems.length > 0 ||
+          dirtyFolderIdsRef.current.size > 0 ||
+          dirtyItemIdsRef.current.size > 0;
 
         const allowCreateNewIndex = !silent || !autoCreateIndexAttemptedRef.current;
         const shouldPushBack =
@@ -645,29 +1053,93 @@ export default function App() {
           if (!res.hasIndex) {
             autoCreateIndexAttemptedRef.current = true;
           }
-          const pushRes = await pushIndexToTelegramPinnedMessage(
-            cfg.botToken,
-            cfg.chatId,
-            reconciled.items,
-            nextPinnedId,
-            reconciled.tombstones,
-            {
-              skipMergePull: true,
+
+          if (localProxy) {
+            const pushDirtyFolders = new Set(dirtyFolderIdsRef.current);
+            const pushDirtyItems = new Set(dirtyItemIdsRef.current);
+            if (!res.isV4 || !res.hasIndex || needsV4Migration) {
+              pushDirtyFolders.add('ALL');
+            }
+            for (const item of [...channelMedia, ...changedLocalItems]) {
+              pushDirtyFolders.add(item.parentId || 'ROOT');
+              pushDirtyItems.add(item.id);
+            }
+            for (const delId of deletedInTelegramItemIds) {
+              pushDirtyFolders.add('ROOT');
+              pushDirtyItems.add(delId);
+            }
+
+            const v4Push = await pushV4ChangesToTelegram({
+              botToken: cfg.botToken,
+              chatId: cfg.chatId,
+              corsProxyUrl: localProxy,
+              allItems: reconciled.items,
+              dirtyFolderIds: pushDirtyFolders,
+              dirtyItemIds: pushDirtyItems,
+              tombstones: reconciled.tombstones,
+              currentManifest: v4ManifestRef.current,
+              pinnedMessageId: nextPinnedId,
               prefs: viewPrefsRef.current,
-              existingPinnedText: res.rawPinnedText,
-              existingShardRefs: res.shardRefs,
-            },
-          );
-          if (pushRes?.pinnedMessageId) nextPinnedId = pushRes.pinnedMessageId;
-          if (pushRes?.rev) lastSyncedRevRef.current = pushRes.rev;
-          if (pushRes?.pinBlocked && !pinBlockedRef.current) {
-            pinBlockedRef.current = true;
-            pushNotification({
-              kind: 'error',
-              title: 'Bot belum diizinkan Pin Pesan di Channel',
-              detail:
-                'Buka Info Channel Telegram -> Admin -> aktifkan izin "Pin Messages" & "Edit Messages" untuk Bot agar tidak membuat pesan baru.',
+              obsoleteV3ShardIds: obsoleteV3ShardsRef.current,
             });
+            v4ManifestRef.current = v4Push.manifest;
+            void saveV4ManifestIdb(v4Push.manifest);
+            dirtyFolderIdsRef.current.clear();
+            dirtyItemIdsRef.current.clear();
+            obsoleteV3ShardsRef.current = [];
+            void saveDirtyTrackingIdb([], []);
+            for (const item of v4Push.updatedItems) {
+              if (item.type === 'folder' && item.folderIdx?.h) {
+                loadedFolderRevsRef.current[item.id] = item.folderIdx.h;
+              }
+            }
+            void saveLoadedFolderRevsIdb(loadedFolderRevsRef.current);
+
+            if (v4Push.pinnedMessageId) nextPinnedId = v4Push.pinnedMessageId;
+            if (v4Push.manifest.rev) lastSyncedRevRef.current = v4Push.manifest.rev;
+            tombstonesRef.current = v4Push.tombstones;
+            saveDeletedTombstones(v4Push.tombstones);
+            saveStoredItems(v4Push.updatedItems);
+            void replaceAllCatalogIdb(v4Push.catalog);
+            itemsRef.current = v4Push.updatedItems;
+            setItems(v4Push.updatedItems);
+            if (v4Push.failedDeleteMids.length > 0) {
+              recordFailedChannelDeletes(v4Push.failedDeleteMids);
+            }
+            if (v4Push.pinBlocked && !pinBlockedRef.current) {
+              pinBlockedRef.current = true;
+              pushNotification({
+                kind: 'error',
+                title: 'Bot belum diizinkan Pin Pesan di Channel',
+                detail:
+                  'Buka Info Channel Telegram -> Admin -> aktifkan izin "Pin Messages" & "Edit Messages" untuk Bot agar tidak membuat pesan baru.',
+              });
+            }
+          } else {
+            const pushRes = await pushIndexToTelegramPinnedMessage(
+              cfg.botToken,
+              cfg.chatId,
+              reconciled.items,
+              nextPinnedId,
+              reconciled.tombstones,
+              {
+                skipMergePull: true,
+                prefs: viewPrefsRef.current,
+                existingPinnedText: res.rawPinnedText,
+                existingShardRefs: res.v3ShardRefs,
+              },
+            );
+            if (pushRes?.pinnedMessageId) nextPinnedId = pushRes.pinnedMessageId;
+            if (pushRes?.rev) lastSyncedRevRef.current = pushRes.rev;
+            if (pushRes?.pinBlocked && !pinBlockedRef.current) {
+              pinBlockedRef.current = true;
+              pushNotification({
+                kind: 'error',
+                title: 'Bot belum diizinkan Pin Pesan di Channel',
+                detail:
+                  'Buka Info Channel Telegram -> Admin -> aktifkan izin "Pin Messages" & "Edit Messages" untuk Bot agar tidak membuat pesan baru.',
+              });
+            }
           }
         }
 
@@ -702,7 +1174,7 @@ export default function App() {
             detail:
               notes.length > 0
                 ? `${notes.join(' · ')}.`
-                : `${reconciled.items.length} item tersinkron dari @${cfg.botUsername || 'Bot'}.`,
+                : `${reconciled.items.length.toLocaleString('id-ID')} item tersinkron dari @${cfg.botUsername || 'Bot'}.`,
           });
         }
       } finally {
@@ -714,6 +1186,8 @@ export default function App() {
     },
     [
       tgConfig,
+      currentFolderId,
+      ensureFolderLoaded,
       pushNotification,
       applyRemoteViewPrefs,
       broadcastLocalStateToTabs,
@@ -727,7 +1201,13 @@ export default function App() {
       const freshTombstones = loadDeletedTombstones();
       const freshPrefs = loadStoredViewPrefs();
       tombstonesRef.current = freshTombstones;
-      setItems(freshItems);
+      if (freshItems.length > 0) {
+        setItems(freshItems);
+      } else {
+        void loadIndexedCatalogState().then((idbState) => {
+          if (idbState.items.length > 0) setItems(idbState.items);
+        });
+      }
       applyRemoteViewPrefs(freshPrefs);
     };
 
@@ -864,18 +1344,60 @@ export default function App() {
     [currentFolderId, items],
   );
 
+  const currentFolderName = useMemo(
+    () =>
+      currentFolderId
+        ? items.find((i) => i.id === currentFolderId && i.type === 'folder')?.name
+        : undefined,
+    [currentFolderId, items],
+  );
+
   const visibleItems = useMemo(
     () =>
       filterAndSortItems(items, {
         section,
         currentFolderId,
-        searchQuery,
-        typeFilter: 'all',
+        searchQuery: debouncedSearchQuery,
+        searchScope,
+        typeFilter,
+        sizeFilter,
         sortField,
         sortDirection,
       }),
-    [items, section, currentFolderId, searchQuery, sortField, sortDirection],
+    [
+      items,
+      section,
+      currentFolderId,
+      debouncedSearchQuery,
+      searchScope,
+      typeFilter,
+      sizeFilter,
+      sortField,
+      sortDirection,
+    ],
   );
+
+  const pagedItems = useMemo(
+    () => visibleItems.slice(0, renderLimit),
+    [visibleItems, renderLimit],
+  );
+
+  // Auto-load next 100-item batch as the user scrolls near the bottom of the list
+  useEffect(() => {
+    const sentinel = loadMoreSentinelRef.current;
+    if (!sentinel || visibleItems.length <= renderLimit) return;
+    if (typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setRenderLimit((prev) => prev + 100);
+        }
+      },
+      { root: mainRef.current, rootMargin: '240px' },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [visibleItems.length, renderLimit]);
 
   const handleCopyIds = useCallback(
     (ids: string[]) => {
@@ -901,24 +1423,35 @@ export default function App() {
         : items.find((i) => i.id === targetParentId)?.name || 'Folder tujuan';
 
     const now = new Date().toISOString();
-    let pastedCount = 0;
+    let createdItems: DriveItem[] = [];
 
-    commitItems((prev) => {
-      const created = cloneDriveItemsForPaste(
-        clipboardIds,
-        prev,
-        targetParentId,
-        now,
-        (type) => `${type === 'folder' ? 'fld' : 'file'}-${crypto.randomUUID()}`,
+    commitItems(
+      (prev) => {
+        createdItems = cloneDriveItemsForPaste(
+          clipboardIds,
+          prev,
+          targetParentId,
+          now,
+          (type) => `${type === 'folder' ? 'fld' : 'file'}-${crypto.randomUUID()}`,
+        );
+        return createdItems.length > 0 ? [...createdItems, ...prev] : prev;
+      },
+      { deferIndexPush: true },
+    );
+
+    if (createdItems.length > 0) {
+      const dirtyFolders = Array.from(new Set(createdItems.map((c) => c.parentId || 'ROOT')));
+      for (const c of createdItems) {
+        if (c.type === 'folder') dirtyFolders.push(c.id);
+      }
+      markDirtyScope(
+        dirtyFolders,
+        createdItems.map((c) => c.id),
       );
-      pastedCount = created.length;
-      return created.length > 0 ? [...created, ...prev] : prev;
-    });
-
-    if (pastedCount > 0) {
+      setCloudPushTick((t) => t + 1);
       pushNotification({
         kind: 'success',
-        title: `Berhasil menempel ${pastedCount} item`,
+        title: `Berhasil menempel ${createdItems.length} item`,
         detail: `Ditempatkan di ${targetFolderName}.`,
       });
     } else {
@@ -928,18 +1461,28 @@ export default function App() {
         detail: 'Folder tidak dapat ditempel ke dalam dirinya sendiri.',
       });
     }
-  }, [clipboardIds, section, currentFolderId, items, commitItems, pushNotification]);
+  }, [clipboardIds, section, currentFolderId, items, commitItems, markDirtyScope, pushNotification]);
 
   const handleDropMoveToFolder = useCallback(
     (ids: string[], targetFolderId: string | null) => {
       const now = new Date().toISOString();
+      const idSet = new Set(ids);
+      const sourceFolders = itemsRef.current
+        .filter((i) => idSet.has(i.id))
+        .map((i) => i.parentId || 'ROOT');
       let movedCount = 0;
 
-      commitItems((prev) => {
-        const result = applyMoveItems(ids, targetFolderId, prev, now);
-        movedCount = result.movedCount;
-        return result.nextItems;
-      });
+      commitItems(
+        (prev) => {
+          const result = applyMoveItems(ids, targetFolderId, prev, now);
+          movedCount = result.movedCount;
+          return result.nextItems;
+        },
+        {
+          dirtyFolderIds: [...sourceFolders, targetFolderId || 'ROOT'],
+          dirtyItemIds: ids,
+        },
+      );
 
       setDraggingIds([]);
       setSelectedIds(new Set());
@@ -959,56 +1502,180 @@ export default function App() {
     [commitItems, items, pushNotification],
   );
 
-  // Keyboard shortcuts (Search `/`, Select All `Ctrl+A`, Copy `Ctrl+C`, Paste `Ctrl+V`, `Escape`)
+  // Complete PC keyboard shortcuts (`/`, `Ctrl+A`, `Ctrl+C`, `Ctrl+V`, `Arrow` nav, `Enter`, `F2`, `Delete`, `Backspace`, `Escape`)
+  const shiftAnchorIdRef = useRef<string | null>(null);
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       const isEditingInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+      const anyModalOpen = Boolean(
+        previewItem ||
+          telegramModalOpen ||
+          nameModal.open ||
+          deleteModal.open ||
+          moveModal.open ||
+          duplicatesModalOpen ||
+          contextMenu,
+      );
 
-      if (e.key === '/' && !isEditingInput) {
+      if (e.key === 'Escape') {
+        if (anyModalOpen) {
+          setContextMenu(null);
+          setPreviewItem(null);
+          setTelegramModalOpen(false);
+          setNameModal((prev) => ({ ...prev, open: false }));
+          setDeleteModal({ open: false, variant: 'permanent', ids: [] });
+          setMoveModal({ open: false, ids: [] });
+          setDuplicatesModalOpen(false);
+        } else if (selectedIds.size > 0) {
+          setSelectedIds(new Set());
+        }
+        return;
+      }
+
+      if (isEditingInput || anyModalOpen) return;
+
+      if (e.key === '/') {
         e.preventDefault();
         searchInputRef.current?.focus();
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && !isEditingInput) {
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
         if (visibleItems.length > 0) {
           e.preventDefault();
           setSelectedIds(new Set(visibleItems.map((i) => i.id)));
         }
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c' && !isEditingInput) {
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
         if (selectedIds.size > 0) {
           e.preventDefault();
           handleCopyIds(Array.from(selectedIds));
         }
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v' && !isEditingInput) {
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
         if (clipboardIds.length > 0) {
           e.preventDefault();
           handlePasteItems();
         }
-      } else if (e.key === 'Escape') {
-        setContextMenu(null);
-        setPreviewItem(null);
-        setTelegramModalOpen(false);
-        setNameModal((prev) => ({ ...prev, open: false }));
-        setDeleteModal({ open: false, variant: 'permanent', ids: [] });
-        setSelectedIds(new Set());
+      } else if (
+        e.key === 'ArrowUp' ||
+        e.key === 'ArrowDown' ||
+        e.key === 'ArrowLeft' ||
+        e.key === 'ArrowRight'
+      ) {
+        if (pagedItems.length === 0) return;
+        e.preventDefault();
+
+        let gridCols = 1;
+        if (viewMode === 'grid' && mainRef.current) {
+          const cards = Array.from(mainRef.current.querySelectorAll<HTMLElement>('[data-drive-item]'));
+          if (cards.length > 1) {
+            const firstTop = Math.round(cards[0].getBoundingClientRect().top);
+            let cols = 0;
+            for (const card of cards) {
+              if (Math.abs(Math.round(card.getBoundingClientRect().top) - firstTop) <= 6) {
+                cols += 1;
+              } else {
+                break;
+              }
+            }
+            if (cols > 0) gridCols = cols;
+          }
+        }
+
+        const step =
+          e.key === 'ArrowLeft'
+            ? -1
+            : e.key === 'ArrowRight'
+              ? 1
+              : e.key === 'ArrowUp'
+                ? -gridCols
+                : gridCols;
+
+        const currId = lastSelectedIdRef.current;
+        const currIdx = currId ? pagedItems.findIndex((i) => i.id === currId) : -1;
+        const nextIdx =
+          currIdx === -1
+            ? step > 0
+              ? 0
+              : pagedItems.length - 1
+            : Math.max(0, Math.min(pagedItems.length - 1, currIdx + step));
+        const nextItem = pagedItems[nextIdx];
+        if (!nextItem) return;
+
+        if (e.shiftKey) {
+          const anchorIdxRaw = shiftAnchorIdRef.current
+            ? pagedItems.findIndex((i) => i.id === shiftAnchorIdRef.current)
+            : currIdx;
+          const anchorIdx = anchorIdxRaw >= 0 ? anchorIdxRaw : 0;
+          if (!shiftAnchorIdRef.current) {
+            shiftAnchorIdRef.current = pagedItems[anchorIdx].id;
+          }
+          const [from, to] = anchorIdx < nextIdx ? [anchorIdx, nextIdx] : [nextIdx, anchorIdx];
+          const rangeIds = new Set<string>();
+          for (let i = from; i <= to; i += 1) {
+            rangeIds.add(pagedItems[i].id);
+          }
+          setSelectedIds(rangeIds);
+        } else {
+          shiftAnchorIdRef.current = nextItem.id;
+          setSelectedIds(new Set([nextItem.id]));
+        }
+        lastSelectedIdRef.current = nextItem.id;
+        mainRef.current
+          ?.querySelector<HTMLElement>(`[data-drive-item="${nextItem.id}"]`)
+          ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      } else if (e.key === 'Enter' && selectedIds.size === 1) {
+        const target = visibleItems.find((i) => selectedIds.has(i.id));
+        if (!target) return;
+        e.preventDefault();
+        if (target.type === 'folder') {
+          handleNavigateFolder(target.id);
+        } else {
+          handleDoubleClickItem(target);
+        }
+      } else if (e.key === 'F2' && !isTrashView && selectedIds.size === 1) {
+        const target = visibleItems.find((i) => selectedIds.has(i.id));
+        if (!target) return;
+        e.preventDefault();
+        setNameModal({ open: true, mode: 'rename', targetItem: target });
+      } else if (e.key === 'Delete' && selectedIds.size > 0) {
+        e.preventDefault();
+        const chosen = visibleItems.filter((i) => selectedIds.has(i.id));
+        if (chosen.length === 0) return;
+        if (isTrashView) {
+          openPermanentDeleteConfirmation(chosen);
+        } else {
+          openTrashConfirmation(chosen);
+        }
+      } else if (e.key === 'Backspace' && section === 'my-drive' && currentFolderId) {
+        e.preventDefault();
+        const currFolder = items.find((i) => i.id === currentFolderId);
+        handleNavigateFolder(currFolder?.parentId ?? null);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [visibleItems, selectedIds, clipboardIds, handleCopyIds, handlePasteItems]);
+  });
 
   const handleSelectSection = (next: NavSection) => {
     setSection(next);
     setSelectedIds(new Set());
     if (next !== 'my-drive') {
       setCurrentFolderId(null);
+      setSearchScope('all');
     }
   };
 
   const handleNavigateFolder = (folderId: string | null) => {
     setSection('my-drive');
     setSearchQuery('');
+    setDebouncedSearchQuery('');
+    if (!folderId) {
+      setSearchScope('all');
+    }
+    setRenderLimit(100);
     setCurrentFolderId(folderId);
     setSelectedIds(new Set());
+    if (folderId) {
+      void ensureFolderLoaded(folderId);
+    }
   };
 
   const handleViewModeChange = (nextMode: ViewMode) => {
@@ -1106,7 +1773,11 @@ export default function App() {
             !hasMoreQueued || (nextJob.isBatch && batchSuccessCountRef.current % 15 === 0);
           commitItems(
             (prev) => [createdItem, ...prev.filter((i) => i.id !== createdItem.id)],
-            { deferIndexPush: !shouldCheckpoint },
+            {
+              deferIndexPush: !shouldCheckpoint,
+              dirtyFolderIds: [createdItem.parentId || 'ROOT'],
+              dirtyItemIds: [createdItem.id],
+            },
           );
           if (!nextJob.isBatch) {
             pushNotification({
@@ -1279,6 +1950,7 @@ export default function App() {
 
       let resolveParentId: (path: string[]) => string | null = () => baseParentId;
       let createdFoldersCount = 0;
+      const createdFolderIds = new Set<string>();
 
       if (allFolderPaths.length > 0) {
         const nowIso = new Date().toISOString();
@@ -1291,8 +1963,20 @@ export default function App() {
         );
         resolveParentId = materialized.resolveParentId;
         createdFoldersCount = materialized.createdFolders.length;
+        for (const folder of materialized.createdFolders) {
+          createdFolderIds.add(folder.id);
+        }
         if (createdFoldersCount > 0) {
-          commitItems((prev) => [...materialized.createdFolders, ...prev]);
+          const dirtyFolderScope = [
+            baseParentId || 'ROOT',
+            ...materialized.createdFolders.map((f) => f.parentId || 'ROOT'),
+            ...materialized.createdFolders.map((f) => f.id),
+          ];
+          commitItems((prev) => [...materialized.createdFolders, ...prev], {
+            dirtyFolderIds: dirtyFolderScope,
+            dirtyItemIds: materialized.createdFolders.map((f) => f.id),
+            deferIndexPush: uploadableEntries.length > 0,
+          });
         }
       }
 
@@ -1306,57 +1990,116 @@ export default function App() {
         return;
       }
 
-      const isBatch = uploadableEntries.length > 1 || createdFoldersCount > 0;
-      if (!isBatch) {
-        pushNotification({
-          kind: 'info',
-          title: `Mengunggah ${uploadableEntries[0].file.name}`,
-          detail: `Dikirim cepat ke ${destLabel} (Cloud Telegram).`,
-        });
-      } else {
-        const folderNote = createdFoldersCount > 0 ? `${createdFoldersCount} folder & ` : '';
-        pushNotification({
-          kind: 'info',
-          title: `Mengantrekan ${folderNote}${uploadableEntries.length} file ke ${destLabel}`,
-          detail: 'Diproses satu per satu sampai selesai agar upload cepat & koneksi tetap stabil.',
-        });
-      }
+      void (async () => {
+        // Hydrate any pre-existing target folders in V4 mode so resume skip checks real folder contents
+        const existingTargetFolderIds = new Set<string>();
+        for (const entry of uploadableEntries) {
+          const pId = resolveParentId(entry.folderPath);
+          if (pId && !createdFolderIds.has(pId)) {
+            existingTargetFolderIds.add(pId);
+          }
+        }
+        for (const fId of existingTargetFolderIds) {
+          const folderNode = itemsRef.current.find((i) => i.id === fId && i.type === 'folder');
+          if (folderNode?.folderIdx?.mid) {
+            await ensureFolderLoaded(fId);
+          }
+        }
 
-      const createdTasks: TransferTask[] = [];
-      for (const entry of uploadableEntries) {
-        const taskId = `tr-${crypto.randomUUID()}`;
-        const resolvedParent = resolveParentId(entry.folderPath);
-        createdTasks.push({
-          id: taskId,
-          kind: 'upload',
-          filename: entry.file.name,
-          totalBytes: entry.file.size,
-          loadedBytes: 0,
-          speedBytesPerSec: 0,
-          etaSeconds: 0,
-          completedChunks: 0,
-          totalChunks: 1,
-          status: 'queued',
-          createdAt: Date.now(),
-        });
+        const { entriesToUpload, skippedDuplicateCount } = filterDuplicateUploadEntries(
+          uploadableEntries,
+          resolveParentId,
+          itemsRef.current,
+          uploadQueueRef.current.map((job) => ({
+            filename: job.file.name,
+            size: job.file.size,
+            targetParent: job.targetParent,
+          })),
+        );
 
-        uploadQueueRef.current.push({
-          taskId,
-          file: entry.file,
-          targetParent: resolvedParent,
-          tgSnapshot: tgConfig,
-          isBatch,
-        });
+        if (entriesToUpload.length === 0) {
+          if (createdFoldersCount > 0) {
+            setCloudPushTick((t) => t + 1);
+          }
+          if (skippedDuplicateCount > 0) {
+            pushNotification({
+              kind: 'info',
+              title: `${skippedDuplicateCount} file sudah ada, dilewati otomatis`,
+              detail:
+                createdFoldersCount > 0
+                  ? `${createdFoldersCount} folder baru dibuat di ${destLabel}; semua file dengan nama & ukuran sama dilewati.`
+                  : `Semua file sudah tersimpan di ${destLabel} dengan nama dan ukuran yang sama.`,
+            });
+          }
+          return;
+        }
 
-        transferCancelMap.current.set(taskId, () => {
-          uploadQueueRef.current = uploadQueueRef.current.filter((job) => job.taskId !== taskId);
-        });
-      }
+        const isBatch =
+          entriesToUpload.length > 1 || createdFoldersCount > 0 || skippedDuplicateCount > 0;
+        const skipNote =
+          skippedDuplicateCount > 0 ? ` (${skippedDuplicateCount} duplikat dilewati)` : '';
 
-      setTransfers((prev) => [...createdTasks, ...prev].slice(0, 200));
-      pumpUploadQueue();
+        if (entriesToUpload.length === 1 && createdFoldersCount === 0 && skippedDuplicateCount === 0) {
+          pushNotification({
+            kind: 'info',
+            title: `Mengunggah ${entriesToUpload[0].entry.file.name}`,
+            detail: `Dikirim cepat ke ${destLabel} (Cloud Telegram).`,
+          });
+        } else {
+          const folderNote = createdFoldersCount > 0 ? `${createdFoldersCount} folder & ` : '';
+          pushNotification({
+            kind: 'info',
+            title: `Mengantrekan ${folderNote}${entriesToUpload.length} file ke ${destLabel}${skipNote}`,
+            detail:
+              skippedDuplicateCount > 0
+                ? `${skippedDuplicateCount} file yang sudah ada dilewati otomatis untuk melanjutkan upload.`
+                : 'Diproses satu per satu sampai selesai agar upload cepat & koneksi tetap stabil.',
+          });
+        }
+
+        const createdTasks: TransferTask[] = [];
+        for (const { entry, targetParent } of entriesToUpload) {
+          const taskId = `tr-${crypto.randomUUID()}`;
+          createdTasks.push({
+            id: taskId,
+            kind: 'upload',
+            filename: entry.file.name,
+            totalBytes: entry.file.size,
+            loadedBytes: 0,
+            speedBytesPerSec: 0,
+            etaSeconds: 0,
+            completedChunks: 0,
+            totalChunks: 1,
+            status: 'queued',
+            createdAt: Date.now(),
+          });
+
+          uploadQueueRef.current.push({
+            taskId,
+            file: entry.file,
+            targetParent,
+            tgSnapshot: tgConfig,
+            isBatch,
+          });
+
+          transferCancelMap.current.set(taskId, () => {
+            uploadQueueRef.current = uploadQueueRef.current.filter((job) => job.taskId !== taskId);
+          });
+        }
+
+        setTransfers((prev) => [...createdTasks, ...prev].slice(0, 200));
+        pumpUploadQueue();
+      })();
     },
-    [commitItems, currentFolderId, section, tgConfig, pumpUploadQueue, pushNotification],
+    [
+      commitItems,
+      currentFolderId,
+      ensureFolderLoaded,
+      section,
+      tgConfig,
+      pumpUploadQueue,
+      pushNotification,
+    ],
   );
 
   const enqueueFilesUpload = useCallback(
@@ -1378,59 +2121,68 @@ export default function App() {
   const handleDownloadItem = useCallback(
     (item: DriveItem) => {
       if (item.type !== 'file') return;
-      const taskId = `dl-${crypto.randomUUID()}`;
-      const downloadTask: TransferTask = {
-        id: taskId,
-        kind: 'download',
-        filename: item.name,
-        totalBytes: item.size,
-        loadedBytes: 0,
-        speedBytesPerSec: 0,
-        etaSeconds: 0,
-        completedChunks: 0,
-        totalChunks: 1,
-        status: 'active',
-        createdAt: Date.now(),
-      };
-      setTransfers((prev) => [downloadTask, ...prev].slice(0, 200));
 
-      const ctrl = startDirectDownload(item, tgConfig, (progress) => {
-        updateTransferTask(taskId, progress);
-      });
-      transferCancelMap.current.set(taskId, ctrl.cancel);
+      void (async () => {
+        let targetItem = item;
+        if (targetItem.isCatalogStub && targetItem.parentId) {
+          await ensureFolderLoaded(targetItem.parentId);
+          targetItem = itemsRef.current.find((i) => i.id === targetItem.id) || targetItem;
+        }
 
-      ctrl.promise
-        .then((res) => {
-          transferCancelMap.current.delete(taskId);
-          if (res?.usedRawFallback) {
-            pushNotification({
-              kind: 'info',
-              title: `Unduhan dialihkan ke Telegram: ${item.name}`,
-              detail:
-                'Aktifkan Proxy Cloudflare Worker di Pengaturan Telegram agar HP langsung menyimpan file dengan nama dan format asli.',
-            });
-          } else {
-            pushNotification({
-              kind: 'success',
-              title: `Unduhan dimulai: ${item.name}`,
-            });
-          }
-        })
-        .catch((err) => {
-          transferCancelMap.current.delete(taskId);
-          const msg = err instanceof Error ? err.message : 'Unduhan gagal.';
-          updateTransferTask(taskId, {
-            status: 'error',
-            errorMessage: msg,
-          });
-          pushNotification({
-            kind: 'error',
-            title: `Gagal mengunduh ${item.name}`,
-            detail: msg,
-          });
+        const taskId = `dl-${crypto.randomUUID()}`;
+        const downloadTask: TransferTask = {
+          id: taskId,
+          kind: 'download',
+          filename: targetItem.name,
+          totalBytes: targetItem.size,
+          loadedBytes: 0,
+          speedBytesPerSec: 0,
+          etaSeconds: 0,
+          completedChunks: 0,
+          totalChunks: 1,
+          status: 'active',
+          createdAt: Date.now(),
+        };
+        setTransfers((prev) => [downloadTask, ...prev].slice(0, 200));
+
+        const ctrl = startDirectDownload(targetItem, tgConfig, (progress) => {
+          updateTransferTask(taskId, progress);
         });
+        transferCancelMap.current.set(taskId, ctrl.cancel);
+
+        ctrl.promise
+          .then((res) => {
+            transferCancelMap.current.delete(taskId);
+            if (res?.usedRawFallback) {
+              pushNotification({
+                kind: 'info',
+                title: `Unduhan dialihkan ke Telegram: ${targetItem.name}`,
+                detail:
+                  'Aktifkan Proxy Cloudflare Worker di Pengaturan Telegram agar HP langsung menyimpan file dengan nama dan format asli.',
+              });
+            } else {
+              pushNotification({
+                kind: 'success',
+                title: `Unduhan dimulai: ${targetItem.name}`,
+              });
+            }
+          })
+          .catch((err) => {
+            transferCancelMap.current.delete(taskId);
+            const msg = err instanceof Error ? err.message : 'Unduhan gagal.';
+            updateTransferTask(taskId, {
+              status: 'error',
+              errorMessage: msg,
+            });
+            pushNotification({
+              kind: 'error',
+              title: `Gagal mengunduh ${targetItem.name}`,
+              detail: msg,
+            });
+          });
+      })();
     },
-    [tgConfig, updateTransferTask, pushNotification],
+    [tgConfig, ensureFolderLoaded, updateTransferTask, pushNotification],
   );
 
   const handleCancelTransfer = (id: string) => {
@@ -1449,20 +2201,27 @@ export default function App() {
       lastSelectedIdRef.current = item.id;
       setSelectedIds(new Set([item.id]));
       setPreviewPaneOpen(true);
+      if (item.isCatalogStub) {
+        void hydrateStubItem(item);
+      }
     }
   };
 
   const handleDoubleClickItem = (item: DriveItem) => {
     if (item.type === 'file') {
       setPreviewItem(item);
+      if (item.isCatalogStub) {
+        void hydrateStubItem(item);
+      }
     }
   };
 
   const handleToggleStar = (item: DriveItem) => {
     const nextStar = !item.starred;
     const now = new Date().toISOString();
-    commitItems((prev) =>
-      prev.map((i) => (i.id === item.id ? { ...i, starred: nextStar, updatedAt: now } : i)),
+    commitItems(
+      (prev) => prev.map((i) => (i.id === item.id ? { ...i, starred: nextStar, updatedAt: now } : i)),
+      { dirtyFolderIds: [item.parentId || 'ROOT'], dirtyItemIds: [item.id] },
     );
     if (previewItem?.id === item.id) {
       setPreviewItem({ ...previewItem, starred: nextStar });
@@ -1492,7 +2251,10 @@ export default function App() {
         storageBackend: 'telegram',
         chunks: [],
       };
-      commitItems((prev) => [folder, ...prev]);
+      commitItems((prev) => [folder, ...prev], {
+        dirtyFolderIds: [targetParent || 'ROOT'],
+        dirtyItemIds: [folder.id],
+      });
       pushNotification({
         kind: 'success',
         title: `Folder dibuat: ${cleanName}`,
@@ -1500,8 +2262,12 @@ export default function App() {
     } else if (nameModal.targetItem) {
       const targetId = nameModal.targetItem.id;
       const cleanName = name.slice(0, 180);
-      commitItems((prev) =>
-        prev.map((i) => (i.id === targetId ? { ...i, name: cleanName, updatedAt: now } : i)),
+      commitItems(
+        (prev) => prev.map((i) => (i.id === targetId ? { ...i, name: cleanName, updatedAt: now } : i)),
+        {
+          dirtyFolderIds: [nameModal.targetItem.parentId || 'ROOT'],
+          dirtyItemIds: [targetId],
+        },
       );
       if (previewItem?.id === targetId) {
         setPreviewItem({ ...previewItem, name: cleanName });
@@ -1515,23 +2281,30 @@ export default function App() {
 
   const handleTrashOrRestore = (ids: string[], trashed: boolean) => {
     const now = new Date().toISOString();
-    commitItems((prev) => {
-      const expanded = new Set<string>();
-      for (const id of ids) {
-        const target = prev.find((i) => i.id === id);
-        if (!target) continue;
-        if (target.type === 'folder') {
-          for (const d of collectDescendantIds(target.id, prev)) expanded.add(d);
-        } else {
-          expanded.add(target.id);
+    const expandedIds = new Set<string>();
+    const dirtyFolders = new Set<string>();
+    commitItems(
+      (prev) => {
+        for (const id of ids) {
+          const target = prev.find((i) => i.id === id);
+          if (!target) continue;
+          if (target.type === 'folder') {
+            for (const d of collectDescendantIds(target.id, prev)) expandedIds.add(d);
+          } else {
+            expandedIds.add(target.id);
+          }
         }
-      }
-      return prev.map((i) =>
-        expanded.has(i.id)
-          ? { ...i, trashed, trashedAt: trashed ? now : null, updatedAt: now }
-          : i,
-      );
-    });
+        return prev.map((i) => {
+          if (!expandedIds.has(i.id)) return i;
+          dirtyFolders.add(i.parentId || 'ROOT');
+          if (i.type === 'folder') dirtyFolders.add(i.id);
+          return { ...i, trashed, trashedAt: trashed ? now : null, updatedAt: now };
+        });
+      },
+      { deferIndexPush: true },
+    );
+    markDirtyScope(Array.from(dirtyFolders), Array.from(expandedIds));
+    setCloudPushTick((t) => t + 1);
     setSelectedIds(new Set());
     pushNotification({
       kind: 'info',
@@ -1543,33 +2316,71 @@ export default function App() {
 
   const handlePermanentDelete = async () => {
     if (!deleteModal.ids.length) return;
-    const expanded = new Set<string>();
+
+    // Ensure any deleted folder (and nested stub folders) is hydrated first so Telegram files & folder index docs get deleted
+    const initialExpanded = new Set<string>();
     for (const id of deleteModal.ids) {
-      const target = items.find((i) => i.id === id);
+      const target = itemsRef.current.find((i) => i.id === id);
       if (!target) continue;
       if (target.type === 'folder') {
-        for (const d of collectDescendantIds(target.id, items)) expanded.add(d);
+        for (const d of collectDescendantIds(target.id, itemsRef.current)) initialExpanded.add(d);
+      } else {
+        initialExpanded.add(target.id);
+      }
+    }
+    const stubFolderIds = itemsRef.current
+      .filter((i) => initialExpanded.has(i.id) && i.type === 'folder')
+      .map((i) => i.id);
+    for (const fId of stubFolderIds) {
+      await ensureFolderLoaded(fId);
+    }
+
+    const latestItems = itemsRef.current;
+    const expanded = new Set<string>();
+    const affectedParentFolders = new Set<string>();
+    for (const id of deleteModal.ids) {
+      const target = latestItems.find((i) => i.id === id);
+      if (!target) continue;
+      if (target.type === 'folder') {
+        for (const d of collectDescendantIds(target.id, latestItems)) expanded.add(d);
       } else {
         expanded.add(target.id);
       }
     }
 
     const remainingBlobKeys = new Set(
-      items
+      latestItems
         .filter((i) => !expanded.has(i.id) && i.localBlobKey)
         .map((i) => i.localBlobKey as string),
     );
 
     const deletedTgMsgIds: number[] = [];
+    const failedDeletes: Array<{ mid: number; label: string; error?: string }> = [];
     let tgErrorMsg: string | null = null;
     let tgDeletedCount = 0;
 
-    for (const item of items) {
+    for (const item of latestItems) {
       if (!expanded.has(item.id)) continue;
+      affectedParentFolders.add(item.parentId || 'ROOT');
       if (item.localBlobKey && !remainingBlobKeys.has(item.localBlobKey)) {
         await deleteLocalBlob(item.localBlobKey);
       }
       if (item.storageBackend === 'telegram') {
+        if (item.type === 'folder' && item.folderIdx?.mid && tgConfig.botToken && tgConfig.chatId) {
+          deletedTgMsgIds.push(item.folderIdx.mid);
+          const fldDelRes = await deleteTelegramMessageDirect(
+            tgConfig.botToken,
+            tgConfig.chatId,
+            item.folderIdx.mid,
+          );
+          if (!fldDelRes.ok) {
+            failedDeletes.push({
+              mid: item.folderIdx.mid,
+              label: `Indeks folder: ${item.name}`,
+              error: fldDelRes.error,
+            });
+          }
+        }
         for (const chunk of item.chunks) {
           if (chunk.telegramMessageId) {
             deletedTgMsgIds.push(chunk.telegramMessageId);
@@ -1581,8 +2392,15 @@ export default function App() {
               );
               if (delRes.ok) {
                 tgDeletedCount += 1;
-              } else if (!tgErrorMsg && delRes.error) {
-                tgErrorMsg = delRes.error;
+              } else {
+                if (!tgErrorMsg && delRes.error) {
+                  tgErrorMsg = delRes.error;
+                }
+                failedDeletes.push({
+                  mid: chunk.telegramMessageId,
+                  label: item.name,
+                  error: delRes.error,
+                });
               }
             }
           }
@@ -1590,12 +2408,19 @@ export default function App() {
       }
     }
 
+    if (failedDeletes.length > 0) {
+      recordFailedChannelDeletes(failedDeletes);
+    }
+
     if (deletedTgMsgIds.length > 0) {
       addDismissedTelegramMessageIds(deletedTgMsgIds);
     }
 
     tombstonesRef.current = addDeletedTombstones(Array.from(expanded));
-    commitItems((prev) => prev.filter((i) => !expanded.has(i.id)));
+    commitItems((prev) => prev.filter((i) => !expanded.has(i.id)), {
+      dirtyFolderIds: Array.from(affectedParentFolders),
+      dirtyItemIds: Array.from(expanded),
+    });
     setSelectedIds(new Set());
 
     if (tgErrorMsg) {
@@ -1792,6 +2617,7 @@ export default function App() {
           if (pulledItems.length > 0) {
             setItems(pulledItems);
             saveStoredItems(pulledItems);
+            void replaceAllCatalogIdb(pulledItems.map(toCatalogRecord));
           }
           pushNotification({
             kind: 'success',
@@ -1876,6 +2702,7 @@ export default function App() {
           setIsDraggingExternalFiles(false);
           handleDropExternalPayload(payload, null);
         }}
+        onOpenDuplicateFinder={() => setDuplicatesModalOpen(true)}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -1906,6 +2733,19 @@ export default function App() {
           sortField={sortField}
           sortDirection={sortDirection}
           onSortChange={handleSortChange}
+          typeFilter={typeFilter}
+          onTypeFilterChange={setTypeFilter}
+          searchScope={searchScope}
+          onSearchScopeChange={setSearchScope}
+          sizeFilter={sizeFilter}
+          onSizeFilterChange={setSizeFilter}
+          hasCurrentFolder={section === 'my-drive' && Boolean(currentFolderId)}
+          currentFolderName={currentFolderName}
+          onResetSearchFilters={() => {
+            setTypeFilter('all');
+            setSearchScope('all');
+            setSizeFilter('all');
+          }}
           clipboardCount={clipboardIds.length}
           onPasteItems={handlePasteItems}
           onClearClipboard={() => setClipboardIds([])}
@@ -1946,6 +2786,13 @@ export default function App() {
               </div>
             )}
 
+            {loadingFolderId && loadingFolderId === currentFolderId && (
+              <div className="mb-3 flex items-center gap-2 rounded-xl border border-blue-200/80 bg-blue-50/80 px-3.5 py-2 text-xs text-blue-700 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-300">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                <span>Memuat isi folder dari indeks Telegram...</span>
+              </div>
+            )}
+
             {visibleItems.length === 0 ? (
               <div className="mx-auto mt-14 flex max-w-md flex-col items-center rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center dark:border-slate-700 dark:bg-slate-900">
                 <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-blue-50 text-blue-600 dark:bg-blue-950/60 dark:text-blue-400">
@@ -1971,12 +2818,26 @@ export default function App() {
                                   : 'Folder ini masih kosong'}
                 </h2>
                 <p className="mt-1.5 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
-                  {searchQuery
-                    ? 'Coba kata kunci lain.'
+                  {searchQuery || typeFilter !== 'all' || sizeFilter !== 'all'
+                    ? 'Coba kata kunci lain atau ubah filter pencarian.'
                     : isTrashView
                       ? 'File atau folder yang Anda buang akan muncul di sini sebelum dihapus permanen.'
                       : 'Seret dan lepas file ke area ini (atau tepat ke atas folder) atau klik Unggah File (maks. 20 MB per file).'}
                 </p>
+
+                {(typeFilter !== 'all' || sizeFilter !== 'all' || searchScope !== 'all') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTypeFilter('all');
+                      setSearchScope('all');
+                      setSizeFilter('all');
+                    }}
+                    className="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    <span>Reset Filter</span>
+                  </button>
+                )}
 
                 {!isTrashView && !searchQuery && (
                   <div className="mt-5 flex flex-wrap justify-center gap-2">
@@ -2003,7 +2864,7 @@ export default function App() {
               </div>
             ) : viewMode === 'grid' ? (
               <FileGrid
-                items={visibleItems}
+                items={pagedItems}
                 allItems={items}
                 tgConfig={tgConfig}
                 folderCounts={folderCounts}
@@ -2026,7 +2887,7 @@ export default function App() {
               />
             ) : (
               <FileTable
-                items={visibleItems}
+                items={pagedItems}
                 allItems={items}
                 folderCounts={folderCounts}
                 selectedIds={selectedIds}
@@ -2046,6 +2907,36 @@ export default function App() {
                 onDoubleClickItem={handleDoubleClickItem}
                 isTrashView={isTrashView}
               />
+            )}
+
+            {visibleItems.length > pagedItems.length && (
+              <div
+                ref={loadMoreSentinelRef}
+                className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
+              >
+                <span>
+                  Menampilkan <strong className="font-semibold text-slate-900 dark:text-slate-100">{pagedItems.length.toLocaleString('id-ID')}</strong> dari{' '}
+                  <strong className="font-semibold text-slate-900 dark:text-slate-100">{visibleItems.length.toLocaleString('id-ID')}</strong> item
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setRenderLimit((prev) => prev + 100)}
+                    className="rounded-lg bg-blue-600 px-3 py-1.5 font-semibold text-white hover:bg-blue-700"
+                  >
+                    Muat 100 lagi
+                  </button>
+                  {visibleItems.length <= 1000 && (
+                    <button
+                      type="button"
+                      onClick={() => setRenderLimit(visibleItems.length)}
+                      className="rounded-lg border border-slate-200 px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                    >
+                      Tampilkan semua
+                    </button>
+                  )}
+                </div>
+              </div>
             )}
 
             {/* Mouse Drag Marquee Selection Box */}
@@ -2073,6 +2964,7 @@ export default function App() {
             tgConfig={tgConfig}
             onOpenFolder={(folder) => handleNavigateFolder(folder.id)}
             onOpenTelegramSettings={() => setTelegramModalOpen(true)}
+            onHydrateStub={hydrateStubItem}
           />
         </div>
       </div>
@@ -2125,20 +3017,178 @@ export default function App() {
 
       {/* Modals */}
       <PreviewModal
-        item={previewItem}
+        item={previewItem ? items.find((i) => i.id === previewItem.id) || previewItem : null}
         tgConfig={tgConfig}
         onClose={() => setPreviewItem(null)}
         onOpenTelegramSettings={() => setTelegramModalOpen(true)}
+        onHydrateStub={hydrateStubItem}
       />
 
       <TelegramModal
         open={telegramModalOpen}
         config={tgConfig}
         vaultAvailable={isVaultConfigured(activeVaultString)}
+        totalCatalogCount={items.filter((i) => !i.trashed).length}
+        isV4Mode={Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl))}
+        obsoleteChannelMsgs={obsoleteChannelMsgs}
         onClose={() => setTelegramModalOpen(false)}
         onSaveLocalVault={(vaultCode) => {
           saveLocalEncryptedVault(vaultCode);
           setLocalVaultString(vaultCode);
+        }}
+        onExportBackup={async () => {
+          const blob = await buildOfflineBackupBlob(itemsRef.current, tombstonesRef.current);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          const stamp = new Date().toISOString().slice(0, 10);
+          a.href = url;
+          a.download = `teledrive-backup-${stamp}.json.gz`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+          pushNotification({
+            kind: 'success',
+            title: 'Cadangan offline diunduh',
+            detail: `${itemsRef.current.length.toLocaleString('id-ID')} item disimpan ke file cadangan.`,
+          });
+        }}
+        onImportBackup={async (file) => {
+          const restored = await parseOfflineBackupFile(file);
+          const reconciled = reconcileConcurrentDriveState(
+            itemsRef.current,
+            restored.items,
+            [],
+            tombstonesRef.current,
+            restored.tombstones,
+          );
+          tombstonesRef.current = reconciled.tombstones;
+          saveDeletedTombstones(reconciled.tombstones);
+          saveStoredItems(reconciled.items);
+          void replaceAllCatalogIdb(reconciled.items.map(toCatalogRecord));
+          itemsRef.current = reconciled.items;
+          setItems(reconciled.items);
+          markDirtyScope(['ALL'], reconciled.items.map((i) => i.id));
+          setCloudPushTick((t) => t + 1);
+          pushNotification({
+            kind: 'success',
+            title: 'Cadangan berhasil dipulihkan',
+            detail: `${restored.items.length.toLocaleString('id-ID')} item dimuat & disinkronkan ke cloud.`,
+          });
+        }}
+        onCompactIndex={async () => {
+          const proxyUrl = normalizeCorsProxyUrl(tgConfig.corsProxyUrl || v4ManifestRef.current?.p?.px);
+          if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId || !proxyUrl) {
+            throw new Error('Aktifkan Proxy Cloudflare Worker & hubungkan Bot terlebih dahulu.');
+          }
+          setSyncState('syncing');
+          try {
+            const v4Res = await pushV4ChangesToTelegram({
+              botToken: tgConfig.botToken,
+              chatId: tgConfig.chatId,
+              corsProxyUrl: proxyUrl,
+              allItems: itemsRef.current,
+              dirtyFolderIds: new Set(['ALL']),
+              dirtyItemIds: new Set(),
+              tombstones: tombstonesRef.current,
+              currentManifest: v4ManifestRef.current,
+              pinnedMessageId: pinnedIndexIdRef.current,
+              prefs: viewPrefsRef.current,
+              forceCompact: true,
+              obsoleteV3ShardIds: obsoleteV3ShardsRef.current,
+            });
+            v4ManifestRef.current = v4Res.manifest;
+            void saveV4ManifestIdb(v4Res.manifest);
+            dirtyFolderIdsRef.current.clear();
+            dirtyItemIdsRef.current.clear();
+            obsoleteV3ShardsRef.current = [];
+            void saveDirtyTrackingIdb([], []);
+            for (const item of v4Res.updatedItems) {
+              if (item.type === 'folder' && item.folderIdx?.h) {
+                loadedFolderRevsRef.current[item.id] = item.folderIdx.h;
+              }
+            }
+            void saveLoadedFolderRevsIdb(loadedFolderRevsRef.current);
+            if (v4Res.manifest.rev) lastSyncedRevRef.current = v4Res.manifest.rev;
+            tombstonesRef.current = v4Res.tombstones;
+            saveDeletedTombstones(v4Res.tombstones);
+            saveStoredItems(v4Res.updatedItems);
+            void replaceAllCatalogIdb(v4Res.catalog);
+            itemsRef.current = v4Res.updatedItems;
+            setItems(v4Res.updatedItems);
+            if (v4Res.pinnedMessageId) pinnedIndexIdRef.current = v4Res.pinnedMessageId;
+            if (v4Res.failedDeleteMids.length > 0) {
+              recordFailedChannelDeletes(v4Res.failedDeleteMids);
+            }
+            setSyncState('synced');
+            pushNotification({
+              kind: 'success',
+              title: 'Indeks V4 dirapikan',
+              detail: `${v4Res.catalog.length.toLocaleString('id-ID')} item terkompaksi rapi di Telegram.`,
+            });
+          } catch (err) {
+            setSyncState('error');
+            throw err;
+          }
+        }}
+        onCleanChannel={async () => {
+          if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
+            throw new Error('Hubungkan Bot & Channel Telegram terlebih dahulu.');
+          }
+          let totalDeleted = 0;
+          const proxyUrl = normalizeCorsProxyUrl(tgConfig.corsProxyUrl || v4ManifestRef.current?.p?.px);
+          if (proxyUrl && v4ManifestRef.current) {
+            const v4Res = await pushV4ChangesToTelegram({
+              botToken: tgConfig.botToken,
+              chatId: tgConfig.chatId,
+              corsProxyUrl: proxyUrl,
+              allItems: itemsRef.current,
+              dirtyFolderIds: new Set(['ALL']),
+              dirtyItemIds: new Set(),
+              tombstones: tombstonesRef.current,
+              currentManifest: v4ManifestRef.current,
+              pinnedMessageId: pinnedIndexIdRef.current,
+              prefs: viewPrefsRef.current,
+              forceCompact: true,
+              obsoleteV3ShardIds: obsoleteV3ShardsRef.current,
+            });
+            v4ManifestRef.current = v4Res.manifest;
+            void saveV4ManifestIdb(v4Res.manifest);
+            dirtyFolderIdsRef.current.clear();
+            dirtyItemIdsRef.current.clear();
+            obsoleteV3ShardsRef.current = [];
+            void saveDirtyTrackingIdb([], []);
+            if (v4Res.manifest.rev) lastSyncedRevRef.current = v4Res.manifest.rev;
+            if (v4Res.pinnedMessageId) pinnedIndexIdRef.current = v4Res.pinnedMessageId;
+            tombstonesRef.current = v4Res.tombstones;
+            saveDeletedTombstones(v4Res.tombstones);
+            saveStoredItems(v4Res.updatedItems);
+            void replaceAllCatalogIdb(v4Res.catalog);
+            itemsRef.current = v4Res.updatedItems;
+            setItems(v4Res.updatedItems);
+            totalDeleted += v4Res.cleanedUpCount;
+            if (v4Res.failedDeleteMids.length > 0) {
+              recordFailedChannelDeletes(v4Res.failedDeleteMids);
+            }
+          }
+
+          const latestPending = loadObsoleteTelegramMsgs();
+          const cleanupRes = await cleanupObsoleteTelegramMessages(
+            tgConfig.botToken,
+            tgConfig.chatId,
+            latestPending,
+          );
+          totalDeleted += cleanupRes.deletedCount;
+          saveObsoleteTelegramMsgs(cleanupRes.remaining);
+          setObsoleteChannelMsgs(cleanupRes.remaining);
+          return {
+            deletedCount: totalDeleted,
+            remainingCount: cleanupRes.remaining.length,
+          };
+        }}
+        onDismissObsoleteMsgs={() => {
+          saveObsoleteTelegramMsgs([]);
+          setObsoleteChannelMsgs([]);
         }}
         onSaveConfig={(nextCfg, pulledItems) => {
           if (!nextCfg.connected) {
@@ -2161,8 +3211,12 @@ export default function App() {
             setItems((prev) => {
               const merged = mergeDriveItems(prev, pulledItems);
               saveStoredItems(merged);
+              void replaceAllCatalogIdb(merged.map(toCatalogRecord));
               return merged;
             });
+          }
+          if (nextProxy && !v4ManifestRef.current) {
+            markDirtyScope(['ALL'], []);
           }
           setCloudPushTick((t) => t + 1);
           pushNotification({
@@ -2183,12 +3237,13 @@ export default function App() {
             setItems((prev) => {
               const merged = mergeDriveItems(prev, pulledItems);
               saveStoredItems(merged);
+              void replaceAllCatalogIdb(merged.map(toCatalogRecord));
               return merged;
             });
             setSyncState('synced');
             pushNotification({
               kind: 'success',
-              title: `${pulledItems.length} item dimuat dari Telegram`,
+              title: `${pulledItems.length.toLocaleString('id-ID')} item dimuat dari Telegram`,
             });
           }
         }}
@@ -2218,6 +3273,26 @@ export default function App() {
         onConfirmPermanent={handlePermanentDelete}
       />
 
+      <MoveModal
+        open={moveModal.open}
+        movingIds={moveModal.ids}
+        items={items}
+        currentFolderId={currentFolderId}
+        onClose={() => setMoveModal({ open: false, ids: [] })}
+        onMove={async (targetParentId) => {
+          handleDropMoveToFolder(moveModal.ids, targetParentId);
+        }}
+      />
+
+      <DuplicateFinderModal
+        open={duplicatesModalOpen}
+        items={items}
+        onClose={() => setDuplicatesModalOpen(false)}
+        onNavigateFolder={handleNavigateFolder}
+        onTrashItems={(targetItems) => openTrashConfirmation(targetItems)}
+        onDeletePermanentItems={(targetItems) => openPermanentDeleteConfirmation(targetItems)}
+      />
+
       <ContextMenu
         menu={contextMenu}
         selectedItems={selectedItemsList}
@@ -2230,6 +3305,9 @@ export default function App() {
             if (target.type === 'file') handleDownloadItem(target);
           }
         }}
+        onMoveItems={(targetItems) => {
+          setMoveModal({ open: true, ids: targetItems.map((i) => i.id) });
+        }}
         onCopyItems={(targetItems) => {
           handleCopyIds(targetItems.map((i) => i.id));
         }}
@@ -2239,8 +3317,13 @@ export default function App() {
           const nextStar = !allStarred;
           const ids = new Set(targetItems.map((i) => i.id));
           const now = new Date().toISOString();
-          commitItems((prev) =>
-            prev.map((i) => (ids.has(i.id) ? { ...i, starred: nextStar, updatedAt: now } : i)),
+          commitItems(
+            (prev) =>
+              prev.map((i) => (ids.has(i.id) ? { ...i, starred: nextStar, updatedAt: now } : i)),
+            {
+              dirtyFolderIds: targetItems.map((t) => t.parentId || 'ROOT'),
+              dirtyItemIds: targetItems.map((t) => t.id),
+            },
           );
           pushNotification({
             kind: 'info',
@@ -2265,3 +3348,4 @@ export default function App() {
     </div>
   );
 }
+

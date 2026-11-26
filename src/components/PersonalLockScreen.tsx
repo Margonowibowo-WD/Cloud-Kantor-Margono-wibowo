@@ -19,10 +19,10 @@ import {
   type DetectedChat,
   detectTelegramChatsDirect,
   normalizeCorsProxyUrl,
-  pullIndexFromTelegramPinnedMessage,
   verifyTelegramDirect,
 } from '../utils/telegramDirect';
 import type { CloudViewPrefs } from '../utils/telegramIndex';
+import { pullCloudStateFromTelegram } from '../utils/telegramV4';
 
 interface PersonalLockScreenProps {
   vaultString: string;
@@ -108,14 +108,14 @@ export function PersonalLockScreen({
         return;
       }
 
-      const pulled = await pullIndexFromTelegramPinnedMessage(
+      const pulled = await pullCloudStateFromTelegram(
         creds.botToken,
         verification.chatId || creds.chatId,
         {
+          corsProxyUrl: creds.corsProxyUrl,
           skipVerifyGetMe: true,
           prefetchedPinnedText: verification.pinnedIndexText,
           prefetchedPinnedMessageId: verification.pinnedMessageId,
-          prefetchedChatId: verification.chatId || creds.chatId,
         },
       );
 
@@ -206,11 +206,10 @@ export function PersonalLockScreen({
       }
 
       const resolvedChat = verification.chatId || cleanChat;
-      const pulled = await pullIndexFromTelegramPinnedMessage(cleanToken, resolvedChat, {
+      const pulled = await pullCloudStateFromTelegram(cleanToken, resolvedChat, {
         skipVerifyGetMe: true,
         prefetchedPinnedText: verification.pinnedIndexText,
         prefetchedPinnedMessageId: verification.pinnedMessageId,
-        prefetchedChatId: resolvedChat,
       });
 
       const resolvedProxy = normalizeCorsProxyUrl(pulled.prefs?.px);

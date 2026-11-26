@@ -1,8 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Check,
   CheckCircle2,
   Copy,
+  Database,
+  Download,
+  ExternalLink,
   Eye,
   EyeOff,
   Globe,
@@ -12,41 +15,61 @@ import {
   Radar,
   RefreshCw,
   Send,
+  Trash2,
   Unlink,
+  Upload,
   X,
 } from 'lucide-react';
 import type { DriveItem, TelegramConfigState } from '../types/drive';
 import { encryptTelegramVault } from '../utils/cryptoVault';
+import type { ObsoleteTelegramMsg } from '../utils/localVault';
 import {
   CLOUDFLARE_WORKER_CORS_SNIPPET,
   type DetectedChat,
+  buildTelegramMessageUrl,
   detectTelegramChatsDirect,
   maskTelegramToken,
   normalizeCorsProxyUrl,
-  pullIndexFromTelegramPinnedMessage,
   verifyTelegramDirect,
 } from '../utils/telegramDirect';
+import { pullCloudStateFromTelegram } from '../utils/telegramV4';
 
 interface TelegramModalProps {
   open: boolean;
   config: TelegramConfigState;
   vaultAvailable?: boolean;
+  totalCatalogCount?: number;
+  isV4Mode?: boolean;
+  obsoleteChannelMsgs?: ObsoleteTelegramMsg[];
   onOpenVaultUnlock?: () => void;
   onClose: () => void;
   onSaveConfig: (next: TelegramConfigState, pulledItems?: DriveItem[]) => void;
   onPullRemoteItems: (items: DriveItem[], pinnedMessageId?: number) => void;
   onSaveLocalVault?: (vaultCode: string) => void;
+  onExportBackup?: () => Promise<void>;
+  onImportBackup?: (file: File) => Promise<void>;
+  onCompactIndex?: () => Promise<void>;
+  onCleanChannel?: () => Promise<{ deletedCount: number; remainingCount: number }>;
+  onDismissObsoleteMsgs?: () => void;
 }
 
 export function TelegramModal({
   open,
   config,
   vaultAvailable = false,
+  totalCatalogCount = 0,
+  isV4Mode = false,
+  obsoleteChannelMsgs = [],
   onOpenVaultUnlock,
   onClose,
   onSaveConfig,
   onPullRemoteItems,
   onSaveLocalVault,
+  onExportBackup,
+  onImportBackup,
+  onCompactIndex,
+  onCleanChannel,
+  onDismissObsoleteMsgs,
 }: TelegramModalProps) {
   const [botToken, setBotToken] = useState(config.botToken || '');
   const [chatId, setChatId] = useState(config.chatId || '');
@@ -57,6 +80,7 @@ export function TelegramModal({
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [pulling, setPulling] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
   const [detectedChats, setDetectedChats] = useState<DetectedChat[]>([]);
   const [feedback, setFeedback] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
 
@@ -69,6 +93,7 @@ export function TelegramModal({
   const [generatingVault, setGeneratingVault] = useState(false);
   const [generatedVault, setGeneratedVault] = useState('');
   const [copiedVault, setCopiedVault] = useState(false);
+  const backupInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (open) {
@@ -120,7 +145,9 @@ export function TelegramModal({
     }
     setPulling(true);
     setFeedback(null);
-    const res = await pullIndexFromTelegramPinnedMessage(activeToken, chatId);
+    const res = await pullCloudStateFromTelegram(activeToken, chatId, {
+      corsProxyUrl: normalizeCorsProxyUrl(corsProxyUrl) || config.corsProxyUrl,
+    });
     setPulling(false);
 
     if (res.error) {
@@ -133,7 +160,7 @@ export function TelegramModal({
       kind: 'success',
       text:
         res.items.length > 0
-          ? `Berhasil memuat ${res.items.length} item dari Pesan Tersemat channel Telegram.`
+          ? `Berhasil memuat ${res.items.length.toLocaleString('id-ID')} item dari channel Telegram.`
           : 'Koneksi berhasil, tetapi belum ada daftar indeks TeleDrive yang tersemat di channel ini.',
     });
   };
@@ -154,7 +181,6 @@ export function TelegramModal({
       return;
     }
 
-    const pulled = await pullIndexFromTelegramPinnedMessage(activeToken, verification.chatId || chatId);
     const cleanProxy = normalizeCorsProxyUrl(corsProxyUrl);
     if (corsProxyUrl.trim() && !cleanProxy) {
       setSaving(false);
@@ -164,6 +190,16 @@ export function TelegramModal({
       });
       return;
     }
+    const pulled = await pullCloudStateFromTelegram(
+      activeToken,
+      verification.chatId || chatId,
+      {
+        corsProxyUrl: cleanProxy || config.corsProxyUrl,
+        skipVerifyGetMe: true,
+        prefetchedPinnedText: verification.pinnedIndexText,
+        prefetchedPinnedMessageId: verification.pinnedMessageId,
+      },
+    );
     const hadProxyBefore = Boolean(normalizeCorsProxyUrl(config.corsProxyUrl));
     const effectiveProxy = cleanProxy || (!hadProxyBefore ? normalizeCorsProxyUrl(pulled.prefs?.px) : undefined);
 
@@ -421,7 +457,7 @@ export function TelegramModal({
             <span>Otomatis unggah file baru (≤20 MB) langsung ke Telegram & sinkron indeks</span>
           </label>
 
-          {/* Optional Free Cloudflare Worker CORS Proxy for Cross-Device PDF & Office Preview */}
+          {/* Optional Free Cloudflare Worker CORS Proxy for V4 Large-Scale Index & Cross-Device Preview */}
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-800/40">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
@@ -430,7 +466,7 @@ export function TelegramModal({
                   htmlFor="tg-cors-proxy"
                   className="text-xs font-semibold text-slate-800 dark:text-slate-100"
                 >
-                  Proxy Pratinjau PDF &amp; Office Lintas Perangkat (Gratis, Opsional)
+                  Proxy Cloudflare Worker (Gratis Rp 0 — Wajib untuk Mode V4)
                 </label>
               </div>
               <button
@@ -451,7 +487,11 @@ export function TelegramModal({
               className="mt-2 h-9 w-full rounded-lg border border-slate-200 bg-white px-3 font-mono text-xs text-slate-900 focus:border-blue-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
             />
             <p className="mt-1.5 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
-              Mengatasi batas CORS browser agar PDF, Word, Excel, dan PowerPoint bisa langsung dipratinjau dari HP atau laptop lain tanpa mengunduh dulu.
+              Cukup isi 1x (gratis 100.000 akses/hari selamanya) untuk mengaktifkan{' '}
+              <strong className="text-slate-700 dark:text-slate-200">
+                Mode Indeks V4 (100rb–1jt file, muat per folder)
+              </strong>{' '}
+              sekaligus pratinjau PDF/Office dari HP atau laptop lain. Otomatis tersinkron antar perangkat.
             </p>
 
             {proxyGuideOpen && (
@@ -627,6 +667,225 @@ export function TelegramModal({
               </div>
             )}
           </div>
+
+          {/* Long-term Offline Backup & Scalable Index Controls */}
+          {config.connected &&
+            (onExportBackup || onImportBackup || onCompactIndex || onCleanChannel) && (
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-800/40">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Database className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
+                  <span className="text-xs font-semibold text-slate-800 dark:text-slate-100">
+                    Arsip &amp; Indeks Skala Besar ({totalCatalogCount.toLocaleString('id-ID')} item)
+                  </span>
+                </div>
+                <span
+                  className={`text-[11px] font-semibold ${
+                    isV4Mode
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-amber-600 dark:text-amber-400'
+                  }`}
+                >
+                  {isV4Mode ? 'Mode V4 Aktif' : 'Mode Teks V3 (Isi Proxy di atas untuk V4)'}
+                </span>
+              </div>
+              <p className="mt-1.5 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                {isV4Mode
+                  ? 'Mode V4 aktif: isi folder dimuat saat dibuka, pencarian Everything lintas folder, dan cadangan indeks siap diunduh kapan saja.'
+                  : 'Mode V4 otomatis aktif begitu URL Proxy Cloudflare Worker gratis diisi di atas (tanpa perlu upload ulang file).'}
+              </p>
+
+              <input
+                ref={backupInputRef}
+                type="file"
+                accept=".gz,.json.gz"
+                className="hidden"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = '';
+                  if (!file || !onImportBackup) return;
+                  setBackupBusy(true);
+                  setFeedback(null);
+                  try {
+                    await onImportBackup(file);
+                    setFeedback({
+                      kind: 'success',
+                      text: 'Cadangan indeks berhasil dipulihkan dan siap disinkronkan.',
+                    });
+                  } catch (err) {
+                    setFeedback({
+                      kind: 'error',
+                      text: err instanceof Error ? err.message : 'Gagal memulihkan file cadangan.',
+                    });
+                  } finally {
+                    setBackupBusy(false);
+                  }
+                }}
+              />
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                {onExportBackup && (
+                  <button
+                    type="button"
+                    disabled={backupBusy}
+                    onClick={async () => {
+                      setBackupBusy(true);
+                      setFeedback(null);
+                      try {
+                        await onExportBackup();
+                        setFeedback({
+                          kind: 'success',
+                          text: 'File cadangan (.json.gz) berhasil diunduh ke perangkat Anda.',
+                        });
+                      } catch (err) {
+                        setFeedback({
+                          kind: 'error',
+                          text: err instanceof Error ? err.message : 'Gagal mengekspor cadangan.',
+                        });
+                      } finally {
+                        setBackupBusy(false);
+                      }
+                    }}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>Unduh Cadangan</span>
+                  </button>
+                )}
+
+                {onImportBackup && (
+                  <button
+                    type="button"
+                    disabled={backupBusy}
+                    onClick={() => backupInputRef.current?.click()}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    <Upload className="h-3.5 w-3.5" />
+                    <span>Pulihkan Cadangan</span>
+                  </button>
+                )}
+
+                {isV4Mode && onCompactIndex && (
+                  <button
+                    type="button"
+                    disabled={backupBusy}
+                    onClick={async () => {
+                      setBackupBusy(true);
+                      setFeedback(null);
+                      try {
+                        await onCompactIndex();
+                        setFeedback({
+                          kind: 'success',
+                          text: 'Katalog pencarian & catatan tambahan berhasil dirapikan.',
+                        });
+                      } catch (err) {
+                        setFeedback({
+                          kind: 'error',
+                          text: err instanceof Error ? err.message : 'Gagal merapikan indeks.',
+                        });
+                      } finally {
+                        setBackupBusy(false);
+                      }
+                    }}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    {backupBusy ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    )}
+                    <span>Rapikan Indeks</span>
+                  </button>
+                )}
+
+                {onCleanChannel && (
+                  <button
+                    type="button"
+                    disabled={backupBusy}
+                    onClick={async () => {
+                      setBackupBusy(true);
+                      setFeedback(null);
+                      try {
+                        const res = await onCleanChannel();
+                        setFeedback({
+                          kind: res.remainingCount > 0 ? 'error' : 'success',
+                          text:
+                            res.remainingCount > 0
+                              ? `${res.deletedCount} pesan lama dihapus; ${res.remainingCount} pesan ditolak Telegram (>48 jam di grup / butuh izin hapus) — lihat tautan di bawah untuk hapus manual.`
+                              : res.deletedCount > 0
+                                ? `Channel bersih! ${res.deletedCount} pesan indeks/file lama berhasil dihapus.`
+                                : 'Channel sudah rapi — tidak ada pesan sisa yang tertinggal.',
+                        });
+                      } catch (err) {
+                        setFeedback({
+                          kind: 'error',
+                          text: err instanceof Error ? err.message : 'Gagal membersihkan channel.',
+                        });
+                      } finally {
+                        setBackupBusy(false);
+                      }
+                    }}
+                    className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium disabled:opacity-50 whitespace-nowrap ${
+                      obsoleteChannelMsgs.length > 0
+                        ? 'border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:border-amber-900/70 dark:bg-amber-950/40 dark:text-amber-200'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    <span>
+                      Rapikan Channel
+                      {obsoleteChannelMsgs.length > 0 ? ` (${obsoleteChannelMsgs.length})` : ''}
+                    </span>
+                  </button>
+                )}
+              </div>
+
+              {obsoleteChannelMsgs.length > 0 && (
+                <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50/70 p-3 dark:border-amber-900/60 dark:bg-amber-950/25">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold text-amber-900 dark:text-amber-200">
+                      {obsoleteChannelMsgs.length} pesan sisa belum terhapus otomatis dari Telegram
+                    </span>
+                    {onDismissObsoleteMsgs && (
+                      <button
+                        type="button"
+                        onClick={onDismissObsoleteMsgs}
+                        className="text-[11px] font-medium text-amber-700 hover:underline dark:text-amber-300"
+                      >
+                        Tandai Sudah Bersih
+                      </button>
+                    )}
+                  </div>
+                  <div className="mt-2 max-h-28 space-y-1 overflow-y-auto">
+                    {obsoleteChannelMsgs.slice(0, 20).map((msg) => {
+                      const tgUrl = buildTelegramMessageUrl(config.chatId, msg.mid);
+                      return (
+                        <div
+                          key={msg.mid}
+                          className="flex items-center justify-between gap-2 rounded bg-white/80 px-2.5 py-1 text-[11px] dark:bg-slate-900/70"
+                        >
+                          <span className="truncate text-slate-700 dark:text-slate-300">
+                            #{msg.mid} · {msg.label}
+                          </span>
+                          {tgUrl && (
+                            <a
+                              href={tgUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex shrink-0 items-center gap-1 font-medium text-blue-600 hover:underline dark:text-blue-400"
+                            >
+                              <span>Buka</span>
+                              <ExternalLink className="h-3 w-3" />
+                            </a>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           {feedback && (
             <div

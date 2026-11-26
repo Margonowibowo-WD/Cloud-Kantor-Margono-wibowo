@@ -38,6 +38,12 @@ export interface DriveItem {
   localBlobKey?: string;
   chunks: FileChunk[];
   description?: string;
+  folderIdx?: {
+    mid: number;
+    fid: string;
+    h: string;
+  };
+  isCatalogStub?: boolean;
 }
 
 export interface TelegramConfigState {
@@ -104,9 +110,20 @@ export type NavSection =
   | 'others'
   | 'trash';
 
-export type TypeFilter = 'all' | 'image' | 'video' | 'audio' | 'document' | 'archive';
+export type TypeFilter =
+  | 'all'
+  | 'folder'
+  | 'image'
+  | 'video'
+  | 'audio'
+  | 'document'
+  | 'archive'
+  | 'other';
 
-export type SortField = 'name' | 'updatedAt' | 'size';
+export type SearchSizeFilter = 'all' | 'small' | 'medium' | 'large';
+export type SearchScope = 'all' | 'folder';
+
+export type SortField = 'name' | 'updatedAt' | 'size' | 'type';
 export type SortDirection = 'asc' | 'desc';
 export type ViewMode = 'grid' | 'list';
 

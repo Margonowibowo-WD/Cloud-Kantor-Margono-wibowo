@@ -8,6 +8,7 @@ import {
   computeByteSlices,
   computeStorageSummary,
   filterAndSortItems,
+  findCrossFolderDuplicates,
   formatBytes,
   formatEta,
   getFileCategory,
@@ -20,22 +21,34 @@ import {
   sanitizeDownloadFilename,
 } from './fileHelpers';
 import {
+  type CatalogRecord,
+  type TelegramV4Manifest,
+  applyDeltaToCatalog,
   buildTelegramV3Plan,
+  computeCatalogStorageSummary,
+  decodeGzipJson,
   decodeTelegramDocumentIndex,
   decodeTelegramDocumentIndexFull,
   decodeTelegramIndex,
   decodeTelegramV3Manifest,
   decodeTelegramV3Shard,
+  encodeGzipJson,
   encodeTelegramDocumentIndex,
   encodeTelegramIndex,
   encodeTelegramV3ManifestText,
+  encodeTelegramV4ManifestText,
   extractV3Meta,
   extractV3Revision,
+  extractV4Manifest,
   formatTelegramIndexHtml,
   formatTelegramShardHtml,
+  formatTelegramV4IndexHtml,
+  fromCatalogRecordStub,
   mergeDriveItems,
   reconcileConcurrentDriveState,
   reconcileRemoteDriveItems,
+  splitCatalogIntoVolumes,
+  toCatalogRecord,
 } from './telegramIndex';
 import { planBlobCacheEviction } from './localVault';
 import type { DriveItem } from '../types/drive';
@@ -519,6 +532,7 @@ test('getOfficePreviewType classifies Word, Excel, PowerPoint, and legacy format
 import {
   extractDroppedTree,
   extractTreeFromFileList,
+  filterDuplicateUploadEntries,
   materializeFolderTree,
 } from './dropUploadHelpers';
 
@@ -857,7 +871,11 @@ test('formatTelegramIndexHtml stays <= 4080 plain-text chars and extractV3Meta p
   ]);
 });
 
-import { buildProxiedTelegramFileUrl, normalizeCorsProxyUrl } from './telegramDirect';
+import {
+  buildProxiedTelegramFileUrl,
+  buildTelegramMessageUrl,
+  normalizeCorsProxyUrl,
+} from './telegramDirect';
 
 test('normalizeCorsProxyUrl and buildProxiedTelegramFileUrl safely wrap Telegram file URLs', async () => {
   assert.equal(normalizeCorsProxyUrl(''), undefined);
@@ -917,5 +935,370 @@ test('resolveMimeTypeForFilename and sanitizeDownloadFilename preserve real exte
   );
 });
 
+test('V4 encodeGzipJson and decodeGzipJson round-trip structured payloads accurately', async () => {
+  const payload = {
+    v: 4,
+    folderId: 'f-root-1',
+    items: sampleItems.map((i) => ({ id: i.id, name: i.name, size: i.size })),
+  };
+  const { bytes, hash } = await encodeGzipJson(payload);
+  assert.ok(bytes.byteLength > 0);
+  assert.ok(hash.length > 0);
+  const decoded = await decodeGzipJson<typeof payload>(bytes);
+  assert.deepEqual(decoded, payload);
+});
+
+test('V4 CatalogRecord conversion, stub hydration preservation, delta apply, and volume splitting work at scale', () => {
+  const folderWithRef: DriveItem = {
+    ...sampleItems[0],
+    folderIdx: { mid: 8801, fid: 'FID_FLD_1', h: 'hash_f1' },
+  };
+  const folderCat = toCatalogRecord(folderWithRef);
+  assert.equal(folderCat.t, 'd');
+  assert.equal(folderCat.fm, 8801);
+  assert.equal(folderCat.ff, 'FID_FLD_1');
+  assert.equal(folderCat.fh, 'hash_f1');
+
+  const fileCat = toCatalogRecord(sampleItems[2]);
+  assert.equal(fileCat.t, 'f');
+  assert.equal(fileCat.s, 2_500_000);
+  assert.equal(fileCat.st, 1);
+
+  const fileStub = fromCatalogRecordStub(fileCat);
+  assert.equal(fileStub.isCatalogStub, true);
+  assert.equal(fileStub.chunks.length, 0);
+  assert.equal(fileStub.name, 'Hero_Banner.jpg');
+
+  // Stub-aware mergeDriveItems must NOT downgrade an already-hydrated full item with chunks into a stub
+  const hydratedMerge = mergeDriveItems([sampleItems[2]], [fileStub]);
+  assert.equal(hydratedMerge[0].isCatalogStub, undefined);
+  assert.equal(hydratedMerge[0].chunks.length, 1);
+
+  // Delta log applies newer upserts and removes tombstoned deletions
+  const baseCatalog: CatalogRecord[] = [folderCat, fileCat];
+  const renamedNewer: CatalogRecord = {
+    ...fileCat,
+    n: 'Hero_Banner_Final.jpg',
+    u: fileCat.u + 5000,
+  };
+  const applied = applyDeltaToCatalog(baseCatalog, {}, {
+    v: 4,
+    updatedAt: '2026-11-25T10:00:00.000Z',
+    upserts: [renamedNewer],
+    deletes: { 'f-root-1': new Date(folderCat.u + 1000).toISOString() },
+  });
+  assert.equal(applied.catalog.length, 1);
+  assert.equal(applied.catalog[0].n, 'Hero_Banner_Final.jpg');
+
+  // Split into volumes cleanly
+  const manyRecords: CatalogRecord[] = Array.from({ length: 1200 }, (_, idx) => ({
+    i: `id-${idx}`,
+    p: null,
+    n: `Arsip_Tahunan_Dokumen_Pribadi_${idx}.pdf`,
+    t: 'f',
+    s: 1024,
+    u: 1700000000000 + idx,
+  }));
+  const vols = splitCatalogIntoVolumes(manyRecords, 25_000);
+  assert.ok(vols.length > 1);
+  assert.equal(vols.flat().length, 1200);
+
+  const catSummary = computeCatalogStorageSummary([folderCat, fileCat, toCatalogRecord(sampleItems[4])]);
+  assert.equal(catSummary.folderCount, 1);
+  assert.equal(catSummary.fileCount, 1);
+  assert.equal(catSummary.activeBytes, 2_500_000);
+  assert.equal(catSummary.trashedBytes, 5_000_000);
+});
+
+test('V4 manifest formats cleanly within Telegram limits and parses back identically', () => {
+  const manifest: TelegramV4Manifest = {
+    v: 4,
+    rev: 'rev_v4_123',
+    p: { v: 'grid', sf: 'name', sd: 'asc', px: 'https://proxy.example.workers.dev' },
+    root: { mid: 101, fid: 'FID_ROOT', h: 'hroot', cnt: 12 },
+    cat: [{ mid: 102, fid: 'FID_CAT1', h: 'hcat1', cnt: 125000 }],
+    delta: { mid: 103, fid: 'FID_DELTA', h: 'hdelta', cnt: 14 },
+    sum: { f: 120000, d: 5000, b: 250_000_000_000, tb: 1_000_000 },
+  };
+  const raw = encodeTelegramV4ManifestText(manifest);
+  const html = formatTelegramV4IndexHtml(raw, manifest.sum!);
+  const plain = html
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+  assert.ok(plain.length <= 4080);
+
+  const extracted = extractV4Manifest(plain);
+  assert.deepEqual(extracted, manifest);
+});
+
+test('filterAndSortItems supports sort by type, typeFilter, searchScope, sizeFilter, and ext: search', () => {
+  const dataset: DriveItem[] = [
+    ...sampleItems,
+    {
+      id: 'file-word',
+      name: 'Surat_Resmi.docx',
+      type: 'file',
+      parentId: 'f-root-1',
+      size: 400_000, // < 1 MB (small)
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      starred: false,
+      trashed: false,
+      createdAt: '2026-11-16T09:00:00.000Z',
+      updatedAt: '2026-11-16T09:00:00.000Z',
+      storageBackend: 'telegram',
+      chunks: [],
+    },
+    {
+      id: 'file-big-vid',
+      name: 'Dokumentasi_Acara_Kantor.mp4',
+      type: 'file',
+      parentId: null,
+      size: 15_000_000, // > 10 MB (large)
+      mimeType: 'video/mp4',
+      starred: false,
+      trashed: false,
+      createdAt: '2026-11-16T10:00:00.000Z',
+      updatedAt: '2026-11-16T10:00:00.000Z',
+      storageBackend: 'telegram',
+      chunks: [],
+    },
+  ];
+
+  // 1) Sort by 'type' keeps folders first, then sorts files by getFileTypeLabel (JPG, MP4, PDF, Word)
+  const sortedByTypeAsc = filterAndSortItems(dataset, {
+    section: 'my-drive',
+    currentFolderId: null,
+    searchQuery: ' ',
+    typeFilter: 'all',
+    sortField: 'type',
+    sortDirection: 'asc',
+  });
+  // Root items only (empty trimmed query -> currentFolderId=null -> f-root-1, file-1, file-big-vid)
+  assert.deepEqual(
+    sortedByTypeAsc.map((i) => i.id),
+    ['f-root-1', 'file-1', 'file-big-vid'],
+  );
+
+  // Search matching all active files sorted by 'type' asc: JPG ('file-1'), MP4 ('file-big-vid'), PDF ('file-2'), Word ('file-word')
+  const recentSortedByTypeAsc = filterAndSortItems(dataset, {
+    section: 'recent',
+    currentFolderId: null,
+    searchQuery: '',
+    typeFilter: 'all',
+    sortField: 'type',
+    sortDirection: 'asc',
+  });
+  assert.deepEqual(
+    recentSortedByTypeAsc.map((i) => i.id),
+    ['file-1', 'file-big-vid', 'file-2', 'file-word'],
+  );
+
+  const recentSortedByTypeDesc = filterAndSortItems(dataset, {
+    section: 'recent',
+    currentFolderId: null,
+    searchQuery: '',
+    typeFilter: 'all',
+    sortField: 'type',
+    sortDirection: 'desc',
+  });
+  assert.deepEqual(
+    recentSortedByTypeDesc.map((i) => i.id),
+    ['file-word', 'file-2', 'file-big-vid', 'file-1'],
+  );
+
+  // 2) typeFilter: 'folder'
+  const foldersOnly = filterAndSortItems(dataset, {
+    section: 'my-drive',
+    currentFolderId: null,
+    searchQuery: '',
+    typeFilter: 'folder',
+    sortField: 'name',
+    sortDirection: 'asc',
+  });
+  assert.deepEqual(
+    foldersOnly.map((i) => i.id),
+    ['f-root-1'],
+  );
+
+  // 3) Everything-style multi-word AND + ext: search + searchScope: 'folder'
+  const extSearch = filterAndSortItems(dataset, {
+    section: 'my-drive',
+    currentFolderId: null,
+    searchQuery: 'laporan ext:pdf,docx',
+    typeFilter: 'all',
+    sortField: 'name',
+    sortDirection: 'asc',
+  });
+  assert.deepEqual(
+    extSearch.map((i) => i.id),
+    ['file-2'],
+  );
+
+  // Scoped inside f-root-1 finds file-word (direct child) and file-2 (in nested f-sub-1) + f-sub-1
+  const folderScoped = filterAndSortItems(dataset, {
+    section: 'my-drive',
+    currentFolderId: 'f-root-1',
+    searchQuery: 'ext:docx,pdf',
+    searchScope: 'folder',
+    typeFilter: 'all',
+    sortField: 'name',
+    sortDirection: 'asc',
+  });
+  assert.deepEqual(
+    folderScoped.map((i) => i.id),
+    ['file-2', 'file-word'],
+  );
+
+  // 4) sizeFilter: small (<1MB), medium (1-10MB), large (>10MB)
+  const smallFiles = filterAndSortItems(dataset, {
+    section: 'my-drive',
+    currentFolderId: null,
+    searchQuery: 'surat',
+    typeFilter: 'all',
+    sizeFilter: 'small',
+    sortField: 'name',
+    sortDirection: 'asc',
+  });
+  assert.deepEqual(
+    smallFiles.map((i) => i.id),
+    ['file-word'],
+  );
+
+  const largeFiles = filterAndSortItems(dataset, {
+    section: 'my-drive',
+    currentFolderId: null,
+    searchQuery: 'acara kantor',
+    typeFilter: 'all',
+    sizeFilter: 'large',
+    sortField: 'name',
+    sortDirection: 'asc',
+  });
+  assert.deepEqual(
+    largeFiles.map((i) => i.id),
+    ['file-big-vid'],
+  );
+});
+
+test('filterDuplicateUploadEntries skips existing, queued, and intra-batch duplicates per folder while keeping unique files', () => {
+  const sameAsHero = new File([new Uint8Array(10)], 'hero_banner.jpg', { type: 'image/jpeg' });
+  Object.defineProperty(sameAsHero, 'size', { value: 2_500_000 });
+
+  const differentSizeHero = new File([new Uint8Array(10)], 'Hero_Banner.jpg', {
+    type: 'image/jpeg',
+  });
+  Object.defineProperty(differentSizeHero, 'size', { value: 3_000_000 });
+
+  const queuedFile = new File([new Uint8Array(10)], 'Antrean.pdf', { type: 'application/pdf' });
+  Object.defineProperty(queuedFile, 'size', { value: 12_345 });
+
+  const sameInSubfolder = new File([new Uint8Array(10)], 'Laporan_Q4.pdf', {
+    type: 'application/pdf',
+  });
+  Object.defineProperty(sameInSubfolder, 'size', { value: 1_200_000 });
+
+  const freshFile = new File([new Uint8Array(10)], 'Baru.pdf', { type: 'application/pdf' });
+  Object.defineProperty(freshFile, 'size', { value: 99_999 });
+
+  const freshDuplicateInBatch = new File([new Uint8Array(10)], 'baru.pdf', {
+    type: 'application/pdf',
+  });
+  Object.defineProperty(freshDuplicateInBatch, 'size', { value: 99_999 });
+
+  const resolveParent = (folderPath: string[]) =>
+    folderPath.join('/') === 'Desain Produk/Mockup Final' ? 'f-sub-1' : null;
+
+  const result = filterDuplicateUploadEntries(
+    [
+      { file: sameAsHero, folderPath: [] }, // matches sampleItems['file-1'] in root -> skip
+      { file: differentSizeHero, folderPath: [] }, // different size -> keep
+      { file: queuedFile, folderPath: [] }, // matches queuedItems -> skip
+      { file: sameInSubfolder, folderPath: ['Desain Produk', 'Mockup Final'] }, // matches 'file-2' in f-sub-1 -> skip
+      { file: freshFile, folderPath: ['Desain Produk', 'Mockup Final'] }, // new -> keep
+      { file: freshDuplicateInBatch, folderPath: ['Desain Produk', 'Mockup Final'] }, // intra-batch duplicate -> skip
+    ],
+    resolveParent,
+    sampleItems,
+    [{ filename: 'Antrean.pdf', size: 12_345, targetParent: null }],
+  );
+
+  assert.equal(result.skippedDuplicateCount, 4);
+  assert.equal(result.entriesToUpload.length, 2);
+  assert.equal(result.entriesToUpload[0].entry.file.name, 'Hero_Banner.jpg');
+  assert.equal(result.entriesToUpload[0].targetParent, null);
+  assert.equal(result.entriesToUpload[1].entry.file.name, 'Baru.pdf');
+  assert.equal(result.entriesToUpload[1].targetParent, 'f-sub-1');
+});
+
+test('findCrossFolderDuplicates detects duplicate files across folders while ignoring trashed and unique items', () => {
+  const archiveItems: DriveItem[] = [
+    ...sampleItems,
+    {
+      id: 'dup-banner-copy',
+      name: 'hero_banner.jpg', // case-insensitive match with file-1 (starred, root)
+      type: 'file',
+      parentId: 'f-root-1',
+      size: 2_500_000,
+      mimeType: 'image/jpeg',
+      starred: false,
+      trashed: false,
+      createdAt: '2026-11-18T10:00:00.000Z',
+      updatedAt: '2026-11-18T10:00:00.000Z',
+      storageBackend: 'telegram',
+      chunks: [],
+    },
+    {
+      id: 'dup-banner-diff-size',
+      name: 'Hero_Banner.jpg',
+      type: 'file',
+      parentId: 'f-sub-1',
+      size: 900_000, // different size -> NOT duplicate
+      mimeType: 'image/jpeg',
+      starred: false,
+      trashed: false,
+      createdAt: '2026-11-19T10:00:00.000Z',
+      updatedAt: '2026-11-19T10:00:00.000Z',
+      storageBackend: 'telegram',
+      chunks: [],
+    },
+    {
+      id: 'dup-backup-trashed',
+      name: 'Backup_Lama.zip',
+      type: 'file',
+      parentId: 'f-root-1',
+      size: 5_000_000, // sampleItems['file-trash'] is trashed -> NOT duplicate
+      mimeType: 'application/zip',
+      starred: false,
+      trashed: false,
+      createdAt: '2026-11-19T10:00:00.000Z',
+      updatedAt: '2026-11-19T10:00:00.000Z',
+      storageBackend: 'telegram',
+      chunks: [],
+    },
+  ];
+
+  const dupRes = findCrossFolderDuplicates(archiveItems);
+  assert.equal(dupRes.groups.length, 1);
+  assert.equal(dupRes.totalDuplicateFiles, 1);
+  assert.equal(dupRes.totalWastedBytes, 2_500_000);
+  // Starred item 'file-1' must be ordered first as primary copy
+  assert.deepEqual(
+    dupRes.groups[0].items.map((i) => i.id),
+    ['file-1', 'dup-banner-copy'],
+  );
+});
+
+test('buildTelegramMessageUrl generates valid t.me deep links for private channels and public usernames', () => {
+  assert.equal(
+    buildTelegramMessageUrl('-1001987654321', 420),
+    'https://t.me/c/1987654321/420',
+  );
+  assert.equal(
+    buildTelegramMessageUrl('@my_backup_channel', 88),
+    'https://t.me/my_backup_channel/88',
+  );
+  assert.equal(buildTelegramMessageUrl('123456', 10), null);
+});
 
 

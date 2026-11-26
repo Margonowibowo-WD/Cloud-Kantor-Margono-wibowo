@@ -7,7 +7,14 @@ import {
   PanelRight,
   X,
 } from 'lucide-react';
-import type { NavSection, SortDirection, SortField } from '../types/drive';
+import type {
+  NavSection,
+  SearchScope,
+  SearchSizeFilter,
+  SortDirection,
+  SortField,
+  TypeFilter,
+} from '../types/drive';
 import {
   type CapturedDropPayload,
   captureDropEntriesSync,
@@ -21,6 +28,15 @@ interface ToolbarProps {
   sortField: SortField;
   sortDirection: SortDirection;
   onSortChange: (field: SortField) => void;
+  typeFilter: TypeFilter;
+  onTypeFilterChange: (filter: TypeFilter) => void;
+  searchScope: SearchScope;
+  onSearchScopeChange: (scope: SearchScope) => void;
+  sizeFilter: SearchSizeFilter;
+  onSizeFilterChange: (filter: SearchSizeFilter) => void;
+  hasCurrentFolder: boolean;
+  currentFolderName?: string;
+  onResetSearchFilters?: () => void;
   clipboardCount: number;
   onPasteItems: () => void;
   onClearClipboard: () => void;
@@ -51,6 +67,15 @@ export function Toolbar({
   sortField,
   sortDirection,
   onSortChange,
+  typeFilter,
+  onTypeFilterChange,
+  searchScope,
+  onSearchScopeChange,
+  sizeFilter,
+  onSizeFilterChange,
+  hasCurrentFolder,
+  currentFolderName,
+  onResetSearchFilters,
   clipboardCount,
   onPasteItems,
   onClearClipboard,
@@ -62,12 +87,15 @@ export function Toolbar({
 }: ToolbarProps) {
   const isTrash = section === 'trash';
   const [dragOverCrumbKey, setDragOverCrumbKey] = useState<string | null>(null);
+  const isSearching = Boolean(searchQuery.trim());
+  const hasActiveSearchFilters =
+    typeFilter !== 'all' || sizeFilter !== 'all' || searchScope !== 'all';
 
   return (
-    <div className="flex flex-col gap-3 border-b border-slate-200 bg-white px-4 py-3 sm:px-6 dark:border-slate-800 dark:bg-slate-900">
+    <div className="flex flex-col gap-2.5 border-b border-slate-200 bg-white px-4 py-3 sm:px-6 dark:border-slate-800 dark:bg-slate-900">
       <div className="flex flex-wrap items-center justify-between gap-3">
         {/* Breadcrumbs or Section Title */}
-        {searchQuery.trim() ? (
+        {isSearching ? (
           <h1 className="min-w-0 break-words font-display text-base font-semibold text-slate-900 sm:text-lg dark:text-slate-100">
             Hasil pencarian: <span className="break-all text-blue-600 dark:text-blue-400">{searchQuery}</span>
           </h1>
@@ -144,7 +172,7 @@ export function Toolbar({
           </h1>
         )}
 
-        {/* Paste & Sort Controls (Zero Bulk Selection Clutter Above Preview) */}
+        {/* Paste, Filter & Sort Controls */}
         <div className="flex flex-wrap items-center gap-2">
           {/* Paste Action when clipboard has copied items */}
           {clipboardCount > 0 && !isTrash && (
@@ -168,6 +196,30 @@ export function Toolbar({
               </div>
             )}
 
+            {/* Type Filter */}
+            <label htmlFor="type-filter-select" className="sr-only">
+              Filter tipe file
+            </label>
+            <select
+              id="type-filter-select"
+              value={typeFilter}
+              onChange={(e) => onTypeFilterChange(e.target.value as TypeFilter)}
+              className={`h-8 rounded-lg border px-2 text-xs font-medium focus:outline-none ${
+                typeFilter !== 'all'
+                  ? 'border-blue-300 bg-blue-50/70 text-blue-700 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-300'
+                  : 'border-slate-200 bg-white text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200'
+              }`}
+            >
+              <option value="all" className="dark:bg-slate-900">Semua Tipe</option>
+              <option value="folder" className="dark:bg-slate-900">Folder</option>
+              <option value="document" className="dark:bg-slate-900">Dokumen</option>
+              <option value="image" className="dark:bg-slate-900">Foto</option>
+              <option value="video" className="dark:bg-slate-900">Video</option>
+              <option value="audio" className="dark:bg-slate-900">Musik</option>
+              <option value="archive" className="dark:bg-slate-900">Arsip</option>
+              <option value="other" className="dark:bg-slate-900">Lainnya</option>
+            </select>
+
             {/* Sort Control */}
             <div className="flex items-center rounded-lg border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-800">
               <label htmlFor="sort-field-select" className="sr-only">
@@ -182,6 +234,7 @@ export function Toolbar({
                 <option value="name" className="dark:bg-slate-900">Nama</option>
                 <option value="updatedAt" className="dark:bg-slate-900">Diubah</option>
                 <option value="size" className="dark:bg-slate-900">Ukuran</option>
+                <option value="type" className="dark:bg-slate-900">Tipe File</option>
               </select>
               <button
                 type="button"
@@ -217,6 +270,79 @@ export function Toolbar({
             )}
         </div>
       </div>
+
+      {/* Everything-style Advanced Search Filter Row (shown when actively searching) */}
+      {isSearching && (
+        <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 pt-2 dark:border-slate-800/80">
+          {hasCurrentFolder && (
+            <div
+              role="group"
+              aria-label="Cakupan pencarian"
+              className="flex items-center rounded-lg border border-slate-200 bg-slate-50 p-0.5 dark:border-slate-700 dark:bg-slate-800"
+            >
+              <button
+                type="button"
+                onClick={() => onSearchScopeChange('all')}
+                aria-pressed={searchScope === 'all'}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap ${
+                  searchScope === 'all'
+                    ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-slate-100'
+                    : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                }`}
+              >
+                Semua Drive
+              </button>
+              <button
+                type="button"
+                onClick={() => onSearchScopeChange('folder')}
+                aria-pressed={searchScope === 'folder'}
+                title={`Cari hanya di dalam folder ${currentFolderName || 'ini'} dan subfoldernya`}
+                className={`max-w-[180px] truncate rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                  searchScope === 'folder'
+                    ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-slate-100'
+                    : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                }`}
+              >
+                Folder: {currentFolderName || 'Ini'}
+              </button>
+            </div>
+          )}
+
+          <label htmlFor="size-filter-select" className="sr-only">
+            Filter ukuran file
+          </label>
+          <select
+            id="size-filter-select"
+            value={sizeFilter}
+            onChange={(e) => onSizeFilterChange(e.target.value as SearchSizeFilter)}
+            className={`h-7 rounded-lg border px-2 text-xs font-medium focus:outline-none ${
+              sizeFilter !== 'all'
+                ? 'border-blue-300 bg-blue-50/70 text-blue-700 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-300'
+                : 'border-slate-200 bg-white text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200'
+            }`}
+          >
+            <option value="all" className="dark:bg-slate-900">Semua Ukuran</option>
+            <option value="small" className="dark:bg-slate-900">&lt; 1 MB</option>
+            <option value="medium" className="dark:bg-slate-900">1–10 MB</option>
+            <option value="large" className="dark:bg-slate-900">&gt; 10 MB</option>
+          </select>
+
+          {hasActiveSearchFilters && onResetSearchFilters && (
+            <button
+              type="button"
+              onClick={onResetSearchFilters}
+              className="inline-flex h-7 items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+            >
+              <X className="h-3 w-3" />
+              <span>Reset Filter</span>
+            </button>
+          )}
+
+          <span className="ml-auto hidden text-[11px] text-slate-400 md:inline dark:text-slate-500">
+            Tip: ketik <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">ext:pdf</code> atau beberapa kata
+          </span>
+        </div>
+      )}
     </div>
   );
 }

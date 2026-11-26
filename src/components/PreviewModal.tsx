@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import type { DriveItem, TelegramConfigState } from '../types/drive';
 import {
@@ -9,7 +9,7 @@ import {
   isPdfFile,
   isTextPreviewable,
 } from '../utils/fileHelpers';
-import { DIRECT_TELEGRAM_MAX_BYTES } from '../utils/telegramDirect';
+import { DIRECT_TELEGRAM_MAX_BYTES, normalizeCorsProxyUrl } from '../utils/telegramDirect';
 import {
   PreviewCorsBlockedError,
   resolveItemArrayBuffer,
@@ -25,6 +25,7 @@ interface PreviewModalProps {
   tgConfig: TelegramConfigState;
   onClose: () => void;
   onOpenTelegramSettings?: () => void;
+  onHydrateStub?: (item: DriveItem) => void;
 }
 
 export function PreviewModal({
@@ -32,8 +33,10 @@ export function PreviewModal({
   tgConfig,
   onClose,
   onOpenTelegramSettings,
+  onHydrateStub,
 }: PreviewModalProps) {
   const [mediaUrl, setMediaUrl] = useState<string | null>(null);
+  const [mediaLoading, setMediaLoading] = useState(false);
   const [textContent, setTextContent] = useState<string | null>(null);
   const [textLoading, setTextLoading] = useState(false);
   const [officeBuffer, setOfficeBuffer] = useState<ArrayBuffer | null>(null);
@@ -42,14 +45,19 @@ export function PreviewModal({
   const [pdfLoading, setPdfLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [corsBlocked, setCorsBlocked] = useState(false);
+  const onHydrateStubRef = useRef(onHydrateStub);
+  onHydrateStubRef.current = onHydrateStub;
 
   useEffect(() => {
     if (!item) return;
     let active = true;
     let revokeUrl: string | null = null;
+    let stubTimer: number | null = null;
 
     setMediaUrl(null);
+    setMediaLoading(false);
     setTextContent(null);
+    setTextLoading(false);
     setOfficeBuffer(null);
     setOfficeLoading(false);
     setPdfBuffer(null);
@@ -58,6 +66,27 @@ export function PreviewModal({
     setCorsBlocked(false);
 
     const loadPreview = async () => {
+      if (item.isCatalogStub) {
+        onHydrateStubRef.current?.(item);
+        const category = getFileCategory(item.mimeType, item.name);
+        if (isPdfFile(item.mimeType, item.name)) setPdfLoading(true);
+        else if (getOfficePreviewType(item.mimeType, item.name)) setOfficeLoading(true);
+        else if (isTextPreviewable(item.mimeType, item.name)) setTextLoading(true);
+        else if (category === 'image' || category === 'video' || category === 'audio') {
+          setMediaLoading(true);
+        }
+        stubTimer = window.setTimeout(() => {
+          if (!active) return;
+          setPdfLoading(false);
+          setOfficeLoading(false);
+          setTextLoading(false);
+          setMediaLoading(false);
+          setPreviewError(
+            'Metadata file belum termuat dari Telegram. Pastikan Proxy Cloudflare Worker aktif dan coba Sinkronkan ulang.',
+          );
+        }, 12000);
+        return;
+      }
       if (isPdfFile(item.mimeType, item.name)) {
         setPdfLoading(true);
         try {
@@ -109,24 +138,31 @@ export function PreviewModal({
         return;
       }
 
-      try {
-        const resolved = await resolveItemPlayableUrl(item, tgConfig);
-        if (resolved && active) {
-          if (resolved.isObjectUrl) revokeUrl = resolved.url;
-          setMediaUrl(resolved.url);
-        }
-      } catch (err) {
-        if (active) {
-          setCorsBlocked(err instanceof PreviewCorsBlockedError);
-          setPreviewError(err instanceof Error ? err.message : 'Gagal memuat pratinjau file.');
+      const cat = getFileCategory(item.mimeType, item.name);
+      if (cat === 'image' || cat === 'video' || cat === 'audio') {
+        setMediaLoading(true);
+        try {
+          const resolved = await resolveItemPlayableUrl(item, tgConfig);
+          if (resolved && active) {
+            if (resolved.isObjectUrl) revokeUrl = resolved.url;
+            setMediaUrl(resolved.url);
+          }
+        } catch (err) {
+          if (active) {
+            setCorsBlocked(err instanceof PreviewCorsBlockedError);
+            setPreviewError(err instanceof Error ? err.message : 'Gagal memuat pratinjau file.');
+          }
+        } finally {
+          if (active) setMediaLoading(false);
         }
       }
     };
 
-    loadPreview();
+    void loadPreview();
 
     return () => {
       active = false;
+      if (stubTimer !== null) window.clearTimeout(stubTimer);
       if (revokeUrl) {
         const urlToRevoke = revokeUrl;
         window.setTimeout(() => URL.revokeObjectURL(urlToRevoke), 600);
@@ -180,29 +216,65 @@ export function PreviewModal({
 
         {/* Preview Content Surface */}
         <div className="flex-1 overflow-auto bg-slate-100 p-4 sm:p-6 dark:bg-slate-950">
-          {category === 'image' && mediaUrl ? (
+          {mediaLoading ? (
+            <div className="flex min-h-[280px] flex-col items-center justify-center gap-2 text-center">
+              <div className="h-6 w-6 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" />
+              <p className="text-xs text-slate-500 dark:text-slate-400">Memuat pratinjau...</p>
+            </div>
+          ) : category === 'image' && mediaUrl && !previewError ? (
             <div className="flex min-h-[300px] items-center justify-center">
               <img
                 src={mediaUrl}
                 alt={item.name}
                 referrerPolicy="no-referrer"
+                onError={() => {
+                  const hasProxy = Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl));
+                  setCorsBlocked(!hasProxy);
+                  setPreviewError(
+                    hasProxy
+                      ? 'Gagal memuat gambar melalui proxy. Periksa URL Cloudflare Worker atau koneksi Telegram.'
+                      : 'Gambar tidak dapat dimuat langsung oleh browser. Aktifkan Proxy Cloudflare Worker di Pengaturan Telegram.',
+                  );
+                }}
                 className="max-h-[60vh] rounded-lg object-contain shadow-sm"
               />
             </div>
-          ) : category === 'video' && mediaUrl ? (
+          ) : category === 'video' && mediaUrl && !previewError ? (
             <div className="flex items-center justify-center">
               <video
                 src={mediaUrl}
                 controls
                 preload="metadata"
+                onError={() => {
+                  const hasProxy = Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl));
+                  setCorsBlocked(!hasProxy);
+                  setPreviewError(
+                    hasProxy
+                      ? 'Gagal memutar video melalui proxy Telegram.'
+                      : 'Video tidak dapat dimuat langsung oleh browser. Aktifkan Proxy Cloudflare Worker di Pengaturan Telegram.',
+                  );
+                }}
                 className="max-h-[60vh] w-full rounded-lg bg-black"
               />
             </div>
-          ) : category === 'audio' && mediaUrl ? (
+          ) : category === 'audio' && mediaUrl && !previewError ? (
             <div className="mx-auto flex max-w-md flex-col items-center gap-4 rounded-xl border border-slate-200 bg-white p-8 dark:border-slate-800 dark:bg-slate-900">
               <FileIcon type="file" mimeType={item.mimeType} filename={item.name} size="lg" />
               <p className="text-sm font-medium text-slate-800 dark:text-slate-200">{item.name}</p>
-              <audio src={mediaUrl} controls className="w-full" />
+              <audio
+                src={mediaUrl}
+                controls
+                onError={() => {
+                  const hasProxy = Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl));
+                  setCorsBlocked(!hasProxy);
+                  setPreviewError(
+                    hasProxy
+                      ? 'Gagal memutar audio melalui proxy Telegram.'
+                      : 'Audio tidak dapat dimuat langsung oleh browser. Aktifkan Proxy Cloudflare Worker di Pengaturan Telegram.',
+                  );
+                }}
+                className="w-full"
+              />
             </div>
           ) : officeType && officeType !== 'legacy-office' && (officeLoading || officeBuffer) ? (
             <div className="h-[62vh]">

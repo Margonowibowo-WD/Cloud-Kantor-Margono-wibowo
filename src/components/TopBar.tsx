@@ -157,7 +157,7 @@ export function TopBar({
                 e.currentTarget.blur();
               }
             }}
-            placeholder="Cari file atau folder..."
+            placeholder="Cari file, folder, atau ext:pdf..."
             aria-label="Cari file atau folder"
             className="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 pl-9 pr-10 text-base text-slate-900 placeholder:text-slate-400 transition-colors focus:border-blue-500 focus:bg-white focus:outline-none sm:text-sm dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-blue-500 dark:focus:bg-slate-800"
           />

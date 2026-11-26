@@ -5,6 +5,7 @@ import {
   Copy,
   Download,
   Eye,
+  FolderInput,
   FolderPlus,
   Pencil,
   RotateCcw,
@@ -29,6 +30,7 @@ interface ContextMenuProps {
   onOpenItem: (item: DriveItem) => void;
   onDownloadItems: (items: DriveItem[]) => void;
   onCopyItems: (items: DriveItem[]) => void;
+  onMoveItems: (items: DriveItem[]) => void;
   onRenameItem: (item: DriveItem) => void;
   onToggleStarItems: (items: DriveItem[]) => void;
   onTrashItems: (items: DriveItem[]) => void;
@@ -49,6 +51,7 @@ export function ContextMenu({
   onOpenItem,
   onDownloadItems,
   onCopyItems,
+  onMoveItems,
   onRenameItem,
   onToggleStarItems,
   onTrashItems,
@@ -116,10 +119,13 @@ export function ContextMenu({
                   onClose();
                   onOpenItem(singleItem);
                 }}
-                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+                className="flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
               >
-                <Eye className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
-                <span>{singleItem.type === 'folder' ? 'Buka Folder' : 'Pratinjau'}</span>
+                <span className="flex items-center gap-2.5">
+                  <Eye className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
+                  <span>{singleItem.type === 'folder' ? 'Buka Folder' : 'Pratinjau'}</span>
+                </span>
+                <span className="font-mono text-[10px] text-slate-400">Enter</span>
               </button>
             )}
             {downloadableFiles.length > 0 && (
@@ -145,6 +151,22 @@ export function ContextMenu({
               role="menuitem"
               onClick={() => {
                 onClose();
+                onMoveItems(effectiveItems);
+              }}
+              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              <FolderInput className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
+              <span>
+                {effectiveItems.length > 1
+                  ? `Pindah ke... (${effectiveItems.length})`
+                  : 'Pindah ke...'}
+              </span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                onClose();
                 onCopyItems(effectiveItems);
               }}
               className="flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
@@ -163,10 +185,13 @@ export function ContextMenu({
                   onClose();
                   onRenameItem(singleItem);
                 }}
-                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+                className="flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
               >
-                <Pencil className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
-                <span>Ubah Nama</span>
+                <span className="flex items-center gap-2.5">
+                  <Pencil className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
+                  <span>Ubah Nama</span>
+                </span>
+                <span className="font-mono text-[10px] text-slate-400">F2</span>
               </button>
             )}
             <button
@@ -208,14 +233,17 @@ export function ContextMenu({
                 onClose();
                 onTrashItems(effectiveItems);
               }}
-              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/50"
+              className="flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/50"
             >
-              <Trash2 className="h-3.5 w-3.5" />
-              <span>
-                {effectiveItems.length > 1
-                  ? `Hapus (${effectiveItems.length} item)`
-                  : 'Hapus'}
+              <span className="flex items-center gap-2.5">
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>
+                  {effectiveItems.length > 1
+                    ? `Hapus (${effectiveItems.length} item)`
+                    : 'Hapus'}
+                </span>
               </span>
+              <span className="font-mono text-[10px] opacity-75">Del</span>
             </button>
           </>
         ) : (

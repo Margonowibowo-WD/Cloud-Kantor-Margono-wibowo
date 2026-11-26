@@ -1,7 +1,9 @@
-import type { DriveItem } from '../types/drive';
+import type { DriveItem, StorageSummary } from '../types/drive';
+import { getFileCategory, resolveMimeTypeForFilename } from './fileHelpers';
 
 const INDEX_HEADER = 'TELEDRIVE_IDX_V1:';
 export const INDEX_V3_HEADER = 'TELEDRIVE_IDX_V3:';
+export const INDEX_V4_HEADER = 'TELEDRIVE_IDX_V4:';
 export const INDEX_SHARD_V3_HEADER = 'TELEDRIVE_SHARD_V3:';
 const MAX_TELEGRAM_TEXT_LENGTH = 4000;
 
@@ -12,7 +14,7 @@ export interface TelegramShardRef {
 
 export interface CloudViewPrefs {
   v?: 'grid' | 'list';
-  sf?: 'name' | 'updatedAt' | 'size';
+  sf?: 'name' | 'updatedAt' | 'size' | 'type';
   sd?: 'asc' | 'desc';
   px?: string;
   u?: string;
@@ -96,6 +98,9 @@ interface CompactDriveRecord {
   fid?: string; // telegramFileId
   uid?: string; // telegramUniqueId
   mid?: number; // telegramMessageId
+  fm?: number; // folder doc message_id
+  ff?: string; // folder doc file_id
+  fh?: string; // folder doc hash
 }
 
 interface TelegramDocumentIndexPayload {
@@ -105,7 +110,7 @@ interface TelegramDocumentIndexPayload {
   tombstones?: Record<string, string>;
 }
 
-function toCompactRecord(item: DriveItem): CompactDriveRecord {
+export function toCompactRecord(item: DriveItem): CompactDriveRecord {
   const rec: CompactDriveRecord = {
     i: item.id,
     n: item.name,
@@ -121,10 +126,15 @@ function toCompactRecord(item: DriveItem): CompactDriveRecord {
   if (firstChunk?.telegramFileId) rec.fid = firstChunk.telegramFileId;
   if (firstChunk?.telegramUniqueId) rec.uid = firstChunk.telegramUniqueId;
   if (firstChunk?.telegramMessageId) rec.mid = firstChunk.telegramMessageId;
+  if (item.type === 'folder' && item.folderIdx?.mid) {
+    rec.fm = item.folderIdx.mid;
+    rec.ff = item.folderIdx.fid;
+    rec.fh = item.folderIdx.h;
+  }
   return rec;
 }
 
-function fromCompactRecord(rec: CompactDriveRecord): DriveItem {
+export function fromCompactRecord(rec: CompactDriveRecord): DriveItem {
   const isFolder = rec.t === 'd';
   const hasTg = Boolean(rec.fid);
   return {
@@ -150,6 +160,15 @@ function fromCompactRecord(rec: CompactDriveRecord): DriveItem {
           },
         ]
       : [],
+    ...(isFolder && rec.fm
+      ? {
+          folderIdx: {
+            mid: rec.fm,
+            fid: rec.ff || '',
+            h: rec.fh || '',
+          },
+        }
+      : {}),
   };
 }
 
@@ -282,14 +301,36 @@ export function mergeDriveItems(localItems: DriveItem[], remoteItems: DriveItem[
 
     const remoteTime = Date.parse(remote.updatedAt) || 0;
     const localTime = Date.parse(existing.updatedAt) || 0;
+
     if (remoteTime > localTime) {
+      const keepExistingChunks = Boolean(
+        remote.isCatalogStub && !existing.isCatalogStub && existing.chunks.length > 0,
+      );
       byId.set(remote.id, {
         ...existing,
         ...remote,
+        chunks: keepExistingChunks ? existing.chunks : remote.chunks,
+        isCatalogStub: keepExistingChunks ? false : remote.isCatalogStub,
+        folderIdx: remote.folderIdx ?? existing.folderIdx,
         localBlobKey: existing.localBlobKey,
         thumbnailUrl: existing.thumbnailUrl,
         demoTextContent: existing.demoTextContent,
       });
+    } else if (remoteTime === localTime) {
+      const upgradeFromStub = Boolean(existing.isCatalogStub && !remote.isCatalogStub);
+      const upgradeFolderIdx = Boolean(
+        remote.folderIdx && (!existing.folderIdx || existing.folderIdx.h !== remote.folderIdx.h),
+      );
+      if (upgradeFromStub || upgradeFolderIdx) {
+        byId.set(remote.id, {
+          ...existing,
+          ...(upgradeFromStub ? remote : {}),
+          folderIdx: remote.folderIdx ?? existing.folderIdx,
+          localBlobKey: existing.localBlobKey,
+          thumbnailUrl: existing.thumbnailUrl,
+          demoTextContent: existing.demoTextContent,
+        });
+      }
     }
   }
 
@@ -618,4 +659,321 @@ export async function decodeTelegramV3Manifest(raw: string | undefined | null): 
   } catch {
     return { isV3: false, rev: '', items: [], tombstones: {}, shards: [] };
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* V4 Hybrid Architecture: Lazy Per-Folder Docs + Everything-style Catalog    */
+/* -------------------------------------------------------------------------- */
+
+export interface TelegramDocRef {
+  mid: number;
+  fid: string;
+  h: string;
+  cnt?: number;
+}
+
+export interface CatalogRecord {
+  i: string;
+  p: string | null;
+  n: string;
+  t: 'f' | 'd';
+  s: number;
+  u: number;
+  m?: string;
+  st?: 1;
+  tr?: 1;
+  fm?: number;
+  ff?: string;
+  fh?: string;
+}
+
+export interface TelegramV4FolderDocPayload {
+  v: 4;
+  folderId: string | null;
+  updatedAt: string;
+  items: CompactDriveRecord[];
+}
+
+export interface TelegramV4CatalogDocPayload {
+  v: 4;
+  vol: number;
+  updatedAt: string;
+  records: CatalogRecord[];
+}
+
+export interface TelegramV4DeltaDocPayload {
+  v: 4;
+  baseRev?: string;
+  updatedAt: string;
+  upserts: CatalogRecord[];
+  deletes: Record<string, string>;
+}
+
+export interface TelegramV4Manifest {
+  v: 4;
+  rev: string;
+  p?: CloudViewPrefs;
+  root?: TelegramDocRef;
+  cat?: TelegramDocRef[];
+  delta?: TelegramDocRef;
+  sum?: {
+    f: number;
+    d: number;
+    b: number;
+    tb: number;
+  };
+}
+
+export async function encodeGzipJson(data: unknown): Promise<{ bytes: Uint8Array; hash: string }> {
+  const json = JSON.stringify(data);
+  const hash = computeQuickHash(json);
+  if (typeof CompressionStream === 'undefined') {
+    return { bytes: new TextEncoder().encode(json), hash };
+  }
+  const stream = new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'));
+  const buf = await new Response(stream).arrayBuffer();
+  return { bytes: new Uint8Array(buf), hash };
+}
+
+export async function decodeGzipJson<T>(bytes: Uint8Array): Promise<T | null> {
+  try {
+    // Check gzip magic header 0x1f 0x8b
+    const isGzip = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+    let text: string;
+    if (isGzip && typeof DecompressionStream !== 'undefined') {
+      const copy = new Uint8Array(bytes.byteLength);
+      copy.set(bytes);
+      const stream = new Blob([copy.buffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+      text = await new Response(stream).text();
+    } else {
+      text = new TextDecoder().decode(bytes);
+    }
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function toCatalogRecord(item: DriveItem): CatalogRecord {
+  const updatedMs = Date.parse(item.updatedAt) || Date.now();
+  const inferredMime =
+    item.type === 'folder' ? undefined : resolveMimeTypeForFilename(item.name, item.mimeType);
+  const rec: CatalogRecord = {
+    i: item.id,
+    p: item.parentId ?? null,
+    n: item.name,
+    t: item.type === 'folder' ? 'd' : 'f',
+    s: item.type === 'folder' ? 0 : Number(item.size) || 0,
+    u: updatedMs,
+  };
+  if (inferredMime && inferredMime !== 'application/octet-stream') {
+    // Only store mimeType when extension doesn't already resolve it identically (keeps catalog super compact)
+    const extOnlyMime = resolveMimeTypeForFilename(item.name, '');
+    if (extOnlyMime !== inferredMime) {
+      rec.m = inferredMime;
+    }
+  }
+  if (item.starred) rec.st = 1;
+  if (item.trashed) rec.tr = 1;
+  if (item.type === 'folder' && item.folderIdx?.mid) {
+    rec.fm = item.folderIdx.mid;
+    rec.ff = item.folderIdx.fid;
+    rec.fh = item.folderIdx.h;
+  }
+  return rec;
+}
+
+export function fromCatalogRecordStub(rec: CatalogRecord): DriveItem {
+  const isFolder = rec.t === 'd';
+  const iso = new Date(Number(rec.u) || Date.now()).toISOString();
+  const mimeType = isFolder
+    ? 'inode/directory'
+    : resolveMimeTypeForFilename(rec.n, rec.m || '');
+  return {
+    id: rec.i,
+    name: rec.n,
+    type: isFolder ? 'folder' : 'file',
+    parentId: rec.p ?? null,
+    size: isFolder ? 0 : Number(rec.s) || 0,
+    mimeType,
+    starred: rec.st === 1,
+    trashed: rec.tr === 1,
+    createdAt: iso,
+    updatedAt: iso,
+    storageBackend: 'telegram',
+    chunks: [],
+    isCatalogStub: !isFolder,
+    ...(isFolder && rec.fm
+      ? {
+          folderIdx: {
+            mid: rec.fm,
+            fid: rec.ff || '',
+            h: rec.fh || '',
+          },
+        }
+      : {}),
+  };
+}
+
+export function applyDeltaToCatalog(
+  baseCatalog: CatalogRecord[],
+  baseTombstones: Record<string, string>,
+  delta?: TelegramV4DeltaDocPayload | null,
+): { catalog: CatalogRecord[]; tombstones: Record<string, string> } {
+  const tombstones = mergeTombstones(baseTombstones, delta?.deletes || {});
+  const byId = new Map<string, CatalogRecord>();
+  for (const rec of baseCatalog) {
+    byId.set(rec.i, rec);
+  }
+  if (delta?.upserts) {
+    for (const up of delta.upserts) {
+      const prev = byId.get(up.i);
+      if (!prev || up.u >= prev.u) {
+        byId.set(up.i, {
+          ...up,
+          fm: up.fm ?? prev?.fm,
+          ff: up.ff ?? prev?.ff,
+          fh: up.fh ?? prev?.fh,
+        });
+      }
+    }
+  }
+  const active: CatalogRecord[] = [];
+  for (const rec of byId.values()) {
+    const delIso = tombstones[rec.i];
+    if (delIso && (Date.parse(delIso) || 0) >= (rec.u || 0)) {
+      continue;
+    }
+    active.push(rec);
+  }
+  return { catalog: active, tombstones };
+}
+
+export function splitCatalogIntoVolumes(
+  records: CatalogRecord[],
+  maxApproxRawBytes = 6 * 1024 * 1024,
+): CatalogRecord[][] {
+  if (records.length === 0) return [[]];
+  const volumes: CatalogRecord[][] = [];
+  let current: CatalogRecord[] = [];
+  let approxBytes = 0;
+
+  for (const rec of records) {
+    const est = 48 + rec.n.length + (rec.ff?.length || 0);
+    if (current.length > 0 && approxBytes + est > maxApproxRawBytes) {
+      volumes.push(current);
+      current = [];
+      approxBytes = 0;
+    }
+    current.push(rec);
+    approxBytes += est;
+  }
+  if (current.length > 0) {
+    volumes.push(current);
+  }
+  return volumes;
+}
+
+export function computeCatalogStorageSummary(records: CatalogRecord[]): StorageSummary {
+  const categories = {
+    image: { bytes: 0, count: 0 },
+    video: { bytes: 0, count: 0 },
+    document: { bytes: 0, count: 0 },
+    audio: { bytes: 0, count: 0 },
+    other: { bytes: 0, count: 0 },
+  };
+  let activeBytes = 0;
+  let trashedBytes = 0;
+  let fileCount = 0;
+  let folderCount = 0;
+
+  for (const rec of records) {
+    if (rec.tr === 1) {
+      if (rec.t === 'f') trashedBytes += rec.s || 0;
+      continue;
+    }
+    if (rec.t === 'd') {
+      folderCount += 1;
+      continue;
+    }
+    fileCount += 1;
+    const size = rec.s || 0;
+    activeBytes += size;
+    const cat = getFileCategory(rec.m || '', rec.n);
+    if (cat === 'image') {
+      categories.image.bytes += size;
+      categories.image.count += 1;
+    } else if (cat === 'video') {
+      categories.video.bytes += size;
+      categories.video.count += 1;
+    } else if (cat === 'audio') {
+      categories.audio.bytes += size;
+      categories.audio.count += 1;
+    } else if (cat === 'document' || cat === 'code') {
+      categories.document.bytes += size;
+      categories.document.count += 1;
+    } else {
+      categories.other.bytes += size;
+      categories.other.count += 1;
+    }
+  }
+
+  return {
+    totalBytes: activeBytes + trashedBytes,
+    activeBytes,
+    trashedBytes,
+    fileCount,
+    folderCount,
+    telegramSyncedCount: fileCount,
+    telegramSyncedBytes: activeBytes,
+    categories,
+  };
+}
+
+export function extractV4RawLine(raw: string | undefined | null): string | null {
+  if (!raw) return null;
+  const idx = raw.indexOf(INDEX_V4_HEADER);
+  if (idx === -1) return null;
+  return raw.slice(idx).trim();
+}
+
+export function extractV4Manifest(raw: string | undefined | null): TelegramV4Manifest | null {
+  const line = extractV4RawLine(raw);
+  if (!line) return null;
+  try {
+    const parsed = JSON.parse(line.slice(INDEX_V4_HEADER.length)) as Partial<TelegramV4Manifest>;
+    if (parsed?.v !== 4 || typeof parsed.rev !== 'string') return null;
+    return parsed as TelegramV4Manifest;
+  } catch {
+    return null;
+  }
+}
+
+export function encodeTelegramV4ManifestText(manifest: TelegramV4Manifest): string {
+  return INDEX_V4_HEADER + JSON.stringify(manifest);
+}
+
+export function formatTelegramV4IndexHtml(
+  manifestText: string,
+  summary: { f: number; d: number; b: number; tb: number },
+): string {
+  const timeLabel = new Date().toLocaleString('id-ID', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  const quoteBlock = `<blockquote expandable>${escapeTelegramHtml(manifestText)}</blockquote>`;
+  const lines = [
+    '🗂 <b>TeleDrive Cloud — Indeks Utama V4</b>',
+    `📁 ${summary.d.toLocaleString('id-ID')} Folder • 📄 ${summary.f.toLocaleString('id-ID')} File (${formatCompactStorageSize(summary.b + summary.tb)}) • 🕒 ${escapeTelegramHtml(timeLabel)}`,
+    '<i>Indeks skala besar tersemat otomatis (jangan dihapus).</i>',
+    '',
+    quoteBlock,
+  ];
+  const full = lines.join('\n');
+  if (full.replace(/<[^>]+>/g, '').length <= 4080) {
+    return full;
+  }
+  return `🗂 <b>TeleDrive V4</b> (${summary.d}F · ${summary.f}B)\n${quoteBlock}`;
 }

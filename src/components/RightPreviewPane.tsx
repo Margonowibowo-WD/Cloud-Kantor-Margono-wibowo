@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Eye,
   FolderOpen,
@@ -15,7 +15,7 @@ import {
   isPdfFile,
   isTextPreviewable,
 } from '../utils/fileHelpers';
-import { DIRECT_TELEGRAM_MAX_BYTES } from '../utils/telegramDirect';
+import { DIRECT_TELEGRAM_MAX_BYTES, normalizeCorsProxyUrl } from '../utils/telegramDirect';
 import {
   PreviewCorsBlockedError,
   resolveItemArrayBuffer,
@@ -36,6 +36,7 @@ interface RightPreviewPaneProps {
   tgConfig: TelegramConfigState;
   onOpenFolder: (folder: DriveItem) => void;
   onOpenTelegramSettings?: () => void;
+  onHydrateStub?: (item: DriveItem) => void;
 }
 
 const MIN_WIDTH = 280;
@@ -51,6 +52,7 @@ export function RightPreviewPane({
   tgConfig,
   onOpenFolder,
   onOpenTelegramSettings,
+  onHydrateStub,
 }: RightPreviewPaneProps) {
   const [isDesktop, setIsDesktop] = useState<boolean>(
     () => typeof window === 'undefined' || window.matchMedia('(min-width: 1024px)').matches,
@@ -63,6 +65,8 @@ export function RightPreviewPane({
   const [pdfBuffer, setPdfBuffer] = useState<ArrayBuffer | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [corsBlocked, setCorsBlocked] = useState(false);
+  const onHydrateStubRef = useRef(onHydrateStub);
+  onHydrateStubRef.current = onHydrateStub;
 
   const singleItem = selectedItems.length === 1 ? selectedItems[0] : null;
   const singleFile = singleItem?.type === 'file' ? singleItem : null;
@@ -110,6 +114,7 @@ export function RightPreviewPane({
 
     let active = true;
     let revokeUrl: string | null = null;
+    let stubTimer: number | null = null;
 
     setMediaUrl(null);
     setTextContent(null);
@@ -119,6 +124,18 @@ export function RightPreviewPane({
     setCorsBlocked(false);
 
     const load = async () => {
+      if (singleFile.isCatalogStub) {
+        setLoading(true);
+        onHydrateStubRef.current?.(singleFile);
+        stubTimer = window.setTimeout(() => {
+          if (!active) return;
+          setLoading(false);
+          setPreviewError(
+            'Metadata file belum termuat dari Telegram. Pastikan Proxy Cloudflare Worker aktif dan coba Sinkronkan ulang.',
+          );
+        }, 12000);
+        return;
+      }
       if (singleFile.size > DIRECT_TELEGRAM_MAX_BYTES && !singleFile.localBlobKey) {
         return;
       }
@@ -199,6 +216,7 @@ export function RightPreviewPane({
 
     return () => {
       active = false;
+      if (stubTimer !== null) window.clearTimeout(stubTimer);
       if (revokeUrl) {
         const urlToRevoke = revokeUrl;
         window.setTimeout(() => URL.revokeObjectURL(urlToRevoke), 600);
@@ -279,10 +297,25 @@ export function RightPreviewPane({
     const pdfFile = isPdfFile(singleFile.mimeType, singleFile.name);
     const officeType = getOfficePreviewType(singleFile.mimeType, singleFile.name);
 
+    const isFullBleedDoc =
+      !loading &&
+      !previewError &&
+      Boolean(
+        (officeType && officeType !== 'legacy-office' && officeBuffer) ||
+          (pdfFile && pdfBuffer) ||
+          (isTextPreviewable(singleFile.mimeType, singleFile.name) && textContent !== null),
+      );
+
     return (
       <div className="flex min-h-0 flex-1 flex-col">
         {/* Live Preview Canvas */}
-        <div className="flex min-h-[240px] flex-1 items-center justify-center overflow-auto bg-slate-100 p-3 dark:bg-slate-950">
+        <div
+          className={`flex min-h-[240px] flex-1 bg-slate-100 p-3 dark:bg-slate-950 ${
+            isFullBleedDoc
+              ? 'flex-col overflow-hidden'
+              : 'items-center justify-center overflow-auto'
+          }`}
+        >
           {loading ? (
             <div className="flex flex-col items-center gap-2 text-center">
               <div className="h-6 w-6 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" />
@@ -296,21 +329,39 @@ export function RightPreviewPane({
             />
           ) : pdfFile && pdfBuffer ? (
             <PdfCanvasPreview buffer={pdfBuffer} filename={singleFile.name} />
-          ) : category === 'image' && mediaUrl ? (
+          ) : category === 'image' && mediaUrl && !previewError ? (
             <img
               src={mediaUrl}
               alt={singleFile.name}
               referrerPolicy="no-referrer"
+              onError={() => {
+                const hasProxy = Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl));
+                setCorsBlocked(!hasProxy);
+                setPreviewError(
+                  hasProxy
+                    ? 'Gagal memuat gambar melalui proxy. Periksa URL Cloudflare Worker atau koneksi Telegram.'
+                    : 'Gambar tidak dapat dimuat langsung oleh browser. Aktifkan Proxy Cloudflare Worker di Pengaturan Telegram.',
+                );
+              }}
               className="max-h-full max-w-full rounded-xl object-contain shadow-sm"
             />
-          ) : category === 'video' && mediaUrl ? (
+          ) : category === 'video' && mediaUrl && !previewError ? (
             <video
               src={mediaUrl}
               controls
               preload="metadata"
+              onError={() => {
+                const hasProxy = Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl));
+                setCorsBlocked(!hasProxy);
+                setPreviewError(
+                  hasProxy
+                    ? 'Gagal memutar video melalui proxy Telegram.'
+                    : 'Video tidak dapat dimuat langsung oleh browser. Aktifkan Proxy Cloudflare Worker di Pengaturan Telegram.',
+                );
+              }}
               className="max-h-full w-full rounded-xl bg-black"
             />
-          ) : category === 'audio' && mediaUrl ? (
+          ) : category === 'audio' && mediaUrl && !previewError ? (
             <div className="flex w-full max-w-xs flex-col items-center gap-4 rounded-2xl border border-slate-200 bg-white p-6 text-center shadow-xs dark:border-slate-800 dark:bg-slate-900">
               <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-50 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400">
                 <Music className="h-7 w-7" />
@@ -318,7 +369,20 @@ export function RightPreviewPane({
               <p className="w-full truncate text-xs font-semibold text-slate-800 dark:text-slate-200">
                 {singleFile.name}
               </p>
-              <audio src={mediaUrl} controls className="w-full" />
+              <audio
+                src={mediaUrl}
+                controls
+                onError={() => {
+                  const hasProxy = Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl));
+                  setCorsBlocked(!hasProxy);
+                  setPreviewError(
+                    hasProxy
+                      ? 'Gagal memutar audio melalui proxy Telegram.'
+                      : 'Audio tidak dapat dimuat langsung oleh browser. Aktifkan Proxy Cloudflare Worker di Pengaturan Telegram.',
+                  );
+                }}
+                className="w-full"
+              />
             </div>
           ) : isTextPreviewable(singleFile.mimeType, singleFile.name) && textContent !== null ? (
             <div className="h-full w-full overflow-auto rounded-xl border border-slate-200 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900">

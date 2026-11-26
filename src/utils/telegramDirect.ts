@@ -45,7 +45,7 @@ export interface DirectVerifyResult {
 
 const fileUrlCache = new Map<string, { url: string; expiresAt: number }>();
 
-function tgApi(botToken: string, method: string): string {
+export function tgApi(botToken: string, method: string): string {
   return `https://api.telegram.org/bot${botToken.trim()}/${method}`;
 }
 
@@ -603,7 +603,7 @@ function mergeNewerPrefs(local?: CloudViewPrefs, remote?: CloudViewPrefs): Cloud
   return px !== undefined ? { ...winner, px } : winner;
 }
 
-async function postBotTextMessage(
+export async function postBotTextMessage(
   botToken: string,
   chatId: string,
   text: string,
@@ -627,7 +627,7 @@ async function postBotTextMessage(
   }
 }
 
-async function editBotTextMessage(
+export async function editBotTextMessage(
   botToken: string,
   chatId: string,
   messageId: number,
@@ -945,20 +945,29 @@ export async function fetchChannelMediaUpdates(
       const isIndexText = Boolean(
         post.text?.includes('TELEDRIVE_IDX_V1:') ||
           post.text?.includes(INDEX_V3_HEADER) ||
+          post.text?.includes('TELEDRIVE_IDX_V4:') ||
           post.text?.includes(INDEX_SHARD_V3_HEADER),
       );
-      const isLegacyIndexDoc = Boolean(
+      const isIndexDoc = Boolean(
         post.caption?.startsWith(INDEX_DOCUMENT_CAPTION_PREFIX) ||
-          post.document?.file_name === INDEX_DOCUMENT_FILENAME,
+          post.caption?.includes('TELEDRIVE_V4_') ||
+          post.document?.file_name === INDEX_DOCUMENT_FILENAME ||
+          post.document?.file_name?.startsWith('teledrive-'),
       );
 
-      if (isIndexText || isLegacyIndexDoc) {
+      if (isIndexText || isIndexDoc) {
         if (activeIndexIds) {
           const isCurrentPinned =
             Boolean(activeIndexIds.pinnedMessageId) &&
             post.message_id === activeIndexIds.pinnedMessageId;
           const isCurrentShard = Boolean(activeIndexIds.shardIds?.has(post.message_id));
-          if (!isCurrentPinned && !isCurrentShard && (activeIndexIds.pinnedMessageId || isLegacyIndexDoc)) {
+          if (
+            !isCurrentPinned &&
+            !isCurrentShard &&
+            !post.caption?.includes('TELEDRIVE_V4_') &&
+            !post.document?.file_name?.startsWith('teledrive-') &&
+            (activeIndexIds.pinnedMessageId || post.document?.file_name === INDEX_DOCUMENT_FILENAME)
+          ) {
             void deleteTelegramMessageDirect(token, targetChat, post.message_id);
           }
         }
@@ -1222,3 +1231,16 @@ export async function pullIndexFromTelegramPinnedMessage(
     rawLength: rawText.length,
   };
 }
+
+export function buildTelegramMessageUrl(chatId: string, messageId: number): string | null {
+  const cleanChat = chatId.trim();
+  if (!cleanChat || !Number.isFinite(messageId) || messageId <= 0) return null;
+  if (cleanChat.startsWith('-100') && cleanChat.length > 4) {
+    return `https://t.me/c/${cleanChat.slice(4)}/${messageId}`;
+  }
+  if (cleanChat.startsWith('@') && cleanChat.length > 1) {
+    return `https://t.me/${cleanChat.slice(1)}/${messageId}`;
+  }
+  return null;
+}
+
