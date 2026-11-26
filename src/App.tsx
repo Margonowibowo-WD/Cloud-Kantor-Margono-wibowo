@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FolderPlus, Loader2, Trash2, UploadCloud } from 'lucide-react';
+import { FolderPlus, Trash2, UploadCloud } from 'lucide-react';
 import type {
   DriveItem,
   NavSection,
@@ -160,7 +160,6 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const [renderLimit, setRenderLimit] = useState(100);
-  const [loadingFolderId, setLoadingFolderId] = useState<string | null>(null);
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
   const [searchScope, setSearchScope] = useState<SearchScope>('all');
   const [sizeFilter, setSizeFilter] = useState<SearchSizeFilter>('all');
@@ -488,7 +487,6 @@ export default function App() {
           );
           if (revMatches && !hasStubChildren) continue;
 
-          setLoadingFolderId(fId);
           try {
             const children = await loadFolderChildrenV4(
               cfg.botToken,
@@ -514,8 +512,6 @@ export default function App() {
               title: `Gagal memuat isi folder ${folderObj.name}`,
               detail: err instanceof Error ? err.message : 'Periksa koneksi atau Proxy Cloudflare Worker.',
             });
-          } finally {
-            setLoadingFolderId((curr) => (curr === fId ? null : curr));
           }
         }
       })();
@@ -2783,13 +2779,6 @@ export default function App() {
                   <Trash2 className="h-3.5 w-3.5" />
                   <span>Kosongkan Sampah</span>
                 </button>
-              </div>
-            )}
-
-            {loadingFolderId && loadingFolderId === currentFolderId && (
-              <div className="mb-3 flex items-center gap-2 rounded-xl border border-blue-200/80 bg-blue-50/80 px-3.5 py-2 text-xs text-blue-700 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-300">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                <span>Memuat isi folder dari indeks Telegram...</span>
               </div>
             )}
 
