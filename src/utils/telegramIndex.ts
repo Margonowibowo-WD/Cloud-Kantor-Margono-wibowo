@@ -85,6 +85,13 @@ export function computeQuickHash(input: string): string {
   return (hash >>> 0).toString(36);
 }
 
+interface CompactChunkRecord {
+  s: number; // size
+  fid?: string; // telegramFileId
+  uid?: string; // telegramUniqueId
+  mid?: number; // telegramMessageId
+}
+
 interface CompactDriveRecord {
   i: string; // id
   n: string; // name
@@ -95,9 +102,10 @@ interface CompactDriveRecord {
   st?: 1; // starred
   tr?: 1; // trashed
   u: string; // updatedAt
-  fid?: string; // telegramFileId
-  uid?: string; // telegramUniqueId
-  mid?: number; // telegramMessageId
+  fid?: string; // telegramFileId (chunk 0)
+  uid?: string; // telegramUniqueId (chunk 0)
+  mid?: number; // telegramMessageId (chunk 0)
+  cs?: CompactChunkRecord[]; // all chunks when file > 20 MB (multi-chunk)
   fm?: number; // folder doc message_id
   ff?: string; // folder doc file_id
   fh?: string; // folder doc hash
@@ -126,6 +134,17 @@ export function toCompactRecord(item: DriveItem): CompactDriveRecord {
   if (firstChunk?.telegramFileId) rec.fid = firstChunk.telegramFileId;
   if (firstChunk?.telegramUniqueId) rec.uid = firstChunk.telegramUniqueId;
   if (firstChunk?.telegramMessageId) rec.mid = firstChunk.telegramMessageId;
+  if (item.chunks && item.chunks.length > 1) {
+    rec.cs = [...item.chunks]
+      .sort((a, b) => a.index - b.index)
+      .map((c) => {
+        const chunkRec: CompactChunkRecord = { s: Number(c.size) || 0 };
+        if (c.telegramFileId) chunkRec.fid = c.telegramFileId;
+        if (c.telegramUniqueId) chunkRec.uid = c.telegramUniqueId;
+        if (c.telegramMessageId) chunkRec.mid = c.telegramMessageId;
+        return chunkRec;
+      });
+  }
   if (item.type === 'folder' && item.folderIdx?.mid) {
     rec.fm = item.folderIdx.mid;
     rec.ff = item.folderIdx.fid;
@@ -136,7 +155,19 @@ export function toCompactRecord(item: DriveItem): CompactDriveRecord {
 
 export function fromCompactRecord(rec: CompactDriveRecord): DriveItem {
   const isFolder = rec.t === 'd';
-  const hasTg = Boolean(rec.fid || rec.mid);
+  const multiChunks =
+    Array.isArray(rec.cs) && rec.cs.length > 0
+      ? rec.cs.map((c, idx) => ({
+          index: idx,
+          size: Number(c.s) || 0,
+          telegramFileId: c.fid,
+          telegramUniqueId: c.uid,
+          telegramMessageId: c.mid,
+        }))
+      : null;
+  const hasTg = Boolean(
+    rec.fid || rec.mid || (multiChunks && multiChunks.some((c) => c.telegramFileId || c.telegramMessageId)),
+  );
   return {
     id: rec.i,
     name: rec.n,
@@ -149,17 +180,19 @@ export function fromCompactRecord(rec: CompactDriveRecord): DriveItem {
     createdAt: rec.u,
     updatedAt: rec.u,
     storageBackend: hasTg || isFolder ? 'telegram' : 'local',
-    chunks: hasTg
-      ? [
-          {
-            index: 0,
-            size: Number(rec.s) || 0,
-            telegramFileId: rec.fid,
-            telegramUniqueId: rec.uid,
-            telegramMessageId: rec.mid,
-          },
-        ]
-      : [],
+    chunks: multiChunks
+      ? multiChunks
+      : hasTg
+        ? [
+            {
+              index: 0,
+              size: Number(rec.s) || 0,
+              telegramFileId: rec.fid,
+              telegramUniqueId: rec.uid,
+              telegramMessageId: rec.mid,
+            },
+          ]
+        : [],
     ...(isFolder && rec.fm
       ? {
           folderIdx: {

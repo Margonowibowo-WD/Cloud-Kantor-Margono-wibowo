@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  Download,
   Eye,
+  FileArchive,
   FolderOpen,
   GripVertical,
   Music,
@@ -16,7 +18,11 @@ import {
   isTextPreviewable,
 } from '../utils/fileHelpers';
 import { hasLocalBlob } from '../utils/localVault';
-import { DIRECT_TELEGRAM_MAX_BYTES, normalizeCorsProxyUrl } from '../utils/telegramDirect';
+import {
+  DIRECT_TELEGRAM_MAX_BYTES,
+  MAX_LARGE_PREVIEW_BYTES,
+  normalizeCorsProxyUrl,
+} from '../utils/telegramDirect';
 import {
   PreviewCorsBlockedError,
   resolveItemArrayBuffer,
@@ -38,6 +44,8 @@ interface RightPreviewPaneProps {
   onOpenFolder: (folder: DriveItem) => void;
   onOpenTelegramSettings?: () => void;
   onHydrateStub?: (item: DriveItem) => Promise<boolean> | void;
+  onDownloadItem?: (item: DriveItem) => void;
+  onDownloadZip?: (items: DriveItem[]) => void;
 }
 
 const MIN_WIDTH = 280;
@@ -54,6 +62,8 @@ export function RightPreviewPane({
   onOpenFolder,
   onOpenTelegramSettings,
   onHydrateStub,
+  onDownloadItem,
+  onDownloadZip,
 }: RightPreviewPaneProps) {
   const [isDesktop, setIsDesktop] = useState<boolean>(
     () => typeof window === 'undefined' || window.matchMedia('(min-width: 1024px)').matches,
@@ -66,6 +76,8 @@ export function RightPreviewPane({
   const [pdfBuffer, setPdfBuffer] = useState<ArrayBuffer | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [corsBlocked, setCorsBlocked] = useState(false);
+  const [largeAuthId, setLargeAuthId] = useState<string | null>(null);
+  const [requiresLargeAuth, setRequiresLargeAuth] = useState(false);
   const onHydrateStubRef = useRef(onHydrateStub);
   onHydrateStubRef.current = onHydrateStub;
 
@@ -78,8 +90,10 @@ export function RightPreviewPane({
   const lastPreviewIdRef = useRef<string | null>(null);
 
   const firstChunk = singleFile?.chunks?.[0];
+  const chunkCount = singleFile?.chunks?.length || 0;
+  const isLargeAuthorized = Boolean(singleFile && largeAuthId === singleFile.id);
   const singleFileKey = singleFile
-    ? `${singleFile.id}|${singleFile.isCatalogStub ? 'stub' : 'full'}|${singleFile.name}|${singleFile.mimeType}|${singleFile.size}|${singleFile.localBlobKey || ''}|${firstChunk?.telegramFileId || ''}|${firstChunk?.telegramMessageId || ''}|${singleFile.demoTextContent !== undefined ? 'demo' : ''}`
+    ? `${singleFile.id}|${singleFile.isCatalogStub ? 'stub' : 'full'}|${chunkCount}|${isLargeAuthorized ? 'auth' : 'noauth'}|${singleFile.name}|${singleFile.mimeType}|${singleFile.size}|${singleFile.localBlobKey || ''}|${firstChunk?.telegramFileId || ''}|${firstChunk?.telegramMessageId || ''}|${singleFile.demoTextContent !== undefined ? 'demo' : ''}`
     : '';
   const tgKey = `${tgConfig.connected ? 1 : 0}|${tgConfig.botToken}|${tgConfig.chatId}|${tgConfig.corsProxyUrl || ''}`;
 
@@ -123,6 +137,7 @@ export function RightPreviewPane({
       setPdfBuffer(null);
       setPreviewError(null);
       setCorsBlocked(false);
+      setRequiresLargeAuth(false);
       setLoading(false);
       return;
     }
@@ -137,43 +152,51 @@ export function RightPreviewPane({
       setTextContent(null);
       setOfficeBuffer(null);
       setPdfBuffer(null);
+      setLargeAuthId(null);
     }
     setLoading(false);
     setPreviewError(null);
     setCorsBlocked(false);
+    setRequiresLargeAuth(false);
 
     const load = async () => {
-      if (target.isCatalogStub) {
-        const hasCached = await hasLocalBlob(target.localBlobKey || `blob-${target.id}`);
-        if (!active) return;
-        if (!hasCached) {
-          setLoading(true);
-          stubTimer = window.setTimeout(() => {
-            if (!active) return;
+      const hasCached = await hasLocalBlob(target.localBlobKey || `blob-${target.id}`);
+      if (!active) return;
+
+      if (target.isCatalogStub && !hasCached) {
+        setLoading(true);
+        stubTimer = window.setTimeout(() => {
+          if (!active) return;
+          setLoading(false);
+          setPreviewError(
+            'Metadata file belum termuat dari Telegram. Pastikan Proxy Cloudflare Worker aktif dan coba Sinkronkan ulang.',
+          );
+        }, 15000);
+        try {
+          const hydrated = await onHydrateStubRef.current?.(target);
+          if (!active) return;
+          if (hydrated === false) {
+            if (stubTimer !== null) window.clearTimeout(stubTimer);
             setLoading(false);
             setPreviewError(
-              'Metadata file belum termuat dari Telegram. Pastikan Proxy Cloudflare Worker aktif dan coba Sinkronkan ulang.',
+              typeof navigator !== 'undefined' && navigator.onLine === false
+                ? 'Perangkat sedang offline dan file ini belum disimpan ke cache offline.'
+                : 'Metadata file belum ditemukan di folder Telegram. Coba Sinkronkan ulang atau aktifkan Proxy Cloudflare Worker.',
             );
-          }, 15000);
-          try {
-            const hydrated = await onHydrateStubRef.current?.(target);
-            if (!active) return;
-            if (hydrated === false) {
-              if (stubTimer !== null) window.clearTimeout(stubTimer);
-              setLoading(false);
-              setPreviewError(
-                typeof navigator !== 'undefined' && navigator.onLine === false
-                  ? 'Perangkat sedang offline dan file ini belum disimpan ke cache offline.'
-                  : 'Metadata file belum ditemukan di folder Telegram. Coba Sinkronkan ulang atau aktifkan Proxy Cloudflare Worker.',
-              );
-            }
-          } catch {
-            // safety timer handles unexpected failures
           }
-          return;
+        } catch {
+          // safety timer handles unexpected failures
         }
+        return;
       }
-      if (target.size > DIRECT_TELEGRAM_MAX_BYTES && !target.localBlobKey) {
+
+      const isMultiChunkRemote = (target.chunks?.length || 0) > 1 && !hasCached;
+      if (isMultiChunkRemote && largeAuthId !== target.id) {
+        setRequiresLargeAuth(true);
+        return;
+      }
+
+      if (target.size > DIRECT_TELEGRAM_MAX_BYTES && (target.chunks?.length || 0) <= 1 && !hasCached) {
         return;
       }
 
@@ -259,7 +282,7 @@ export function RightPreviewPane({
         window.setTimeout(() => URL.revokeObjectURL(urlToRevoke), 600);
       }
     };
-  }, [open, singleFileKey, tgKey]);
+  }, [open, singleFileKey, tgKey, largeAuthId]);
 
   if (!open) return null;
 
@@ -296,6 +319,16 @@ export function RightPreviewPane({
               {folderCount > 0 && fileCount > 0 ? ' · ' : ''}
               {fileCount > 0 ? `${fileCount} file (${formatBytes(totalSize)})` : ''}
             </p>
+            {onDownloadZip && (
+              <button
+                type="button"
+                onClick={() => onDownloadZip(selectedItems)}
+                className="td-press mt-4 inline-flex h-9 items-center gap-2 rounded-xl bg-blue-600 px-4 text-xs font-semibold text-white hover:bg-blue-700"
+              >
+                <FileArchive className="h-3.5 w-3.5" />
+                <span>Unduh sebagai ZIP</span>
+              </button>
+            )}
           </div>
         </div>
       );
@@ -315,14 +348,26 @@ export function RightPreviewPane({
             <p className="mt-1 text-xs tabular-nums text-slate-500 dark:text-slate-400">
               Folder · {childCount > 0 ? `${childCount} item di dalam` : 'Kosong'} · {formatRelativeDateId(singleItem.updatedAt)}
             </p>
-            <button
-              type="button"
-              onClick={() => onOpenFolder(singleItem)}
-              className="td-press mt-4 inline-flex h-9 items-center gap-2 rounded-xl bg-blue-600 px-4 text-xs font-semibold text-white hover:bg-blue-700"
-            >
-              <FolderOpen className="h-3.5 w-3.5" />
-              <span>Buka Folder</span>
-            </button>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <button
+                type="button"
+                onClick={() => onOpenFolder(singleItem)}
+                className="td-press inline-flex h-9 items-center gap-2 rounded-xl bg-blue-600 px-4 text-xs font-semibold text-white hover:bg-blue-700"
+              >
+                <FolderOpen className="h-3.5 w-3.5" />
+                <span>Buka Folder</span>
+              </button>
+              {onDownloadZip && (
+                <button
+                  type="button"
+                  onClick={() => onDownloadZip([singleItem])}
+                  className="td-press inline-flex h-9 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+                >
+                  <FileArchive className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+                  <span>Unduh ZIP</span>
+                </button>
+              )}
+            </div>
           </div>
         </div>
       );
@@ -343,6 +388,14 @@ export function RightPreviewPane({
           (isTextPreviewable(singleFile.mimeType, singleFile.name) && textContent !== null),
       );
 
+    const canPreviewLargeFormat =
+      singleFile.size <= MAX_LARGE_PREVIEW_BYTES &&
+      (pdfFile ||
+        (officeType && officeType !== 'legacy-office') ||
+        category === 'image' ||
+        category === 'video' ||
+        category === 'audio');
+
     return (
       <div className="flex min-h-0 flex-1 flex-col">
         {/* Live Preview Canvas */}
@@ -356,7 +409,49 @@ export function RightPreviewPane({
           {loading ? (
             <div className="flex flex-col items-center gap-2 text-center">
               <div className="h-6 w-6 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" />
-              <p className="text-xs text-slate-500 dark:text-slate-400">Memuat pratinjau...</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                {(singleFile.chunks?.length || 0) > 1
+                  ? `Menggabungkan ${singleFile.chunks.length} bagian...`
+                  : 'Memuat pratinjau...'}
+              </p>
+            </div>
+          ) : requiresLargeAuth ? (
+            <div className="flex max-w-xs flex-col items-center rounded-2xl border border-slate-200 bg-white p-6 text-center dark:border-slate-800 dark:bg-slate-900">
+              <FileIcon
+                type="file"
+                mimeType={singleFile.mimeType}
+                filename={singleFile.name}
+                size="lg"
+              />
+              <p className="mt-3 text-xs font-semibold text-slate-900 dark:text-slate-100">
+                File besar ({formatBytes(singleFile.size)} · {singleFile.chunks.length} bagian)
+              </p>
+              <p className="mt-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                {canPreviewLargeFormat
+                  ? 'Klik Muat Pratinjau untuk menggabungkan bagian file di browser.'
+                  : 'Disarankan langsung unduh file agar memori browser tetap ringan.'}
+              </p>
+              <div className="mt-3 flex flex-wrap justify-center gap-2">
+                {canPreviewLargeFormat && (
+                  <button
+                    type="button"
+                    onClick={() => setLargeAuthId(singleFile.id)}
+                    className="inline-flex h-8 items-center justify-center rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+                  >
+                    Muat Pratinjau
+                  </button>
+                )}
+                {onDownloadItem && (
+                  <button
+                    type="button"
+                    onClick={() => onDownloadItem(singleFile)}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-blue-600 px-3 text-xs font-semibold text-white hover:bg-blue-700"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>Unduh</span>
+                  </button>
+                )}
+              </div>
             </div>
           ) : officeType && officeType !== 'legacy-office' && officeBuffer ? (
             <OfficePreview
@@ -440,9 +535,9 @@ export function RightPreviewPane({
                   ? previewError
                   : officeType === 'legacy-office'
                     ? 'Format Office lama (.doc/.ppt) belum didukung pratinjau langsung. Gunakan .docx atau .pptx.'
-                    : singleFile.size > DIRECT_TELEGRAM_MAX_BYTES
-                      ? 'File > 20 MB tersimpan di Telegram'
-                      : 'Pratinjau langsung tidak tersedia'}
+                  : singleFile.size > DIRECT_TELEGRAM_MAX_BYTES && (singleFile.chunks?.length || 0) <= 1
+                    ? 'File > 20 MB tersimpan di Telegram'
+                    : 'Pratinjau langsung tidak tersedia'}
               </p>
               <p className="mt-1 text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
                 {formatBytes(singleFile.size)} · {singleFile.mimeType}
@@ -519,14 +614,27 @@ export function RightPreviewPane({
           </h2>
         </div>
 
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Tutup panel pratinjau"
-          className="td-press flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
-        >
-          <X className="h-4 w-4" />
-        </button>
+        <div className="flex items-center gap-1">
+          {singleFile && onDownloadItem && (
+            <button
+              type="button"
+              onClick={() => onDownloadItem(singleFile)}
+              aria-label="Unduh file"
+              title="Unduh file"
+              className="td-press flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-blue-600 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-blue-400"
+            >
+              <Download className="h-3.5 w-3.5" />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Tutup panel pratinjau"
+            className="td-press flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
       </div>
 
       {renderContent()}
@@ -557,14 +665,27 @@ export function RightPreviewPane({
               {headerTitle}
             </h2>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Tutup panel pratinjau"
-            className="td-press flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-1">
+            {singleFile && onDownloadItem && (
+              <button
+                type="button"
+                onClick={() => onDownloadItem(singleFile)}
+                aria-label="Unduh file"
+                title="Unduh file"
+                className="td-press flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-blue-600 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-blue-400"
+              >
+                <Download className="h-3.5 w-3.5" />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Tutup panel pratinjau"
+              className="td-press flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </div>
         {renderContent()}
       </aside>

@@ -17,6 +17,9 @@ import {
 } from './telegramIndex';
 
 export const DIRECT_TELEGRAM_MAX_BYTES = 20 * 1024 * 1024; // 20 MB Telegram getFile limit
+export const CHUNK_SIZE_BYTES = 18 * 1024 * 1024; // 18 MB safe slice size under 20 MB limit
+export const MAX_BROWSER_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB browser upload guard
+export const MAX_LARGE_PREVIEW_BYTES = 120 * 1024 * 1024; // 120 MB on-demand large preview guard
 export const UPLOAD_CONCURRENCY = 1;
 export const INDEX_DOCUMENT_FILENAME = 'teledrive-index.json';
 export const INDEX_DOCUMENT_CAPTION_PREFIX = 'TELEDRIVE_IDX_V2:';
@@ -344,6 +347,7 @@ export function uploadFileDirectToTelegram(
   file: File | Blob,
   filename: string,
   onProgress: (loadedBytes: number, totalBytes: number) => void,
+  options?: { caption?: string },
 ): { cancel: () => void; promise: Promise<{ fileId: string; fileUniqueId: string; messageId: number }> } {
   const xhr = new XMLHttpRequest();
 
@@ -352,7 +356,7 @@ export function uploadFileDirectToTelegram(
       if (file.size > DIRECT_TELEGRAM_MAX_BYTES) {
         reject(
           new Error(
-            'Ukuran file melebihi 20 MB (batas download langsung Telegram Bot API tanpa proxy).',
+            'Ukuran potongan file melebihi 20 MB (batas Telegram Bot API).',
           ),
         );
         return;
@@ -360,7 +364,7 @@ export function uploadFileDirectToTelegram(
 
       const form = new FormData();
       form.append('chat_id', chatId.trim());
-      form.append('caption', `TeleDrive: ${filename}`);
+      form.append('caption', options?.caption || `TeleDrive: ${filename}`);
       form.append('document', file, filename);
 
       xhr.open('POST', tgApi(botToken, 'sendDocument'), true);

@@ -136,9 +136,11 @@ export interface TransferTask {
   loadedBytes: number;
   speedBytesPerSec: number;
   etaSeconds: number;
+  elapsedSeconds?: number;
   completedChunks: number;
   totalChunks: number;
   status: 'queued' | 'active' | 'completed' | 'error' | 'cancelled';
+  statusLabel?: string;
   errorMessage?: string;
   canRetry?: boolean;
   targetBackend?: StorageBackend;

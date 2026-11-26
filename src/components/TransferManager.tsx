@@ -91,7 +91,7 @@ export function TransferManager({
       </div>
 
       {!collapsed && (
-        <div className="max-h-64 divide-y divide-slate-100 overflow-y-auto dark:divide-slate-800">
+        <div className="max-h-72 divide-y divide-slate-100 overflow-y-auto dark:divide-slate-800">
           {tasks.map((task) => {
             const pct =
               task.totalBytes > 0
@@ -100,86 +100,125 @@ export function TransferManager({
                   ? 100
                   : 0;
 
+            const chunkHint =
+              task.statusLabel ||
+              (task.totalChunks > 1
+                ? `Bagian ${Math.min(task.totalChunks, task.completedChunks + 1)}/${task.totalChunks}`
+                : undefined);
+
+            const formatDuration = (sec?: number): string | null => {
+              if (sec === undefined || !Number.isFinite(sec) || sec <= 0) return null;
+              if (sec < 1) return '<1 dtk';
+              return formatEta(sec);
+            };
+
+            const completedDuration = formatDuration(task.elapsedSeconds);
+            const activeElapsed = formatDuration(task.elapsedSeconds);
+
             return (
               <div key={task.id} className="px-4 py-3">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex min-w-0 items-center gap-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 flex-1 items-center gap-2">
                     {task.kind === 'upload' ? (
                       <Upload className="h-3.5 w-3.5 shrink-0 text-blue-600 dark:text-blue-400" />
                     ) : (
                       <Download className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
                     )}
-                    <span className="truncate text-xs font-medium text-slate-900 dark:text-slate-100">
+                    <span
+                      title={task.filename}
+                      className="truncate text-xs font-medium text-slate-900 dark:text-slate-100"
+                    >
                       {task.filename}
                     </span>
                   </div>
 
-                  {task.status === 'active' || task.status === 'queued' ? (
-                    <button
-                      type="button"
-                      onClick={() => onCancelTask(task.id)}
-                      aria-label={`Batalkan transfer ${task.filename}`}
-                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  ) : task.status === 'completed' ? (
-                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
-                  ) : task.status === 'error' && task.canRetry && onRetryTask ? (
-                    <button
-                      type="button"
-                      onClick={() => onRetryTask(task.id)}
-                      aria-label={`Coba ulang unggahan ${task.filename}`}
-                      title="Coba ulang"
-                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950/60"
-                    >
-                      <RotateCcw className="h-3.5 w-3.5" />
-                    </button>
-                  ) : (
-                    <AlertCircle className="h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
-                  )}
+                  <div className="flex shrink-0 items-center gap-2">
+                    {task.status === 'active' && chunkHint && (
+                      <span className="font-mono text-[11px] tabular-nums text-slate-500 whitespace-nowrap dark:text-slate-400">
+                        {chunkHint}
+                      </span>
+                    )}
+
+                    {task.status === 'active' || task.status === 'queued' ? (
+                      <button
+                        type="button"
+                        onClick={() => onCancelTask(task.id)}
+                        aria-label={`Batalkan transfer ${task.filename}`}
+                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    ) : task.status === 'completed' ? (
+                      <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                    ) : task.status === 'error' && task.canRetry && onRetryTask ? (
+                      <button
+                        type="button"
+                        onClick={() => onRetryTask(task.id)}
+                        aria-label={`Coba ulang unggahan ${task.filename}`}
+                        title="Coba ulang"
+                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950/60"
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                      </button>
+                    ) : (
+                      <AlertCircle className="h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
+                    )}
+                  </div>
                 </div>
 
                 {task.status === 'active' && (
                   <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
                     <div
-                      className="h-full rounded-full bg-blue-600 transition-all duration-150"
+                      className={`h-full rounded-full transition-all duration-150 ${
+                        task.kind === 'upload' ? 'bg-blue-600' : 'bg-emerald-600'
+                      }`}
                       style={{ width: `${pct}%` }}
                     />
                   </div>
                 )}
 
-                <div className="mt-1.5 flex items-center justify-between font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
+                <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
                   {task.status === 'queued' ? (
                     <>
-                      <span>{formatBytes(task.totalBytes)}</span>
-                      <span className="inline-flex items-center gap-1 font-sans text-slate-500 dark:text-slate-400">
+                      <span className="whitespace-nowrap">
+                        {formatBytes(task.totalBytes)}
+                        {task.totalChunks > 1 ? ` · ${task.totalChunks} bagian` : ''}
+                      </span>
+                      <span className="inline-flex items-center gap-1 font-sans text-slate-500 whitespace-nowrap dark:text-slate-400">
                         <Clock className="h-3 w-3" />
                         <span>Menunggu antrean...</span>
                       </span>
                     </>
                   ) : task.status === 'active' ? (
-                    task.errorMessage ? (
-                      <span className="font-sans text-amber-600 dark:text-amber-400">
-                        {task.errorMessage}
+                    <>
+                      <span className="whitespace-nowrap">
+                        {formatBytes(task.loadedBytes)} / {formatBytes(task.totalBytes)} ({pct}%)
                       </span>
-                    ) : (
-                      <>
-                        <span>
-                          {formatBytes(task.loadedBytes)} / {formatBytes(task.totalBytes)} ({pct}%)
-                        </span>
-                        <span>
-                          {formatSpeed(task.speedBytesPerSec)} · {formatEta(task.etaSeconds)}
-                        </span>
-                      </>
-                    )
+                      <span className="text-slate-700 whitespace-nowrap dark:text-slate-300">
+                        {task.speedBytesPerSec > 0 ? (
+                          <>
+                            {formatSpeed(task.speedBytesPerSec)}
+                            <span aria-hidden="true"> · </span>
+                            Sisa {formatEta(task.etaSeconds)}
+                            {activeElapsed ? ` (berjalan ${activeElapsed})` : ''}
+                          </>
+                        ) : (
+                          'Menghitung kecepatan...'
+                        )}
+                      </span>
+                    </>
                   ) : task.status === 'completed' ? (
                     <>
-                      <span>
-                        {formatBytes(task.totalBytes)} · {task.totalChunks} bagian
+                      <span className="whitespace-nowrap">
+                        {formatBytes(task.totalBytes)}
+                        {task.totalChunks > 1 ? ` · ${task.totalChunks} bagian` : ''}
                       </span>
-                      <span className="text-emerald-600 dark:text-emerald-400">
-                        {task.speedBytesPerSec > 0 ? formatSpeed(task.speedBytesPerSec) : 'Selesai'}
+                      <span className="text-emerald-600 whitespace-nowrap dark:text-emerald-400">
+                        {task.speedBytesPerSec > 0
+                          ? `${formatSpeed(task.speedBytesPerSec)}${completedDuration ? ` · ${completedDuration}` : ''}`
+                          : completedDuration
+                            ? `Selesai (${completedDuration})`
+                            : 'Selesai'}
                       </span>
                     </>
                   ) : (
@@ -188,6 +227,12 @@ export function TransferManager({
                     </span>
                   )}
                 </div>
+
+                {task.status === 'active' && task.errorMessage && (
+                  <p className="mt-1 font-sans text-[11px] text-amber-600 dark:text-amber-400">
+                    {task.errorMessage}
+                  </p>
+                )}
               </div>
             );
           })}

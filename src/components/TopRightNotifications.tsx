@@ -34,13 +34,13 @@ export function TopRightNotifications({
     <div
       aria-live="polite"
       aria-label="Notifikasi aktivitas dan transfer"
-      className="pointer-events-none fixed right-4 top-36 z-50 flex w-[340px] max-w-[calc(100vw-2rem)] flex-col gap-2.5 sm:top-[8.25rem]"
+      className="pointer-events-none fixed right-4 top-36 z-50 flex w-[min(520px,calc(100vw-2rem))] flex-col items-end gap-2.5 sm:top-[8.25rem]"
     >
       {notifications.map((n) => (
         <div
           key={n.id}
           role="status"
-          className={`td-animate-slide-right pointer-events-auto flex items-start gap-2.5 rounded-xl border bg-white px-3.5 py-2.5 shadow-lg dark:bg-slate-900 ${
+          className={`td-animate-slide-right pointer-events-auto flex w-full max-w-[380px] items-start gap-2.5 rounded-xl border bg-white px-3.5 py-2.5 shadow-lg dark:bg-slate-900 ${
             n.kind === 'error'
               ? 'border-rose-200 dark:border-rose-900/70'
               : n.kind === 'success'
@@ -77,7 +77,7 @@ export function TopRightNotifications({
       ))}
 
       {tasks.length > 0 && (
-        <div className="pointer-events-auto">
+        <div className="pointer-events-auto w-full">
           <TransferManager
             tasks={tasks}
             onCancelTask={onCancelTask}

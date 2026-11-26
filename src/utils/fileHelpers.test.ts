@@ -51,8 +51,10 @@ import {
   reconcileRemoteDriveItems,
   splitCatalogIntoVolumes,
   toCatalogRecord,
+  toCompactRecord,
 } from './telegramIndex';
 import { planBlobCacheEviction } from './localVault';
+import { buildZipArchiveFilename, dedupeZipPath } from './zipDownload';
 import type { DriveItem } from '../types/drive';
 
 const sampleItems: DriveItem[] = [
@@ -1418,3 +1420,47 @@ test('mergeDriveItems strips isCatalogStub and upgrades chunks when remote match
   assert.equal(mergedNewerStub[0].chunks.length, 1);
   assert.equal(mergedNewerStub[0].chunks[0].telegramMessageId, 902);
 });
+
+test('toCompactRecord and fromCompactRecord preserve multi-chunk (>20MB) files cleanly while keeping single-chunk compact', () => {
+  const singleCompact = toCompactRecord(sampleItems[2]);
+  assert.equal(singleCompact.cs, undefined);
+  assert.equal(fromCompactRecord(singleCompact).chunks.length, 1);
+
+  const largeFile: DriveItem = {
+    id: 'large-video-1',
+    name: 'Video_Rapat_2026.mp4',
+    type: 'file',
+    parentId: 'f-root-1',
+    size: 40 * 1024 * 1024,
+    mimeType: 'video/mp4',
+    starred: false,
+    trashed: false,
+    createdAt: '2026-11-26T10:00:00.000Z',
+    updatedAt: '2026-11-26T10:00:00.000Z',
+    storageBackend: 'telegram',
+    chunks: [
+      { index: 0, size: 18 * 1024 * 1024, telegramFileId: 'fid_0', telegramUniqueId: 'uid_0', telegramMessageId: 1001 },
+      { index: 1, size: 18 * 1024 * 1024, telegramFileId: 'fid_1', telegramUniqueId: 'uid_1', telegramMessageId: 1002 },
+      { index: 2, size: 4 * 1024 * 1024, telegramFileId: 'fid_2', telegramUniqueId: 'uid_2', telegramMessageId: 1003 },
+    ],
+  };
+
+  const compact = toCompactRecord(largeFile);
+  assert.equal(compact.cs?.length, 3);
+  const restored = fromCompactRecord(compact);
+  assert.equal(restored.chunks.length, 3);
+  assert.equal(restored.chunks[1].telegramFileId, 'fid_1');
+  assert.equal(restored.chunks[2].telegramMessageId, 1003);
+  assert.equal(restored.chunks[2].size, 4 * 1024 * 1024);
+});
+
+test('dedupeZipPath and buildZipArchiveFilename generate clean collision-free ZIP names', () => {
+  const used = new Set<string>();
+  assert.equal(dedupeZipPath('/Desain/Foto.jpg', used), 'Desain/Foto.jpg');
+  assert.equal(dedupeZipPath('Desain/Foto.jpg', used), 'Desain/Foto (2).jpg');
+  assert.equal(dedupeZipPath('Desain/Foto.jpg', used), 'Desain/Foto (3).jpg');
+
+  assert.equal(buildZipArchiveFilename([sampleItems[0]]), 'Desain Produk.zip');
+  assert.match(buildZipArchiveFilename([sampleItems[0], sampleItems[2]]), /^TeleDrive_Arsip_\d{4}-\d{2}-\d{2}\.zip$/);
+});
+

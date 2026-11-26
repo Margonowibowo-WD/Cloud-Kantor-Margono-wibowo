@@ -5,6 +5,7 @@ import {
   Copy,
   Download,
   Eye,
+  FileArchive,
   FolderInput,
   FolderPlus,
   Pencil,
@@ -32,6 +33,7 @@ interface ContextMenuProps {
   onClose: () => void;
   onOpenItem: (item: DriveItem) => void;
   onDownloadItems: (items: DriveItem[]) => void;
+  onDownloadZip?: (items: DriveItem[]) => void;
   onCopyItems: (items: DriveItem[]) => void;
   onMoveItems: (items: DriveItem[]) => void;
   onRenameItem: (item: DriveItem) => void;
@@ -55,6 +57,7 @@ export function ContextMenu({
   onClose,
   onOpenItem,
   onDownloadItems,
+  onDownloadZip,
   onCopyItems,
   onMoveItems,
   onRenameItem,
@@ -99,6 +102,9 @@ export function ContextMenu({
     selectedItems.length > 0 ? selectedItems : menu.targetItem ? [menu.targetItem] : [];
   const singleItem = effectiveItems.length === 1 ? effectiveItems[0] : undefined;
   const downloadableFiles = effectiveItems.filter((i) => i.type === 'file');
+  const canDownloadZip =
+    Boolean(onDownloadZip) &&
+    (effectiveItems.length > 1 || effectiveItems.some((i) => i.type === 'folder'));
   const allStarred = effectiveItems.length > 0 && effectiveItems.every((i) => i.starred);
   const allOfflinePinned =
     Boolean(offlinePinnedIds) &&
@@ -154,6 +160,20 @@ export function ContextMenu({
                     ? `Unduh (${downloadableFiles.length} file)`
                     : 'Unduh'}
                 </span>
+              </button>
+            )}
+            {canDownloadZip && onDownloadZip && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  onClose();
+                  onDownloadZip(effectiveItems);
+                }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+              >
+                <FileArchive className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+                <span>Unduh sebagai ZIP</span>
               </button>
             )}
             <button
@@ -326,7 +346,7 @@ export function ContextMenu({
             className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
           >
             <Upload className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
-            <span>Unggah File (≤ 20 MB)</span>
+            <span>Unggah File</span>
           </button>
           {clipboardCount > 0 && !isTrashView && (
             <button

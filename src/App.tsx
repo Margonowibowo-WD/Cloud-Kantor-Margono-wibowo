@@ -18,6 +18,7 @@ import {
   applyMoveItems,
   buildBreadcrumbs,
   cloneDriveItemsForPaste,
+  computeByteSlices,
   computeStorageSummary,
   filterAndSortItems,
   formatBytes,
@@ -63,7 +64,9 @@ import {
   wipeUnlockedSessionData,
 } from './utils/localVault';
 import {
+  CHUNK_SIZE_BYTES,
   DIRECT_TELEGRAM_MAX_BYTES,
+  MAX_BROWSER_UPLOAD_BYTES,
   UPLOAD_CONCURRENCY,
   checkTelegramMessageExists,
   deleteTelegramMessageDirect,
@@ -102,6 +105,7 @@ import {
   startDirectDownload,
   startDirectUpload,
 } from './utils/uploadClient';
+import { buildZipArchiveFilename, startZipDownload } from './utils/zipDownload';
 import { Sidebar } from './components/Sidebar';
 import { type CloudSyncState, type ThemeMode, TopBar } from './components/TopBar';
 import { Toolbar } from './components/Toolbar';
@@ -2058,6 +2062,7 @@ export default function App() {
       batchStartedCountRef.current += 1;
       updateTransferTask(nextJob.taskId, {
         status: 'active',
+        statusLabel: undefined,
         errorMessage: undefined,
         canRetry: false,
       });
@@ -2112,6 +2117,7 @@ export default function App() {
           }
           updateTransferTask(nextJob.taskId, {
             status: canRetry ? 'error' : 'cancelled',
+            statusLabel: undefined,
             errorMessage: msg,
             canRetry,
           });
@@ -2228,19 +2234,19 @@ export default function App() {
         return;
       }
 
-      const oversized = validEntries.filter((e) => e.file.size > DIRECT_TELEGRAM_MAX_BYTES);
+      const oversized = validEntries.filter((e) => e.file.size > MAX_BROWSER_UPLOAD_BYTES);
       const uploadableEntries = validEntries.filter(
-        (e) => e.file.size <= DIRECT_TELEGRAM_MAX_BYTES,
+        (e) => e.file.size <= MAX_BROWSER_UPLOAD_BYTES,
       );
 
       if (oversized.length > 0) {
         pushNotification({
           kind: 'error',
-          title: 'Upload ditolak: File harus di bawah 20 MB',
+          title: 'Upload ditolak: File melebihi batas aman browser (2 GB)',
           detail:
             oversized.length === 1
-              ? `"${oversized[0].file.name}" (${formatBytes(oversized[0].file.size)}) melebihi batas maksimal 20 MB/file.`
-              : `${oversized.length} file melebihi batas 20 MB/file (${oversized[0].file.name}, ...).`,
+              ? `"${oversized[0].file.name}" (${formatBytes(oversized[0].file.size)}) melebihi batas 2 GB/file.`
+              : `${oversized.length} file melebihi batas aman 2 GB/file (${oversized[0].file.name}, ...).`,
         });
       }
 
@@ -2348,13 +2354,28 @@ export default function App() {
 
         const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
         if (isOffline) {
+          const offlineSkippedLarge = entriesToUpload.filter(
+            (e) => e.entry.file.size > DIRECT_TELEGRAM_MAX_BYTES,
+          );
+          const offlineEntries = entriesToUpload.filter(
+            (e) => e.entry.file.size <= DIRECT_TELEGRAM_MAX_BYTES,
+          );
+          if (offlineSkippedLarge.length > 0) {
+            pushNotification({
+              kind: 'error',
+              title: `${offlineSkippedLarge.length} file > 20 MB perlu diunggah saat online`,
+              detail: 'Saat offline, hanya file <= 20 MB yang diantrekan ke memori perangkat agar cache lokal tidak penuh.',
+            });
+          }
+          if (offlineEntries.length === 0) return;
+
           const nowIso = new Date().toISOString();
           const offlineItems: DriveItem[] = [];
           const offlineJobs: OfflineUploadJob[] = [];
           const queuedTasks: TransferTask[] = [];
           const dirtyFolders = new Set<string>();
 
-          for (const { entry, targetParent } of entriesToUpload) {
+          for (const { entry, targetParent } of offlineEntries) {
             const taskId = `tr-${crypto.randomUUID()}`;
             const itemId = `file-${crypto.randomUUID()}`;
             const blobKey = `blob-${itemId}`;
@@ -2418,7 +2439,7 @@ export default function App() {
           setTransfers((prev) => [...queuedTasks, ...prev].slice(0, 200));
           pushNotification({
             kind: 'info',
-            title: `${entriesToUpload.length} file masuk antrean offline`,
+            title: `${offlineEntries.length} file masuk antrean offline`,
             detail: `Disimpan lokal di perangkat & otomatis diunggah ke ${destLabel} saat internet tersambung.`,
           });
           return;
@@ -2450,6 +2471,7 @@ export default function App() {
         const createdTasks: TransferTask[] = [];
         for (const { entry, targetParent } of entriesToUpload) {
           const taskId = `tr-${crypto.randomUUID()}`;
+          const chunkTotal = computeByteSlices(entry.file.size, CHUNK_SIZE_BYTES).length;
           createdTasks.push({
             id: taskId,
             kind: 'upload',
@@ -2459,7 +2481,7 @@ export default function App() {
             speedBytesPerSec: 0,
             etaSeconds: 0,
             completedChunks: 0,
-            totalChunks: 1,
+            totalChunks: chunkTotal,
             status: 'queued',
             createdAt: Date.now(),
           });
@@ -2529,7 +2551,7 @@ export default function App() {
           speedBytesPerSec: 0,
           etaSeconds: 0,
           completedChunks: 0,
-          totalChunks: 1,
+          totalChunks: Math.max(1, targetItem.chunks?.length || 1),
           status: 'active',
           createdAt: Date.now(),
         };
@@ -2553,24 +2575,94 @@ export default function App() {
             } else {
               pushNotification({
                 kind: 'success',
-                title: `Unduhan dimulai: ${targetItem.name}`,
+                title: `Unduhan selesai: ${targetItem.name}`,
               });
             }
           })
           .catch((err) => {
             transferCancelMap.current.delete(taskId);
             const msg = err instanceof Error ? err.message : 'Unduhan gagal.';
+            const cancelled = msg === 'Dibatalkan';
             updateTransferTask(taskId, {
-              status: 'error',
+              status: cancelled ? 'cancelled' : 'error',
               errorMessage: msg,
             });
-            pushNotification({
-              kind: 'error',
-              title: `Gagal mengunduh ${targetItem.name}`,
-              detail: msg,
-            });
+            if (!cancelled) {
+              pushNotification({
+                kind: 'error',
+                title: `Gagal mengunduh ${targetItem.name}`,
+                detail: msg,
+              });
+            }
           });
       })();
+    },
+    [tgConfig, ensureFolderLoaded, updateTransferTask, pushNotification],
+  );
+
+  const handleDownloadZip = useCallback(
+    (targets: DriveItem[]) => {
+      const validTargets = targets.filter((t) => !t.trashed);
+      if (validTargets.length === 0) return;
+
+      const archiveName = buildZipArchiveFilename(validTargets);
+      const taskId = `zip-${crypto.randomUUID()}`;
+      const zipTask: TransferTask = {
+        id: taskId,
+        kind: 'download',
+        filename: archiveName,
+        totalBytes: validTargets.reduce((acc, i) => acc + (i.type === 'file' ? i.size : 0), 0) || 1,
+        loadedBytes: 0,
+        speedBytesPerSec: 0,
+        etaSeconds: 0,
+        elapsedSeconds: 0,
+        completedChunks: 0,
+        totalChunks: 1,
+        status: 'active',
+        statusLabel: 'Menyiapkan arsip ZIP...',
+        createdAt: Date.now(),
+      };
+      setTransfers((prev) => [zipTask, ...prev].slice(0, 200));
+
+      const ctrl = startZipDownload({
+        targets: validTargets,
+        getLatestItems: () => itemsRef.current,
+        tgConfig,
+        ensureFolderLoaded: (folderId) => ensureFolderLoaded(folderId),
+        onProgress: (progress) => {
+          updateTransferTask(taskId, progress);
+        },
+      });
+      transferCancelMap.current.set(taskId, ctrl.cancel);
+
+      ctrl.promise
+        .then(({ fileCount, skippedCount }) => {
+          transferCancelMap.current.delete(taskId);
+          pushNotification({
+            kind: 'success',
+            title: `ZIP selesai: ${archiveName}`,
+            detail:
+              skippedCount > 0
+                ? `${fileCount} file berhasil dikemas (${skippedCount} file gagal/dilewati).`
+                : `${fileCount} file berhasil dikemas ke dalam arsip ZIP.`,
+          });
+        })
+        .catch((err) => {
+          transferCancelMap.current.delete(taskId);
+          const msg = err instanceof Error ? err.message : 'Gagal membuat arsip ZIP.';
+          const cancelled = msg === 'Dibatalkan';
+          updateTransferTask(taskId, {
+            status: cancelled ? 'cancelled' : 'error',
+            errorMessage: msg,
+          });
+          if (!cancelled) {
+            pushNotification({
+              kind: 'error',
+              title: `Gagal membuat ZIP ${archiveName}`,
+              detail: msg,
+            });
+          }
+        });
     },
     [tgConfig, ensureFolderLoaded, updateTransferTask, pushNotification],
   );
@@ -3096,6 +3188,16 @@ export default function App() {
     () => items.filter((i) => selectedIds.has(i.id)),
     [items, selectedIds],
   );
+  const previewableFiles = useMemo(
+    () => visibleItems.filter((i) => i.type === 'file'),
+    [visibleItems],
+  );
+  const activePreviewItem = previewItem
+    ? items.find((i) => i.id === previewItem.id) || previewItem
+    : null;
+  const activePreviewIndex = activePreviewItem
+    ? previewableFiles.findIndex((i) => i.id === activePreviewItem.id)
+    : -1;
   const isTrashView = section === 'trash';
 
   if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
@@ -3324,7 +3426,7 @@ export default function App() {
                     ? 'Coba kata kunci lain atau ubah filter pencarian.'
                     : isTrashView
                       ? 'File atau folder yang Anda buang akan muncul di sini sebelum dihapus permanen.'
-                      : 'Seret dan lepas file ke area ini (atau tepat ke atas folder) atau klik Unggah File (maks. 20 MB per file).'}
+                      : 'Seret dan lepas file atau folder ke area ini (mendukung file besar > 20 MB dengan pemecahan otomatis) atau klik Unggah File.'}
                 </p>
 
                 {(typeFilter !== 'all' || sizeFilter !== 'all' || searchScope !== 'all') && (
@@ -3349,7 +3451,7 @@ export default function App() {
                       className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
                     >
                       <UploadCloud className="h-4 w-4" />
-                      <span>Unggah File (≤ 20 MB)</span>
+                      <span>Unggah File</span>
                     </button>
                     {section === 'my-drive' && (
                       <button
@@ -3469,6 +3571,8 @@ export default function App() {
             onOpenFolder={(folder) => handleNavigateFolder(folder.id)}
             onOpenTelegramSettings={() => setTelegramModalOpen(true)}
             onHydrateStub={hydrateStubItem}
+            onDownloadItem={handleDownloadItem}
+            onDownloadZip={handleDownloadZip}
           />
         </div>
       </div>
@@ -3488,7 +3592,7 @@ export default function App() {
                   : 'Drive Saya'}
               </p>
               <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                Atau arahkan &amp; lepas tepat ke atas kartu folder tujuan (maks. 20 MB/file)
+                Atau arahkan &amp; lepas tepat ke atas kartu folder tujuan (file &gt; 20 MB dipecah otomatis)
               </p>
             </div>
           </div>
@@ -3521,11 +3625,28 @@ export default function App() {
 
       {/* Modals */}
       <PreviewModal
-        item={previewItem ? items.find((i) => i.id === previewItem.id) || previewItem : null}
+        item={activePreviewItem}
         tgConfig={tgConfig}
         onClose={() => setPreviewItem(null)}
         onOpenTelegramSettings={() => setTelegramModalOpen(true)}
         onHydrateStub={hydrateStubItem}
+        onDownloadItem={handleDownloadItem}
+        hasPrev={activePreviewIndex > 0}
+        hasNext={activePreviewIndex >= 0 && activePreviewIndex < previewableFiles.length - 1}
+        onPrev={() => {
+          if (activePreviewIndex > 0) {
+            const target = previewableFiles[activePreviewIndex - 1];
+            setPreviewItem(target);
+            if (target.isCatalogStub) void hydrateStubItem(target);
+          }
+        }}
+        onNext={() => {
+          if (activePreviewIndex >= 0 && activePreviewIndex < previewableFiles.length - 1) {
+            const target = previewableFiles[activePreviewIndex + 1];
+            setPreviewItem(target);
+            if (target.isCatalogStub) void hydrateStubItem(target);
+          }
+        }}
       />
 
       <TelegramModal
@@ -3810,6 +3931,7 @@ export default function App() {
             if (target.type === 'file') handleDownloadItem(target);
           }
         }}
+        onDownloadZip={handleDownloadZip}
         onMoveItems={(targetItems) => {
           setMoveModal({ open: true, ids: targetItems.map((i) => i.id) });
         }}

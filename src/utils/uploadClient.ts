@@ -1,8 +1,14 @@
-import type { DriveItem, StorageBackend, TelegramConfigState } from '../types/drive';
-import { resolveMimeTypeForFilename, sanitizeDownloadFilename } from './fileHelpers';
+import type { DriveItem, FileChunk, StorageBackend, TelegramConfigState } from '../types/drive';
+import {
+  computeByteSlices,
+  resolveMimeTypeForFilename,
+  sanitizeDownloadFilename,
+} from './fileHelpers';
 import { getLocalBlob, saveLocalBlob } from './localVault';
 import {
+  CHUNK_SIZE_BYTES,
   DIRECT_TELEGRAM_MAX_BYTES,
+  MAX_BROWSER_UPLOAD_BYTES,
   buildProxiedTelegramFileUrl,
   deleteTelegramMessageDirect,
   normalizeCorsProxyUrl,
@@ -23,9 +29,11 @@ export interface TransferProgressUpdate {
   loadedBytes: number;
   speedBytesPerSec: number;
   etaSeconds: number;
+  elapsedSeconds?: number;
   completedChunks: number;
   totalChunks: number;
   status?: 'queued' | 'active' | 'completed' | 'error' | 'cancelled';
+  statusLabel?: string;
   errorMessage?: string;
   targetBackend?: StorageBackend;
 }
@@ -81,8 +89,8 @@ export function startDirectUpload(
       throw new Error('Cloud Telegram belum terhubung. Buka PIN Brankas terlebih dahulu.');
     }
 
-    if (file.size > DIRECT_TELEGRAM_MAX_BYTES) {
-      throw new Error('Ukuran file harus di bawah 20 MB per file untuk unggah dari browser.');
+    if (file.size > MAX_BROWSER_UPLOAD_BYTES) {
+      throw new Error('Ukuran file melebihi batas aman browser (2 GB).');
     }
 
     // Ensure the dropped item is a readable file (not a directory handle pseudo-file)
@@ -95,99 +103,186 @@ export function startDirectUpload(
     const id = options?.itemIdOverride || `file-${crypto.randomUUID()}`;
     const blobKey = `blob-${id}`;
     const now = new Date().toISOString();
-    const mimeType = file.type || 'application/octet-stream';
+    const mimeType = resolveMimeTypeForFilename(
+      file.name,
+      file.type || 'application/octet-stream',
+    );
+    const slices = computeByteSlices(file.size, CHUNK_SIZE_BYTES);
+    const totalChunks = slices.length;
+    const isMultiChunk = totalChunks > 1;
 
     if (cancelled) {
       throw new Error('Dibatalkan');
     }
 
-    let uploaded: { fileId: string; fileUniqueId: string; messageId: number } | null = null;
-    let startedAt = performance.now();
-    let rateLimitAttempts = 0;
-    let transientAttempts = 0;
+    const uploadedChunks: FileChunk[] = [];
+    const uploadStartedAt = performance.now();
+    let uploadedBytesBefore = 0;
 
-    while (true) {
-      if (cancelled) {
-        throw new Error('Dibatalkan');
-      }
-      startedAt = performance.now();
+    try {
+      for (const slice of slices) {
+        if (cancelled) {
+          throw new Error('Dibatalkan');
+        }
 
-      try {
-        const uploadOp = uploadFileDirectToTelegram(
-          tgConfig.botToken,
-          tgConfig.chatId,
-          file,
-          file.name,
-          (loaded, total) => {
-            const elapsed = Math.max(0.05, (performance.now() - startedAt) / 1000);
-            const speed = loaded / elapsed;
-            const eta = speed > 0 ? Math.max(0, total - loaded) / speed : 0;
-            onProgress({
-              loadedBytes: loaded,
-              speedBytesPerSec: speed,
-              etaSeconds: eta,
-              completedChunks: 0,
-              totalChunks: 1,
-              status: 'active',
-              errorMessage: undefined,
-              targetBackend: 'telegram',
-            });
-          },
-        );
-        tgCancel = uploadOp.cancel;
-        uploaded = await uploadOp.promise;
-        break;
-      } catch (err) {
-        const typedErr = err as Error & {
-          retryAfterSeconds?: number;
-          isTransientNetworkError?: boolean;
-        };
-        if (!cancelled && typedErr.retryAfterSeconds && rateLimitAttempts < MAX_RATE_LIMIT_RETRIES) {
-          rateLimitAttempts += 1;
-          const waitSec = Math.min(65, Math.max(1, typedErr.retryAfterSeconds));
+        const chunkBlob = isMultiChunk ? file.slice(slice.start, slice.end) : file;
+        const partFilename = isMultiChunk
+          ? `${file.name}.part${String(slice.index + 1).padStart(3, '0')}`
+          : file.name;
+        const caption = isMultiChunk
+          ? `TeleDrive: ${file.name} [Part ${slice.index + 1}/${totalChunks}]`
+          : `TeleDrive: ${file.name}`;
+
+        let uploaded: { fileId: string; fileUniqueId: string; messageId: number } | null = null;
+        let rateLimitAttempts = 0;
+        let transientAttempts = 0;
+
+        while (true) {
+          if (cancelled) {
+            throw new Error('Dibatalkan');
+          }
+
+          try {
+            const uploadOp = uploadFileDirectToTelegram(
+              tgConfig.botToken,
+              tgConfig.chatId,
+              chunkBlob,
+              partFilename,
+              (loaded) => {
+                const clampedChunkLoaded = Math.min(slice.size, Math.max(0, loaded));
+                const totalLoaded = Math.min(file.size, uploadedBytesBefore + clampedChunkLoaded);
+                const elapsed = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
+                const speed = totalLoaded / elapsed;
+                const eta = speed > 0 ? Math.max(0, file.size - totalLoaded) / speed : 0;
+                onProgress({
+                  loadedBytes: totalLoaded,
+                  speedBytesPerSec: speed,
+                  etaSeconds: eta,
+                  elapsedSeconds: elapsed,
+                  completedChunks: slice.index,
+                  totalChunks,
+                  status: 'active',
+                  statusLabel: isMultiChunk
+                    ? `Bagian ${slice.index + 1}/${totalChunks}`
+                    : undefined,
+                  errorMessage: undefined,
+                  targetBackend: 'telegram',
+                });
+              },
+              { caption },
+            );
+            tgCancel = uploadOp.cancel;
+            uploaded = await uploadOp.promise;
+            tgCancel = null;
+            break;
+          } catch (err) {
+            tgCancel = null;
+            const typedErr = err as Error & {
+              retryAfterSeconds?: number;
+              isTransientNetworkError?: boolean;
+            };
+            if (!cancelled && typedErr.retryAfterSeconds && rateLimitAttempts < MAX_RATE_LIMIT_RETRIES) {
+              rateLimitAttempts += 1;
+              const waitSec = Math.min(65, Math.max(1, typedErr.retryAfterSeconds));
+              const elapsed = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
+              onProgress({
+                loadedBytes: uploadedBytesBefore,
+                speedBytesPerSec: uploadedBytesBefore > 0 ? uploadedBytesBefore / elapsed : 0,
+                etaSeconds: waitSec,
+                elapsedSeconds: elapsed,
+                completedChunks: slice.index,
+                totalChunks,
+                status: 'active',
+                statusLabel: isMultiChunk ? `Bagian ${slice.index + 1}/${totalChunks}` : undefined,
+                errorMessage: `Menunggu batas Telegram (${waitSec} dtk)...`,
+                targetBackend: 'telegram',
+              });
+              await waitWithCancel(waitSec * 1000, () => cancelled);
+              continue;
+            }
+            if (
+              !cancelled &&
+              typedErr.isTransientNetworkError &&
+              transientAttempts < MAX_TRANSIENT_RETRIES
+            ) {
+              transientAttempts += 1;
+              const waitSec = transientAttempts * 2;
+              const elapsed = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
+              onProgress({
+                loadedBytes: uploadedBytesBefore,
+                speedBytesPerSec: uploadedBytesBefore > 0 ? uploadedBytesBefore / elapsed : 0,
+                etaSeconds: waitSec,
+                elapsedSeconds: elapsed,
+                completedChunks: slice.index,
+                totalChunks,
+                status: 'active',
+                statusLabel: isMultiChunk ? `Bagian ${slice.index + 1}/${totalChunks}` : undefined,
+                errorMessage: `Koneksi terganggu, mencoba ulang bagian ${slice.index + 1}/${totalChunks} (${transientAttempts}/${MAX_TRANSIENT_RETRIES})...`,
+                targetBackend: 'telegram',
+              });
+              await waitWithCancel(waitSec * 1000, () => cancelled);
+              continue;
+            }
+            throw err;
+          }
+        }
+
+        if (!uploaded) {
+          throw new Error(`Gagal mengunggah bagian ${slice.index + 1}/${totalChunks}.`);
+        }
+
+        uploadedChunks.push({
+          index: slice.index,
+          size: slice.size,
+          telegramFileId: uploaded.fileId,
+          telegramUniqueId: uploaded.fileUniqueId,
+          telegramMessageId: uploaded.messageId,
+        });
+
+        uploadedBytesBefore += slice.size;
+
+        if (isMultiChunk && slice.index + 1 < totalChunks) {
+          const elapsedAfterChunk = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
+          const speedAfterChunk = uploadedBytesBefore / elapsedAfterChunk;
+          const etaAfterChunk =
+            speedAfterChunk > 0 ? Math.max(0, file.size - uploadedBytesBefore) / speedAfterChunk : 0;
           onProgress({
-            loadedBytes: 0,
-            speedBytesPerSec: 0,
-            etaSeconds: waitSec,
-            completedChunks: 0,
-            totalChunks: 1,
+            loadedBytes: uploadedBytesBefore,
+            speedBytesPerSec: speedAfterChunk,
+            etaSeconds: etaAfterChunk,
+            elapsedSeconds: elapsedAfterChunk,
+            completedChunks: slice.index + 1,
+            totalChunks,
             status: 'active',
-            errorMessage: `Menunggu batas Telegram (${waitSec} dtk)...`,
+            statusLabel: `Bagian ${slice.index + 2}/${totalChunks}`,
+            errorMessage: undefined,
             targetBackend: 'telegram',
           });
-          await waitWithCancel(waitSec * 1000, () => cancelled);
-          continue;
+          // Gentle pause between chunks to avoid Telegram FloodWait & let UI breathe
+          await waitWithCancel(350, () => cancelled);
         }
-        if (
-          !cancelled &&
-          typedErr.isTransientNetworkError &&
-          transientAttempts < MAX_TRANSIENT_RETRIES
-        ) {
-          transientAttempts += 1;
-          const waitSec = transientAttempts * 2;
-          onProgress({
-            loadedBytes: 0,
-            speedBytesPerSec: 0,
-            etaSeconds: waitSec,
-            completedChunks: 0,
-            totalChunks: 1,
-            status: 'active',
-            errorMessage: `Koneksi terganggu, mencoba ulang (${transientAttempts}/${MAX_TRANSIENT_RETRIES})...`,
-            targetBackend: 'telegram',
-          });
-          await waitWithCancel(waitSec * 1000, () => cancelled);
-          continue;
-        }
-        throw err;
       }
+    } catch (err) {
+      // Clean up orphan partial chunks if user cancelled or multi-chunk upload failed mid-way
+      if (isMultiChunk && uploadedChunks.length > 0 && tgConfig.botToken && tgConfig.chatId) {
+        for (const chunk of uploadedChunks) {
+          if (chunk.telegramMessageId) {
+            void deleteTelegramMessageDirect(
+              tgConfig.botToken,
+              tgConfig.chatId,
+              chunk.telegramMessageId,
+            );
+          }
+        }
+      }
+      throw err;
     }
 
-    if (!uploaded) {
-      throw new Error('Unggahan gagal setelah mencoba ulang.');
+    // Only auto-cache files <= 20 MB locally so large files don't evict the 350 MB preview cache
+    const shouldCacheLocally = file.size <= DIRECT_TELEGRAM_MAX_BYTES;
+    if (shouldCacheLocally) {
+      await saveLocalBlob(blobKey, file);
     }
-
-    // Cache small preview blob for instant offline thumbnail/preview
-    await saveLocalBlob(blobKey, file);
 
     const item: DriveItem = {
       id,
@@ -201,26 +296,20 @@ export function startDirectUpload(
       createdAt: now,
       updatedAt: now,
       storageBackend: 'telegram',
-      localBlobKey: blobKey,
-      chunks: [
-        {
-          index: 0,
-          size: file.size,
-          telegramFileId: uploaded.fileId,
-          telegramUniqueId: uploaded.fileUniqueId,
-          telegramMessageId: uploaded.messageId,
-        },
-      ],
+      ...(shouldCacheLocally ? { localBlobKey: blobKey } : {}),
+      chunks: uploadedChunks,
     };
 
-    const elapsed = Math.max(0.05, (performance.now() - startedAt) / 1000);
+    const elapsed = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
     onProgress({
       loadedBytes: file.size,
       speedBytesPerSec: file.size / elapsed,
       etaSeconds: 0,
-      completedChunks: 1,
-      totalChunks: 1,
+      elapsedSeconds: elapsed,
+      completedChunks: totalChunks,
+      totalChunks,
       status: 'completed',
+      statusLabel: undefined,
       errorMessage: undefined,
       targetBackend: 'telegram',
     });
@@ -295,13 +384,12 @@ async function refreshTelegramFileIdByMessageId(
   }
 }
 
-async function resolveEffectiveTelegramFileUrl(
-  item: DriveItem,
+async function resolveChunkTelegramUrl(
+  chunk: FileChunk,
   tgConfig: TelegramConfigState,
 ): Promise<string> {
-  const firstChunk = item.chunks?.[0];
-  const tgFileId = firstChunk?.telegramFileId;
-  const tgMsgId = firstChunk?.telegramMessageId;
+  const tgFileId = chunk.telegramFileId;
+  const tgMsgId = chunk.telegramMessageId;
 
   if (!tgConfig.botToken) {
     throw new Error('Koneksi Bot Telegram belum tersedia dan file belum tersimpan di perangkat ini.');
@@ -342,6 +430,131 @@ async function resolveEffectiveTelegramFileUrl(
   throw new Error('File belum memiliki ID Telegram yang valid. Coba sinkronkan ulang atau unggah ulang.');
 }
 
+async function resolveEffectiveTelegramFileUrl(
+  item: DriveItem,
+  tgConfig: TelegramConfigState,
+): Promise<string> {
+  const firstChunk = item.chunks?.[0];
+  if (!firstChunk) {
+    throw new Error('File belum memiliki ID Telegram yang valid. Coba sinkronkan ulang atau unggah ulang.');
+  }
+  return resolveChunkTelegramUrl(firstChunk, tgConfig);
+}
+
+function downloadBlobViaXhr(
+  url: string,
+  expectedSize: number,
+  onProgress: (loadedBytes: number) => void,
+  registerCancel: (cancelFn: () => void) => void,
+): Promise<Blob> {
+  return new Promise<Blob>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    registerCancel(() => xhr.abort());
+    xhr.open('GET', url, true);
+    xhr.responseType = 'blob';
+
+    xhr.onprogress = (ev) => {
+      onProgress(Math.min(expectedSize || ev.loaded, ev.loaded));
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.response instanceof Blob) {
+        resolve(xhr.response);
+      } else {
+        reject(new Error(`HTTP ${xhr.status || 0}`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error('XHR_NETWORK_FALLBACK'));
+    xhr.onabort = () => reject(new Error('Dibatalkan'));
+    xhr.send();
+  });
+}
+
+async function assembleMultiChunkBlob(
+  item: DriveItem,
+  tgConfig: TelegramConfigState,
+  onProgress?: (update: TransferProgressUpdate) => void,
+  isCancelled?: () => boolean,
+  registerXhrCancel?: (fn: (() => void) | null) => void,
+): Promise<Blob> {
+  const chunks = [...(item.chunks || [])].sort((a, b) => a.index - b.index);
+  if (chunks.length === 0) {
+    throw new Error('Metadata bagian file tidak ditemukan. Coba sinkronkan ulang.');
+  }
+  const hasProxy = Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl));
+  if (!hasProxy) {
+    throw new PreviewCorsBlockedError(
+      'File di atas 20 MB terdiri dari beberapa bagian dan memerlukan Proxy Cloudflare Worker agar browser bisa menggabungkannya.',
+    );
+  }
+
+  const startedAt = performance.now();
+  const totalChunks = chunks.length;
+  const totalSize = item.size || chunks.reduce((acc, c) => acc + (c.size || 0), 0);
+  const blobs: Blob[] = [];
+  let loadedBefore = 0;
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    if (isCancelled?.()) {
+      throw new Error('Dibatalkan');
+    }
+    const chunk = chunks[i];
+    if (onProgress) {
+      const elapsedStart = Math.max(0.05, (performance.now() - startedAt) / 1000);
+      const speedStart = loadedBefore > 0 ? loadedBefore / elapsedStart : 0;
+      const etaStart =
+        speedStart > 0 && totalSize > 0 ? Math.max(0, totalSize - loadedBefore) / speedStart : 0;
+      onProgress({
+        loadedBytes: loadedBefore,
+        speedBytesPerSec: speedStart,
+        etaSeconds: etaStart,
+        elapsedSeconds: elapsedStart,
+        completedChunks: i,
+        totalChunks,
+        status: 'active',
+        statusLabel: `Bagian ${i + 1}/${totalChunks}`,
+        errorMessage: undefined,
+        targetBackend: 'telegram',
+      });
+    }
+    const tgUrl = await resolveChunkTelegramUrl(chunk, tgConfig);
+    const proxiedUrl = buildProxiedTelegramFileUrl(tgUrl, tgConfig.corsProxyUrl);
+
+    const chunkBlob = await downloadBlobViaXhr(
+      proxiedUrl,
+      chunk.size || 0,
+      (chunkLoaded) => {
+        if (!onProgress) return;
+        const totalLoaded = Math.min(totalSize || Number.MAX_SAFE_INTEGER, loadedBefore + chunkLoaded);
+        const elapsed = Math.max(0.05, (performance.now() - startedAt) / 1000);
+        const speed = totalLoaded / elapsed;
+        const eta = speed > 0 && totalSize > 0 ? Math.max(0, totalSize - totalLoaded) / speed : 0;
+        onProgress({
+          loadedBytes: totalLoaded,
+          speedBytesPerSec: speed,
+          etaSeconds: eta,
+          elapsedSeconds: elapsed,
+          completedChunks: i,
+          totalChunks,
+          status: 'active',
+          statusLabel: `Bagian ${i + 1}/${totalChunks}`,
+          errorMessage: undefined,
+          targetBackend: 'telegram',
+        });
+      },
+      (cancelFn) => registerXhrCancel?.(cancelFn),
+    );
+    registerXhrCancel?.(null);
+
+    blobs.push(chunkBlob);
+    loadedBefore += chunkBlob.size || chunk.size || 0;
+  }
+
+  const resolvedMime = resolveMimeTypeForFilename(item.name, item.mimeType);
+  return new Blob(blobs, { type: resolvedMime });
+}
+
 export async function resolveItemPlayableUrl(
   item: DriveItem,
   tgConfig: TelegramConfigState,
@@ -361,8 +574,17 @@ export async function resolveItemPlayableUrl(
     return { url: URL.createObjectURL(typed), isObjectUrl: true };
   }
 
+  if ((item.chunks?.length || 0) > 1) {
+    const assembled = await assembleMultiChunkBlob(item, tgConfig);
+    const typed =
+      effectiveMime && assembled.type !== effectiveMime
+        ? new Blob([assembled], { type: effectiveMime })
+        : assembled;
+    return { url: URL.createObjectURL(typed), isObjectUrl: true };
+  }
+
   if (item.size > DIRECT_TELEGRAM_MAX_BYTES) {
-    throw new Error('File di atas 20 MB hanya bisa dibuka langsung di aplikasi Telegram.');
+    throw new Error('File di atas 20 MB hanya bisa dibuka setelah diunggah sebagai potongan chunk.');
   }
 
   const tgUrl = await resolveEffectiveTelegramFileUrl(item, tgConfig);
@@ -402,8 +624,14 @@ export async function resolveItemArrayBuffer(
   if (cachedBlob) {
     return cachedBlob.arrayBuffer();
   }
+
+  if ((item.chunks?.length || 0) > 1) {
+    const assembled = await assembleMultiChunkBlob(item, tgConfig);
+    return assembled.arrayBuffer();
+  }
+
   if (item.size > DIRECT_TELEGRAM_MAX_BYTES) {
-    throw new Error('File di atas 20 MB hanya bisa dibuka langsung di aplikasi Telegram.');
+    throw new Error('File di atas 20 MB belum memiliki data potongan untuk dibaca di browser.');
   }
 
   const tgUrl = await resolveEffectiveTelegramFileUrl(item, tgConfig);
@@ -442,7 +670,7 @@ export async function resolveItemTextContent(
     return cachedBlob.text();
   }
   if (item.size > DIRECT_TELEGRAM_MAX_BYTES) {
-    throw new Error('File teks di atas 20 MB hanya bisa dibuka di Telegram.');
+    throw new Error('File teks di atas 20 MB hanya bisa diunduh.');
   }
 
   const tgUrl = await resolveEffectiveTelegramFileUrl(item, tgConfig);
@@ -484,11 +712,11 @@ export function startDirectDownload(
   onProgress: (update: TransferProgressUpdate) => void,
 ): { cancel: () => void; promise: Promise<{ usedRawFallback?: boolean }> } {
   let cancelled = false;
-  let activeXhr: XMLHttpRequest | null = null;
+  let activeAbort: (() => void) | null = null;
 
   const cancel = () => {
     cancelled = true;
-    activeXhr?.abort();
+    activeAbort?.();
   };
 
   const promise = (async (): Promise<{ usedRawFallback?: boolean }> => {
@@ -503,9 +731,42 @@ export function startDirectDownload(
         loadedBytes: item.size || cachedBlob.size,
         speedBytesPerSec: (item.size || cachedBlob.size) / elapsed,
         etaSeconds: 0,
-        completedChunks: 1,
-        totalChunks: 1,
+        elapsedSeconds: elapsed,
+        completedChunks: item.chunks?.length || 1,
+        totalChunks: item.chunks?.length || 1,
         status: 'completed',
+        statusLabel: undefined,
+        errorMessage: undefined,
+        targetBackend: 'telegram',
+      });
+      return { usedRawFallback: false };
+    }
+
+    // Multi-chunk file (> 20 MB split into <= 18 MB Telegram parts)
+    if ((item.chunks?.length || 0) > 1) {
+      const assembled = await assembleMultiChunkBlob(
+        item,
+        tgConfig,
+        onProgress,
+        () => cancelled,
+        (fn) => {
+          activeAbort = fn;
+        },
+      );
+      const prepared = normalizeBlobForDownload(assembled, item.name, item.mimeType);
+      triggerBlobDownload(prepared.blob, prepared.filename);
+      const totalSize = item.size || prepared.blob.size;
+      const elapsed = Math.max(0.05, (performance.now() - startedAt) / 1000);
+      onProgress({
+        loadedBytes: totalSize,
+        speedBytesPerSec: totalSize / elapsed,
+        etaSeconds: 0,
+        elapsedSeconds: elapsed,
+        completedChunks: item.chunks.length,
+        totalChunks: item.chunks.length,
+        status: 'completed',
+        statusLabel: undefined,
+        errorMessage: undefined,
         targetBackend: 'telegram',
       });
       return { usedRawFallback: false };
@@ -513,56 +774,47 @@ export function startDirectDownload(
 
     if (item.size > DIRECT_TELEGRAM_MAX_BYTES) {
       throw new Error(
-        'File di atas 20 MB tidak dapat diunduh lewat browser (batas Telegram Bot API). Gunakan tombol Buka di Telegram.',
+        'File di atas 20 MB ini tidak memiliki metadata potongan. Gunakan tombol Buka di Telegram.',
       );
     }
 
-    const tgFileId = item.chunks?.[0]?.telegramFileId;
-    if (!tgFileId || !tgConfig.botToken) {
+    const firstChunk = item.chunks?.[0];
+    if (!firstChunk || (!firstChunk.telegramFileId && !firstChunk.telegramMessageId) || !tgConfig.botToken) {
       throw new Error('File tidak tersedia di Cloud Telegram.');
     }
 
-    const tgUrl = await resolveTelegramFileUrl(tgConfig.botToken, tgFileId);
+    const tgUrl = await resolveChunkTelegramUrl(firstChunk, tgConfig);
     const hasProxy = Boolean(normalizeCorsProxyUrl(tgConfig.corsProxyUrl));
     const fetchUrl = buildProxiedTelegramFileUrl(tgUrl, tgConfig.corsProxyUrl);
     if (cancelled) throw new Error('Dibatalkan');
 
     // Download via XHR for real-time MB/s progress, ETA, and IndexedDB caching
     try {
-      const downloadedBlob = await new Promise<Blob>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        activeXhr = xhr;
-        xhr.open('GET', fetchUrl, true);
-        xhr.responseType = 'blob';
-
-        xhr.onprogress = (ev) => {
-          const total = ev.lengthComputable && ev.total > 0 ? ev.total : item.size;
+      const downloadedBlob = await downloadBlobViaXhr(
+        fetchUrl,
+        item.size,
+        (loaded) => {
+          const total = item.size || loaded;
           const elapsed = Math.max(0.05, (performance.now() - startedAt) / 1000);
-          const speed = ev.loaded / elapsed;
-          const eta = speed > 0 && total > 0 ? Math.max(0, total - ev.loaded) / speed : 0;
+          const speed = loaded / elapsed;
+          const eta = speed > 0 && total > 0 ? Math.max(0, total - loaded) / speed : 0;
           onProgress({
-            loadedBytes: ev.loaded,
+            loadedBytes: loaded,
             speedBytesPerSec: speed,
             etaSeconds: eta,
+            elapsedSeconds: elapsed,
             completedChunks: 0,
             totalChunks: 1,
             status: 'active',
+            statusLabel: undefined,
+            errorMessage: undefined,
             targetBackend: 'telegram',
           });
-        };
-
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300 && xhr.response instanceof Blob) {
-            resolve(xhr.response);
-          } else {
-            reject(new Error(`HTTP ${xhr.status || 0}`));
-          }
-        };
-
-        xhr.onerror = () => reject(new Error('XHR_NETWORK_FALLBACK'));
-        xhr.onabort = () => reject(new Error('Dibatalkan'));
-        xhr.send();
-      });
+        },
+        (fn) => {
+          activeAbort = fn;
+        },
+      );
 
       const prepared = normalizeBlobForDownload(downloadedBlob, item.name, item.mimeType);
       await saveLocalBlob(`blob-${item.id}`, prepared.blob);
@@ -574,9 +826,12 @@ export function startDirectDownload(
         loadedBytes: totalSize,
         speedBytesPerSec: totalSize / elapsed,
         etaSeconds: 0,
+        elapsedSeconds: elapsed,
         completedChunks: 1,
         totalChunks: 1,
         status: 'completed',
+        statusLabel: undefined,
+        errorMessage: undefined,
         targetBackend: 'telegram',
       });
       return { usedRawFallback: false };
@@ -601,7 +856,6 @@ export function startDirectDownload(
         a.click();
         a.remove();
       } else {
-        // Without CORS proxy, browsers block XHR and ignore cross-origin a.download filenames
         const a = document.createElement('a');
         a.href = tgUrl;
         a.download = safeName;
@@ -628,7 +882,7 @@ export function startDirectDownload(
   return { cancel, promise };
 }
 
-function triggerBlobDownload(blob: Blob, filename: string): void {
+export function triggerBlobDownload(blob: Blob, filename: string): void {
   const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = objectUrl;
