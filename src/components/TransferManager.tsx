@@ -113,7 +113,6 @@ export function TransferManager({
             };
 
             const completedDuration = formatDuration(task.elapsedSeconds);
-            const activeElapsed = formatDuration(task.elapsedSeconds);
 
             return (
               <div key={task.id} className="px-4 py-3">
@@ -177,43 +176,41 @@ export function TransferManager({
                   </div>
                 )}
 
-                <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
+                <div className="mt-1.5 flex items-center justify-between gap-3 font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
                   {task.status === 'queued' ? (
                     <>
-                      <span className="whitespace-nowrap">
+                      <span className="min-w-0 truncate">
                         {formatBytes(task.totalBytes)}
                         {task.totalChunks > 1 ? ` · ${task.totalChunks} bagian` : ''}
                       </span>
-                      <span className="inline-flex items-center gap-1 font-sans text-slate-500 whitespace-nowrap dark:text-slate-400">
+                      <span className="inline-flex shrink-0 items-center gap-1 font-sans text-slate-500 whitespace-nowrap dark:text-slate-400">
                         <Clock className="h-3 w-3" />
                         <span>Menunggu antrean...</span>
                       </span>
                     </>
                   ) : task.status === 'active' ? (
                     <>
-                      <span className="whitespace-nowrap">
+                      <span className="min-w-0 truncate">
                         {formatBytes(task.loadedBytes)} / {formatBytes(task.totalBytes)} ({pct}%)
                       </span>
-                      <span className="text-slate-700 whitespace-nowrap dark:text-slate-300">
+                      <span className="shrink-0 text-slate-700 whitespace-nowrap dark:text-slate-300">
                         {task.speedBytesPerSec > 0 ? (
                           <>
                             {formatSpeed(task.speedBytesPerSec)}
-                            <span aria-hidden="true"> · </span>
-                            Sisa {formatEta(task.etaSeconds)}
-                            {activeElapsed ? ` (berjalan ${activeElapsed})` : ''}
+                            {task.etaSeconds > 0 ? ` · ${formatEta(task.etaSeconds)}` : ''}
                           </>
                         ) : (
-                          'Menghitung kecepatan...'
+                          'Menghitung...'
                         )}
                       </span>
                     </>
                   ) : task.status === 'completed' ? (
                     <>
-                      <span className="whitespace-nowrap">
+                      <span className="min-w-0 truncate">
                         {formatBytes(task.totalBytes)}
                         {task.totalChunks > 1 ? ` · ${task.totalChunks} bagian` : ''}
                       </span>
-                      <span className="text-emerald-600 whitespace-nowrap dark:text-emerald-400">
+                      <span className="shrink-0 text-emerald-600 whitespace-nowrap dark:text-emerald-400">
                         {task.speedBytesPerSec > 0
                           ? `${formatSpeed(task.speedBytesPerSec)}${completedDuration ? ` · ${completedDuration}` : ''}`
                           : completedDuration
@@ -222,14 +219,14 @@ export function TransferManager({
                       </span>
                     </>
                   ) : (
-                    <span className="truncate font-sans text-rose-600 dark:text-rose-400">
+                    <span className="min-w-0 truncate font-sans text-rose-600 dark:text-rose-400">
                       {task.errorMessage || 'Dibatalkan'}
                     </span>
                   )}
                 </div>
 
                 {task.status === 'active' && task.errorMessage && (
-                  <p className="mt-1 font-sans text-[11px] text-amber-600 dark:text-amber-400">
+                  <p className="mt-1 truncate font-sans text-[11px] text-amber-600 dark:text-amber-400">
                     {task.errorMessage}
                   </p>
                 )}

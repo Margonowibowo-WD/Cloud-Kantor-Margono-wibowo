@@ -137,57 +137,57 @@ export function startZipDownload(params: {
     const startedAt = performance.now();
     let loadedBytes = 0;
     let skippedCount = 0;
+    let completedFiles = 0;
+    let cursor = 0;
 
-    for (let idx = 0; idx < filesToZip.length; idx += 1) {
-      if (cancelled) throw new Error('Dibatalkan');
-      const { item, zipPath } = filesToZip[idx];
-
-      const preElapsed = Math.max(0.05, (performance.now() - startedAt) / 1000);
-      const preSpeed = loadedBytes > 0 ? loadedBytes / preElapsed : 0;
-      const preEta = preSpeed > 0 ? Math.max(0, totalBytes - loadedBytes) / preSpeed : 0;
-      onProgress({
-        loadedBytes,
-        speedBytesPerSec: preSpeed,
-        etaSeconds: preEta,
-        elapsedSeconds: preElapsed,
-        completedChunks: idx,
-        totalChunks: totalCount,
-        status: 'active',
-        statusLabel: `File ${idx + 1}/${totalCount}`,
-        errorMessage: undefined,
-        targetBackend: 'telegram',
-      });
-
-      try {
-        const buf = await resolveItemArrayBuffer(item, tgConfig);
-        if (cancelled) throw new Error('Dibatalkan');
-        if (buf) {
-          zip.file(zipPath, buf);
-          loadedBytes += item.size || buf.byteLength;
-        } else {
-          skippedCount += 1;
-        }
-      } catch (err) {
-        if (err instanceof Error && err.message === 'Dibatalkan') throw err;
-        skippedCount += 1;
-      }
-
+    const emitZipProgress = () => {
       const elapsed = Math.max(0.05, (performance.now() - startedAt) / 1000);
-      const speed = loadedBytes / elapsed;
+      const speed = loadedBytes > 0 ? loadedBytes / elapsed : 0;
       const eta = speed > 0 ? Math.max(0, totalBytes - loadedBytes) / speed : 0;
       onProgress({
         loadedBytes,
         speedBytesPerSec: speed,
         etaSeconds: eta,
         elapsedSeconds: elapsed,
-        completedChunks: idx + 1,
+        completedChunks: completedFiles,
         totalChunks: totalCount,
         status: 'active',
-        statusLabel: `File ${idx + 1}/${totalCount}`,
+        statusLabel: `${Math.min(totalCount, completedFiles + (completedFiles < totalCount ? 1 : 0))}/${totalCount} file`,
         errorMessage: undefined,
         targetBackend: 'telegram',
       });
-    }
+    };
+
+    emitZipProgress();
+
+    const zipWorker = async () => {
+      while (!cancelled) {
+        const idx = cursor;
+        cursor += 1;
+        if (idx >= filesToZip.length) return;
+
+        const { item, zipPath } = filesToZip[idx];
+        try {
+          const buf = await resolveItemArrayBuffer(item, tgConfig);
+          if (cancelled) throw new Error('Dibatalkan');
+          if (buf) {
+            zip.file(zipPath, buf);
+            loadedBytes += item.size || buf.byteLength;
+          } else {
+            skippedCount += 1;
+          }
+        } catch (err) {
+          if (err instanceof Error && err.message === 'Dibatalkan') throw err;
+          skippedCount += 1;
+        }
+        completedFiles += 1;
+        emitZipProgress();
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(3, filesToZip.length) }, () => zipWorker()),
+    );
 
     if (cancelled) throw new Error('Dibatalkan');
 

@@ -266,7 +266,6 @@ export default function App() {
   const activeUploadCountRef = useRef(0);
   const batchSuccessCountRef = useRef(0);
   const batchStartedCountRef = useRef(0);
-  const batchPacingTimerRef = useRef<number | null>(null);
   const failedUploadJobsRef = useRef<
     Map<string, { file: File; targetParent: string | null; isBatch: boolean }>
   >(new Map());
@@ -2149,19 +2148,7 @@ export default function App() {
             return;
           }
 
-          // Gentle pacing after 5 consecutive files to stay under Telegram channel flood limits
-          const needsPacing = nextJob.isBatch && batchStartedCountRef.current >= 5;
-          if (needsPacing) {
-            if (batchPacingTimerRef.current) {
-              window.clearTimeout(batchPacingTimerRef.current);
-            }
-            batchPacingTimerRef.current = window.setTimeout(() => {
-              batchPacingTimerRef.current = null;
-              pumpUploadQueue();
-            }, 1100);
-          } else {
-            pumpUploadQueue();
-          }
+          pumpUploadQueue();
         });
     }
   }, [commitItems, pushNotification, updateTransferTask]);

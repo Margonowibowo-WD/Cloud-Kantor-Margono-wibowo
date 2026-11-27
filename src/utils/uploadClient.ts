@@ -45,6 +45,8 @@ export interface UploadController {
 
 const MAX_RATE_LIMIT_RETRIES = 4;
 const MAX_TRANSIENT_RETRIES = 2;
+const CHUNK_UPLOAD_CONCURRENCY = 3;
+const CHUNK_DOWNLOAD_CONCURRENCY = 4;
 
 function waitWithCancel(ms: number, isCancelled: () => boolean): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -77,11 +79,18 @@ export function startDirectUpload(
   options?: { itemIdOverride?: string },
 ): UploadController {
   let cancelled = false;
-  let tgCancel: (() => void) | null = null;
+  const activeChunkCancels = new Set<() => void>();
 
   const cancel = () => {
     cancelled = true;
-    tgCancel?.();
+    for (const fn of activeChunkCancels) {
+      try {
+        fn();
+      } catch {
+        // ignore abort errors
+      }
+    }
+    activeChunkCancels.clear();
   };
 
   const promise = (async (): Promise<DriveItem> => {
@@ -115,16 +124,44 @@ export function startDirectUpload(
       throw new Error('Dibatalkan');
     }
 
-    const uploadedChunks: FileChunk[] = [];
+    const uploadedChunkSlots = new Array<FileChunk | undefined>(totalChunks);
+    const perSliceLoaded = new Array<number>(totalChunks).fill(0);
     const uploadStartedAt = performance.now();
-    let uploadedBytesBefore = 0;
+    let maxLoadedSeen = 0;
+    let completedCount = 0;
+    let nextSliceCursor = 0;
+    let firstError: unknown = null;
 
-    try {
-      for (const slice of slices) {
-        if (cancelled) {
-          throw new Error('Dibatalkan');
-        }
+    const emitAggregateProgress = (warningMessage?: string) => {
+      const summed = perSliceLoaded.reduce((acc, v) => acc + v, 0);
+      const totalLoaded = Math.min(file.size, Math.max(maxLoadedSeen, summed));
+      maxLoadedSeen = totalLoaded;
+      const elapsed = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
+      const speed = totalLoaded / elapsed;
+      const eta = speed > 0 ? Math.max(0, file.size - totalLoaded) / speed : 0;
+      onProgress({
+        loadedBytes: totalLoaded,
+        speedBytesPerSec: speed,
+        etaSeconds: eta,
+        elapsedSeconds: elapsed,
+        completedChunks: completedCount,
+        totalChunks,
+        status: 'active',
+        statusLabel: isMultiChunk
+          ? `${Math.min(totalChunks, completedCount + (completedCount < totalChunks ? 1 : 0))}/${totalChunks} bagian`
+          : undefined,
+        errorMessage: warningMessage,
+        targetBackend: 'telegram',
+      });
+    };
 
+    const uploadWorker = async () => {
+      while (!cancelled && !firstError) {
+        const idx = nextSliceCursor;
+        nextSliceCursor += 1;
+        if (idx >= slices.length) return;
+
+        const slice = slices[idx];
         const chunkBlob = isMultiChunk ? file.slice(slice.start, slice.end) : file;
         const partFilename = isMultiChunk
           ? `${file.name}.part${String(slice.index + 1).padStart(3, '0')}`
@@ -138,10 +175,11 @@ export function startDirectUpload(
         let transientAttempts = 0;
 
         while (true) {
-          if (cancelled) {
+          if (cancelled || firstError) {
             throw new Error('Dibatalkan');
           }
 
+          let thisCancel: (() => void) | null = null;
           try {
             const uploadOp = uploadFileDirectToTelegram(
               tgConfig.botToken,
@@ -149,78 +187,41 @@ export function startDirectUpload(
               chunkBlob,
               partFilename,
               (loaded) => {
-                const clampedChunkLoaded = Math.min(slice.size, Math.max(0, loaded));
-                const totalLoaded = Math.min(file.size, uploadedBytesBefore + clampedChunkLoaded);
-                const elapsed = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
-                const speed = totalLoaded / elapsed;
-                const eta = speed > 0 ? Math.max(0, file.size - totalLoaded) / speed : 0;
-                onProgress({
-                  loadedBytes: totalLoaded,
-                  speedBytesPerSec: speed,
-                  etaSeconds: eta,
-                  elapsedSeconds: elapsed,
-                  completedChunks: slice.index,
-                  totalChunks,
-                  status: 'active',
-                  statusLabel: isMultiChunk
-                    ? `Bagian ${slice.index + 1}/${totalChunks}`
-                    : undefined,
-                  errorMessage: undefined,
-                  targetBackend: 'telegram',
-                });
+                perSliceLoaded[idx] = Math.min(slice.size, Math.max(0, loaded));
+                emitAggregateProgress();
               },
               { caption },
             );
-            tgCancel = uploadOp.cancel;
+            thisCancel = uploadOp.cancel;
+            activeChunkCancels.add(thisCancel);
             uploaded = await uploadOp.promise;
-            tgCancel = null;
+            activeChunkCancels.delete(thisCancel);
             break;
           } catch (err) {
-            tgCancel = null;
+            if (thisCancel) activeChunkCancels.delete(thisCancel);
             const typedErr = err as Error & {
               retryAfterSeconds?: number;
               isTransientNetworkError?: boolean;
             };
-            if (!cancelled && typedErr.retryAfterSeconds && rateLimitAttempts < MAX_RATE_LIMIT_RETRIES) {
+            if (!cancelled && !firstError && typedErr.retryAfterSeconds && rateLimitAttempts < MAX_RATE_LIMIT_RETRIES) {
               rateLimitAttempts += 1;
               const waitSec = Math.min(65, Math.max(1, typedErr.retryAfterSeconds));
-              const elapsed = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
-              onProgress({
-                loadedBytes: uploadedBytesBefore,
-                speedBytesPerSec: uploadedBytesBefore > 0 ? uploadedBytesBefore / elapsed : 0,
-                etaSeconds: waitSec,
-                elapsedSeconds: elapsed,
-                completedChunks: slice.index,
-                totalChunks,
-                status: 'active',
-                statusLabel: isMultiChunk ? `Bagian ${slice.index + 1}/${totalChunks}` : undefined,
-                errorMessage: `Menunggu batas Telegram (${waitSec} dtk)...`,
-                targetBackend: 'telegram',
-              });
-              await waitWithCancel(waitSec * 1000, () => cancelled);
+              emitAggregateProgress(`Menunggu batas Telegram (${waitSec} dtk)...`);
+              await waitWithCancel(waitSec * 1000, () => cancelled || Boolean(firstError));
               continue;
             }
             if (
               !cancelled &&
+              !firstError &&
               typedErr.isTransientNetworkError &&
               transientAttempts < MAX_TRANSIENT_RETRIES
             ) {
               transientAttempts += 1;
               const waitSec = transientAttempts * 2;
-              const elapsed = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
-              onProgress({
-                loadedBytes: uploadedBytesBefore,
-                speedBytesPerSec: uploadedBytesBefore > 0 ? uploadedBytesBefore / elapsed : 0,
-                etaSeconds: waitSec,
-                elapsedSeconds: elapsed,
-                completedChunks: slice.index,
-                totalChunks,
-                status: 'active',
-                statusLabel: isMultiChunk ? `Bagian ${slice.index + 1}/${totalChunks}` : undefined,
-                errorMessage: `Koneksi terganggu, mencoba ulang bagian ${slice.index + 1}/${totalChunks} (${transientAttempts}/${MAX_TRANSIENT_RETRIES})...`,
-                targetBackend: 'telegram',
-              });
-              await waitWithCancel(waitSec * 1000, () => cancelled);
+              emitAggregateProgress(
+                `Koneksi terganggu, mengulang bagian ${slice.index + 1}/${totalChunks}...`,
+              );
+              await waitWithCancel(waitSec * 1000, () => cancelled || Boolean(firstError));
               continue;
             }
             throw err;
@@ -231,42 +232,44 @@ export function startDirectUpload(
           throw new Error(`Gagal mengunggah bagian ${slice.index + 1}/${totalChunks}.`);
         }
 
-        uploadedChunks.push({
+        perSliceLoaded[idx] = slice.size;
+        uploadedChunkSlots[idx] = {
           index: slice.index,
           size: slice.size,
           telegramFileId: uploaded.fileId,
           telegramUniqueId: uploaded.fileUniqueId,
           telegramMessageId: uploaded.messageId,
-        });
-
-        uploadedBytesBefore += slice.size;
-
-        if (isMultiChunk && slice.index + 1 < totalChunks) {
-          const elapsedAfterChunk = Math.max(0.05, (performance.now() - uploadStartedAt) / 1000);
-          const speedAfterChunk = uploadedBytesBefore / elapsedAfterChunk;
-          const etaAfterChunk =
-            speedAfterChunk > 0 ? Math.max(0, file.size - uploadedBytesBefore) / speedAfterChunk : 0;
-          onProgress({
-            loadedBytes: uploadedBytesBefore,
-            speedBytesPerSec: speedAfterChunk,
-            etaSeconds: etaAfterChunk,
-            elapsedSeconds: elapsedAfterChunk,
-            completedChunks: slice.index + 1,
-            totalChunks,
-            status: 'active',
-            statusLabel: `Bagian ${slice.index + 2}/${totalChunks}`,
-            errorMessage: undefined,
-            targetBackend: 'telegram',
-          });
-          // Gentle pause between chunks to avoid Telegram FloodWait & let UI breathe
-          await waitWithCancel(350, () => cancelled);
-        }
+        };
+        completedCount += 1;
+        emitAggregateProgress();
       }
+    };
+
+    try {
+      const workerCount = isMultiChunk ? Math.min(CHUNK_UPLOAD_CONCURRENCY, totalChunks) : 1;
+      await Promise.all(
+        Array.from({ length: workerCount }, () =>
+          uploadWorker().catch((err) => {
+            if (!firstError) {
+              firstError = err;
+              for (const fn of activeChunkCancels) {
+                try {
+                  fn();
+                } catch {
+                  // ignore abort errors
+                }
+              }
+            }
+            throw err;
+          }),
+        ),
+      );
+      if (firstError) throw firstError;
     } catch (err) {
       // Clean up orphan partial chunks if user cancelled or multi-chunk upload failed mid-way
-      if (isMultiChunk && uploadedChunks.length > 0 && tgConfig.botToken && tgConfig.chatId) {
-        for (const chunk of uploadedChunks) {
-          if (chunk.telegramMessageId) {
+      if (isMultiChunk && tgConfig.botToken && tgConfig.chatId) {
+        for (const chunk of uploadedChunkSlots) {
+          if (chunk?.telegramMessageId) {
             void deleteTelegramMessageDirect(
               tgConfig.botToken,
               tgConfig.chatId,
@@ -275,8 +278,10 @@ export function startDirectUpload(
           }
         }
       }
-      throw err;
+      throw firstError || err;
     }
+
+    const uploadedChunks = uploadedChunkSlots.filter((c): c is FileChunk => Boolean(c));
 
     // Only auto-cache files <= 20 MB locally so large files don't evict the 350 MB preview cache
     const shouldCacheLocally = file.size <= DIRECT_TELEGRAM_MAX_BYTES;
@@ -492,63 +497,104 @@ async function assembleMultiChunkBlob(
   const startedAt = performance.now();
   const totalChunks = chunks.length;
   const totalSize = item.size || chunks.reduce((acc, c) => acc + (c.size || 0), 0);
-  const blobs: Blob[] = [];
-  let loadedBefore = 0;
+  const blobs = new Array<Blob>(totalChunks);
+  const perChunkLoaded = new Array<number>(totalChunks).fill(0);
+  const activeCancels = new Set<() => void>();
+  let completedCount = 0;
+  let nextCursor = 0;
+  let firstError: unknown = null;
 
-  for (let i = 0; i < chunks.length; i += 1) {
-    if (isCancelled?.()) {
-      throw new Error('Dibatalkan');
+  registerXhrCancel?.(() => {
+    for (const fn of activeCancels) {
+      try {
+        fn();
+      } catch {
+        // ignore abort errors
+      }
     }
-    const chunk = chunks[i];
-    if (onProgress) {
-      const elapsedStart = Math.max(0.05, (performance.now() - startedAt) / 1000);
-      const speedStart = loadedBefore > 0 ? loadedBefore / elapsedStart : 0;
-      const etaStart =
-        speedStart > 0 && totalSize > 0 ? Math.max(0, totalSize - loadedBefore) / speedStart : 0;
-      onProgress({
-        loadedBytes: loadedBefore,
-        speedBytesPerSec: speedStart,
-        etaSeconds: etaStart,
-        elapsedSeconds: elapsedStart,
-        completedChunks: i,
-        totalChunks,
-        status: 'active',
-        statusLabel: `Bagian ${i + 1}/${totalChunks}`,
-        errorMessage: undefined,
-        targetBackend: 'telegram',
-      });
-    }
-    const tgUrl = await resolveChunkTelegramUrl(chunk, tgConfig);
-    const proxiedUrl = buildProxiedTelegramFileUrl(tgUrl, tgConfig.corsProxyUrl);
+  });
 
-    const chunkBlob = await downloadBlobViaXhr(
-      proxiedUrl,
-      chunk.size || 0,
-      (chunkLoaded) => {
-        if (!onProgress) return;
-        const totalLoaded = Math.min(totalSize || Number.MAX_SAFE_INTEGER, loadedBefore + chunkLoaded);
-        const elapsed = Math.max(0.05, (performance.now() - startedAt) / 1000);
-        const speed = totalLoaded / elapsed;
-        const eta = speed > 0 && totalSize > 0 ? Math.max(0, totalSize - totalLoaded) / speed : 0;
-        onProgress({
-          loadedBytes: totalLoaded,
-          speedBytesPerSec: speed,
-          etaSeconds: eta,
-          elapsedSeconds: elapsed,
-          completedChunks: i,
-          totalChunks,
-          status: 'active',
-          statusLabel: `Bagian ${i + 1}/${totalChunks}`,
-          errorMessage: undefined,
-          targetBackend: 'telegram',
-        });
-      },
-      (cancelFn) => registerXhrCancel?.(cancelFn),
+  const emitDownloadProgress = () => {
+    if (!onProgress) return;
+    const summed = perChunkLoaded.reduce((acc, v) => acc + v, 0);
+    const totalLoaded = totalSize > 0 ? Math.min(totalSize, summed) : summed;
+    const elapsed = Math.max(0.05, (performance.now() - startedAt) / 1000);
+    const speed = totalLoaded / elapsed;
+    const eta = speed > 0 && totalSize > 0 ? Math.max(0, totalSize - totalLoaded) / speed : 0;
+    onProgress({
+      loadedBytes: totalLoaded,
+      speedBytesPerSec: speed,
+      etaSeconds: eta,
+      elapsedSeconds: elapsed,
+      completedChunks: completedCount,
+      totalChunks,
+      status: 'active',
+      statusLabel: `${Math.min(totalChunks, completedCount + (completedCount < totalChunks ? 1 : 0))}/${totalChunks} bagian`,
+      errorMessage: undefined,
+      targetBackend: 'telegram',
+    });
+  };
+
+  emitDownloadProgress();
+
+  const downloadWorker = async () => {
+    while (!isCancelled?.() && !firstError) {
+      const i = nextCursor;
+      nextCursor += 1;
+      if (i >= chunks.length) return;
+
+      const chunk = chunks[i];
+      const tgUrl = await resolveChunkTelegramUrl(chunk, tgConfig);
+      if (isCancelled?.() || firstError) throw new Error('Dibatalkan');
+      const proxiedUrl = buildProxiedTelegramFileUrl(tgUrl, tgConfig.corsProxyUrl);
+
+      let thisCancel: (() => void) | null = null;
+      try {
+        const chunkBlob = await downloadBlobViaXhr(
+          proxiedUrl,
+          chunk.size || 0,
+          (chunkLoaded) => {
+            perChunkLoaded[i] = Math.min(chunk.size || chunkLoaded, chunkLoaded);
+            emitDownloadProgress();
+          },
+          (cancelFn) => {
+            thisCancel = cancelFn;
+            activeCancels.add(cancelFn);
+          },
+        );
+        blobs[i] = chunkBlob;
+        perChunkLoaded[i] = chunkBlob.size || chunk.size || 0;
+        completedCount += 1;
+        emitDownloadProgress();
+      } finally {
+        if (thisCancel) activeCancels.delete(thisCancel);
+      }
+    }
+  };
+
+  try {
+    const workerCount = Math.min(CHUNK_DOWNLOAD_CONCURRENCY, totalChunks);
+    await Promise.all(
+      Array.from({ length: workerCount }, () =>
+        downloadWorker().catch((err) => {
+          if (!firstError) {
+            firstError = err;
+            for (const fn of activeCancels) {
+              try {
+                fn();
+              } catch {
+                // ignore abort errors
+              }
+            }
+          }
+          throw err;
+        }),
+      ),
     );
+    if (firstError) throw firstError;
+  } finally {
+    activeCancels.clear();
     registerXhrCancel?.(null);
-
-    blobs.push(chunkBlob);
-    loadedBefore += chunkBlob.size || chunk.size || 0;
   }
 
   const resolvedMime = resolveMimeTypeForFilename(item.name, item.mimeType);
