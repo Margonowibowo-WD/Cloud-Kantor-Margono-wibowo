@@ -55,6 +55,13 @@ import {
 } from './telegramIndex';
 import { planBlobCacheEviction } from './localVault';
 import { buildZipArchiveFilename, dedupeZipPath } from './zipDownload';
+import {
+  type UploadHistoryEntry,
+  capDailyHistoryEntries,
+  getLocalDayKey,
+  pruneUploadHistoryByDay,
+  recordUploadHistoryEntry,
+} from './uploadHistory';
 import type { DriveItem } from '../types/drive';
 
 const sampleItems: DriveItem[] = [
@@ -1463,4 +1470,108 @@ test('dedupeZipPath and buildZipArchiveFilename generate clean collision-free ZI
   assert.equal(buildZipArchiveFilename([sampleItems[0]]), 'Desain Produk.zip');
   assert.match(buildZipArchiveFilename([sampleItems[0], sampleItems[2]]), /^TeleDrive_Arsip_\d{4}-\d{2}-\d{2}\.zip$/);
 });
+
+test('uploadHistory prunes older days, resolves failed records on retry success, and prioritizes failures when capped', () => {
+  const yesterday = new Date('2026-11-26T10:00:00');
+  const today = new Date('2026-11-27T09:15:00');
+  const yesterdayKey = getLocalDayKey(yesterday);
+  const todayKey = getLocalDayKey(today);
+
+  const staleEntry: UploadHistoryEntry = {
+    id: 'hist-old',
+    filename: 'Kemarin.pdf',
+    size: 1024,
+    parentId: null,
+    folderPathLabel: 'Drive Saya',
+    status: 'error',
+    errorMessage: 'Timeout',
+    timestamp: yesterday.toISOString(),
+    dayKey: yesterdayKey,
+  };
+
+  // 1) Recording today's failed entry automatically prunes yesterday's entries
+  let history = recordUploadHistoryEntry(
+    [staleEntry],
+    {
+      taskId: 'tr-1',
+      filename: 'Laporan_Nov.pdf',
+      size: 2048,
+      parentId: 'f-root-1',
+      folderPathLabel: 'Drive Saya / Desain Produk',
+      status: 'error',
+      errorMessage: 'Koneksi terputus',
+    },
+    today,
+  );
+  assert.equal(history.length, 1);
+  assert.equal(history[0].dayKey, todayKey);
+  assert.equal(history[0].status, 'error');
+
+  // Record a distinct file that stays failed
+  history = recordUploadHistoryEntry(
+    history,
+    {
+      taskId: 'tr-2',
+      filename: 'Lampiran_Lain.pdf',
+      size: 4096,
+      parentId: 'f-root-1',
+      folderPathLabel: 'Drive Saya / Desain Produk',
+      status: 'error',
+      errorMessage: 'Rate limit',
+    },
+    today,
+  );
+  assert.equal(history.length, 2);
+
+  // 2) Re-uploading/retrying Laporan_Nov.pdf successfully clears its earlier failure record
+  history = recordUploadHistoryEntry(
+    history,
+    {
+      taskId: 'tr-1',
+      filename: 'laporan_nov.pdf',
+      size: 2048,
+      parentId: 'f-root-1',
+      folderPathLabel: 'Drive Saya / Desain Produk',
+      status: 'success',
+      speedBytesPerSec: 1_500_000,
+      elapsedSeconds: 1.2,
+    },
+    today,
+  );
+  assert.equal(history.length, 2);
+  assert.equal(history.filter((e) => e.status === 'success').length, 1);
+  assert.equal(history.filter((e) => e.status !== 'success').length, 1);
+  assert.equal(history.find((e) => e.status !== 'success')?.filename, 'Lampiran_Lain.pdf');
+
+  // 3) Day rollover pruning drops all previous day records
+  const nextDayKey = getLocalDayKey(new Date('2026-11-28T00:05:00'));
+  assert.deepEqual(pruneUploadHistoryByDay(history, nextDayKey), []);
+
+  // 4) Daily cap retains unresolved failures even when successes exceed cap
+  const manySuccesses: UploadHistoryEntry[] = Array.from({ length: 5 }, (_, idx) => ({
+    id: `hist-s-${idx}`,
+    filename: `Sukses_${idx}.jpg`,
+    size: 500,
+    parentId: null,
+    folderPathLabel: 'Drive Saya',
+    status: 'success',
+    timestamp: today.toISOString(),
+    dayKey: todayKey,
+  }));
+  const failedLast: UploadHistoryEntry = {
+    id: 'hist-fail-last',
+    filename: 'Gagal_Penting.pdf',
+    size: 900,
+    parentId: null,
+    folderPathLabel: 'Drive Saya',
+    status: 'error',
+    errorMessage: 'Network error',
+    timestamp: today.toISOString(),
+    dayKey: todayKey,
+  };
+  const capped = capDailyHistoryEntries([...manySuccesses, failedLast], 3);
+  assert.equal(capped.length, 3);
+  assert.ok(capped.some((e) => e.id === 'hist-fail-last'));
+});
+
 

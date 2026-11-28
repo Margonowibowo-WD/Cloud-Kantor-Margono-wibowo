@@ -21,6 +21,8 @@ interface TransferManagerProps {
   onClearCompleted: () => void;
 }
 
+const MAX_VISIBLE_TASKS = 50;
+
 export function TransferManager({
   tasks,
   onCancelTask,
@@ -32,12 +34,23 @@ export function TransferManager({
 
   if (tasks.length === 0) return null;
 
+  const totalCount = tasks.length;
   const activeRunningCount = tasks.filter((t) => t.status === 'active').length;
   const queuedCount = tasks.filter((t) => t.status === 'queued').length;
   const activeCount = activeRunningCount + queuedCount;
   const completedCount = tasks.filter((t) => t.status === 'completed').length;
   const errorCount = tasks.filter((t) => t.status === 'error').length;
   const retryableCount = tasks.filter((t) => t.status === 'error' && t.canRetry).length;
+
+  const activeTasks = tasks.filter((t) => t.status === 'active');
+  const errorTasks = tasks.filter((t) => t.status === 'error');
+  const queuedTasks = tasks.filter((t) => t.status === 'queued');
+  const finishedTasks = tasks.filter((t) => t.status === 'completed' || t.status === 'cancelled');
+  const visibleTasks = [...activeTasks, ...errorTasks, ...queuedTasks, ...finishedTasks].slice(
+    0,
+    MAX_VISIBLE_TASKS,
+  );
+  const hiddenCount = Math.max(0, totalCount - visibleTasks.length);
 
   return (
     <aside
@@ -46,16 +59,16 @@ export function TransferManager({
     >
       <div className="flex items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2.5 dark:border-slate-800 dark:bg-slate-800/80">
         <div className="min-w-0">
-          <p className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
+          <p className="truncate text-xs font-semibold text-slate-900 tabular-nums dark:text-slate-100">
             {activeCount > 0
               ? queuedCount > 0
-                ? `Memproses ${activeRunningCount} aktif · ${queuedCount} antrean`
-                : `Memproses ${activeRunningCount} transfer`
+                ? `${activeRunningCount} aktif · ${queuedCount.toLocaleString('id-ID')} antrean (${completedCount.toLocaleString('id-ID')}/${totalCount.toLocaleString('id-ID')})`
+                : `Memproses ${activeRunningCount} transfer (${completedCount.toLocaleString('id-ID')}/${totalCount.toLocaleString('id-ID')})`
               : errorCount > 0
                 ? completedCount > 0
-                  ? `${completedCount} selesai · ${errorCount} gagal`
-                  : `${errorCount} transfer gagal`
-                : `${completedCount} transfer selesai`}
+                  ? `${completedCount.toLocaleString('id-ID')} selesai · ${errorCount.toLocaleString('id-ID')} gagal (dari ${totalCount.toLocaleString('id-ID')})`
+                  : `${errorCount.toLocaleString('id-ID')} transfer gagal`
+                : `${completedCount.toLocaleString('id-ID')} dari ${totalCount.toLocaleString('id-ID')} transfer selesai`}
           </p>
         </div>
 
@@ -67,7 +80,7 @@ export function TransferManager({
               className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-semibold text-blue-600 hover:bg-blue-50 whitespace-nowrap dark:text-blue-400 dark:hover:bg-blue-950/50"
             >
               <RotateCcw className="h-3 w-3" />
-              <span>Coba Ulang ({retryableCount})</span>
+              <span>Coba Ulang ({retryableCount.toLocaleString('id-ID')})</span>
             </button>
           )}
           {(completedCount > 0 || errorCount > 0) && activeCount === 0 && (
@@ -92,7 +105,7 @@ export function TransferManager({
 
       {!collapsed && (
         <div className="max-h-72 divide-y divide-slate-100 overflow-y-auto dark:divide-slate-800">
-          {tasks.map((task) => {
+          {visibleTasks.map((task) => {
             const pct =
               task.totalBytes > 0
                 ? Math.min(100, Math.round((task.loadedBytes / task.totalBytes) * 100))
@@ -233,6 +246,13 @@ export function TransferManager({
               </div>
             );
           })}
+          {hiddenCount > 0 && (
+            <div className="bg-slate-50/70 px-4 py-2 text-[11px] font-medium text-slate-500 tabular-nums dark:bg-slate-800/40 dark:text-slate-400">
+              Menampilkan {visibleTasks.length} dari {totalCount.toLocaleString('id-ID')} item ·{' '}
+              {completedCount.toLocaleString('id-ID')} selesai ·{' '}
+              {queuedCount.toLocaleString('id-ID')} menunggu antrean
+            </div>
+          )}
         </div>
       )}
     </aside>

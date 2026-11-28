@@ -1,6 +1,7 @@
 import type { DriveItem, TelegramConfigState } from '../types/drive';
 import { replaceAllDriveItemsIdb, wipeIndexedCatalog } from './indexedCatalog';
 import type { CloudViewPrefs } from './telegramIndex';
+import { clearTodayUploadHistory } from './uploadHistory';
 
 const ITEMS_KEY = 'teledrive_items_v2';
 const TG_CONFIG_KEY = 'teledrive_tg_config_v2';
@@ -512,6 +513,7 @@ export function wipeUnlockedSessionData(options?: { clearLocalVault?: boolean })
     localStorage.removeItem(OBSOLETE_MIDS_KEY);
     localStorage.removeItem(OFFLINE_PINS_KEY);
     localStorage.removeItem(OFFLINE_QUEUE_KEY);
+    clearTodayUploadHistory();
     if (options?.clearLocalVault) {
       localStorage.removeItem(LOCAL_VAULT_KEY);
     }

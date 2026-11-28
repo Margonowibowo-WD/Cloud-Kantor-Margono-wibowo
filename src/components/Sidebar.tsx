@@ -8,6 +8,7 @@ import {
   Film,
   FolderPlus,
   HardDrive,
+  History,
   Image,
   Music,
   Plus,
@@ -37,6 +38,8 @@ interface SidebarProps {
   onDropOnRoot?: (ids: string[]) => void;
   onDropExternalFilesToRoot?: (payload: CapturedDropPayload) => void;
   onOpenDuplicateFinder?: () => void;
+  onOpenActivityHistory?: () => void;
+  failedHistoryCount?: number;
 }
 
 const NAV_ITEMS: Array<{ id: NavSection; label: string; icon: typeof HardDrive }> = [
@@ -65,6 +68,8 @@ export function Sidebar({
   onDropOnRoot,
   onDropExternalFilesToRoot,
   onOpenDuplicateFinder,
+  onOpenActivityHistory,
+  failedHistoryCount = 0,
 }: SidebarProps) {
   const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [rootDragOver, setRootDragOver] = useState(false);
@@ -287,19 +292,41 @@ export function Sidebar({
           })}
         </nav>
 
-        {onOpenDuplicateFinder && (
-          <div className="mt-3 border-t border-slate-200/80 pt-3 dark:border-slate-800">
-            <button
-              type="button"
-              onClick={() => {
-                onOpenDuplicateFinder();
-                onCloseMobile();
-              }}
-              className="td-press flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200/60 whitespace-nowrap dark:text-slate-300 dark:hover:bg-slate-800/70"
-            >
-              <SearchCheck className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-              <span>Cari Duplikat</span>
-            </button>
+        {(onOpenDuplicateFinder || onOpenActivityHistory) && (
+          <div className="mt-3 space-y-1 border-t border-slate-200/80 pt-3 dark:border-slate-800">
+            {onOpenActivityHistory && (
+              <button
+                type="button"
+                onClick={() => {
+                  onOpenActivityHistory();
+                  onCloseMobile();
+                }}
+                className="td-press flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200/60 whitespace-nowrap dark:text-slate-300 dark:hover:bg-slate-800/70"
+              >
+                <span className="flex items-center gap-3 min-w-0">
+                  <History className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
+                  <span className="truncate">Aktivitas Upload</span>
+                </span>
+                {failedHistoryCount > 0 && (
+                  <span className="shrink-0 text-[11px] font-semibold tabular-nums text-rose-600 dark:text-rose-400">
+                    {failedHistoryCount} gagal
+                  </span>
+                )}
+              </button>
+            )}
+            {onOpenDuplicateFinder && (
+              <button
+                type="button"
+                onClick={() => {
+                  onOpenDuplicateFinder();
+                  onCloseMobile();
+                }}
+                className="td-press flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200/60 whitespace-nowrap dark:text-slate-300 dark:hover:bg-slate-800/70"
+              >
+                <SearchCheck className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                <span>Cari Duplikat</span>
+              </button>
+            )}
           </div>
         )}
       </div>

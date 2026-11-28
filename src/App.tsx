@@ -119,7 +119,17 @@ import { TelegramModal } from './components/TelegramModal';
 import { PersonalLockScreen } from './components/PersonalLockScreen';
 import { ConfirmDeleteModal, FolderNameModal, MoveModal } from './components/ActionModals';
 import { DuplicateFinderModal } from './components/DuplicateFinderModal';
+import { ActivityHistoryModal } from './components/ActivityHistoryModal';
 import { OfflineIndicator } from './components/PWAInstallButton';
+import {
+  type UploadHistoryEntry,
+  clearTodayUploadHistory,
+  getLocalDayKey,
+  loadTodayUploadHistory,
+  pruneUploadHistoryByDay,
+  recordUploadHistoryEntry,
+  saveTodayUploadHistory,
+} from './utils/uploadHistory';
 
 const ENV_TELEGRAM_VAULT = ((import.meta.env.VITE_TELEGRAM_VAULT as string | undefined) || '').trim();
 
@@ -221,6 +231,10 @@ export default function App() {
     ids: [],
   });
   const [duplicatesModalOpen, setDuplicatesModalOpen] = useState(false);
+  const [activityModalOpen, setActivityModalOpen] = useState(false);
+  const [uploadHistory, setUploadHistory] = useState<UploadHistoryEntry[]>(() =>
+    loadTodayUploadHistory(),
+  );
   const [obsoleteChannelMsgs, setObsoleteChannelMsgs] = useState<ObsoleteTelegramMsg[]>(() =>
     loadObsoleteTelegramMsgs(),
   );
@@ -295,6 +309,13 @@ export default function App() {
   const loadMoreSentinelRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
+  const reuploadInputRef = useRef<HTMLInputElement>(null);
+  const reuploadParentIdRef = useRef<string | null>(null);
+  const uploadHistoryDayRef = useRef<string>(getLocalDayKey());
+  const uploadStartedAtRef = useRef<Map<string, number>>(new Map());
+  const uploadStatsRef = useRef<
+    Map<string, { speedBytesPerSec?: number; elapsedSeconds?: number; totalChunks?: number }>
+  >(new Map());
   const searchInputRef = useRef<HTMLInputElement>(null);
   const tabChannelRef = useRef<BroadcastChannel | null>(null);
 
@@ -884,6 +905,8 @@ export default function App() {
       transferCancelMap.current.clear();
       uploadQueueRef.current = [];
       failedUploadJobsRef.current.clear();
+      uploadStartedAtRef.current.clear();
+      uploadStatsRef.current.clear();
       activeUploadCountRef.current = 0;
       offlineFlushInFlightRef.current = false;
 
@@ -904,6 +927,7 @@ export default function App() {
       tombstonesRef.current = {};
 
       setItems([]);
+      setUploadHistory([]);
       setOfflinePinnedIds(new Set());
       setOfflineQueueCount(0);
       setSearchQuery('');
@@ -919,6 +943,7 @@ export default function App() {
       setTelegramModalOpen(false);
       setMoveModal({ open: false, ids: [] });
       setDuplicatesModalOpen(false);
+      setActivityModalOpen(false);
       setObsoleteChannelMsgs([]);
       setContextMenu(null);
       setSyncState('disconnected');
@@ -1414,7 +1439,66 @@ export default function App() {
     };
   }, [applyRemoteViewPrefs, handleLockDrive]);
 
+  const resolveFolderPathLabel = useCallback((parentId: string | null) => {
+    if (!parentId) return 'Drive Saya';
+    return buildBreadcrumbs(parentId, itemsRef.current)
+      .map((node) => node.name)
+      .join(' / ');
+  }, []);
+
+  const appendUploadHistory = useCallback(
+    (
+      incoming: Omit<UploadHistoryEntry, 'id' | 'timestamp' | 'dayKey' | 'folderPathLabel'> & {
+        folderPathLabel?: string;
+      },
+    ) => {
+      const now = new Date();
+      const todayKey = getLocalDayKey(now);
+      uploadHistoryDayRef.current = todayKey;
+      const folderPathLabel = incoming.folderPathLabel || resolveFolderPathLabel(incoming.parentId);
+      setUploadHistory((prev) => {
+        const next = recordUploadHistoryEntry(prev, { ...incoming, folderPathLabel }, now);
+        saveTodayUploadHistory(next, now);
+        return next;
+      });
+    },
+    [resolveFolderPathLabel],
+  );
+
+  useEffect(() => {
+    const pruneIfDayChanged = () => {
+      const todayKey = getLocalDayKey();
+      if (uploadHistoryDayRef.current !== todayKey) {
+        uploadHistoryDayRef.current = todayKey;
+        setUploadHistory((prev) => {
+          const pruned = pruneUploadHistoryByDay(prev, todayKey);
+          saveTodayUploadHistory(pruned);
+          return pruned;
+        });
+      }
+    };
+    pruneIfDayChanged();
+    window.addEventListener('focus', pruneIfDayChanged);
+    return () => window.removeEventListener('focus', pruneIfDayChanged);
+  }, [activityModalOpen]);
+
   const updateTransferTask = useCallback((id: string, patch: Partial<TransferTask>) => {
+    if (
+      patch.speedBytesPerSec !== undefined ||
+      patch.elapsedSeconds !== undefined ||
+      patch.totalChunks !== undefined
+    ) {
+      const prevStats = uploadStatsRef.current.get(id);
+      uploadStatsRef.current.set(id, {
+        speedBytesPerSec:
+          patch.speedBytesPerSec && patch.speedBytesPerSec > 0
+            ? patch.speedBytesPerSec
+            : prevStats?.speedBytesPerSec,
+        elapsedSeconds:
+          patch.elapsedSeconds !== undefined ? patch.elapsedSeconds : prevStats?.elapsedSeconds,
+        totalChunks: patch.totalChunks ?? prevStats?.totalChunks,
+      });
+    }
     setTransfers((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
     if (patch.status === 'completed' || patch.status === 'cancelled') {
       const existingTimer = transferRemovalTimers.current.get(id);
@@ -1483,10 +1567,11 @@ export default function App() {
             status: 'active',
             createdAt: Date.now(),
           };
-          return [task, ...prev].slice(0, 200);
+          return [task, ...prev];
         });
 
         try {
+          uploadStartedAtRef.current.set(job.taskId, Date.now());
           const ctrl = startDirectUpload(
             file,
             targetParent,
@@ -1497,10 +1582,29 @@ export default function App() {
           transferCancelMap.current.set(job.taskId, ctrl.cancel);
           const createdItem = await ctrl.promise;
           transferCancelMap.current.delete(job.taskId);
+          const startedAt = uploadStartedAtRef.current.get(job.taskId) ?? Date.now();
+          const stats = uploadStatsRef.current.get(job.taskId);
+          uploadStartedAtRef.current.delete(job.taskId);
+          uploadStatsRef.current.delete(job.taskId);
 
           const remaining = removeOfflineUploadJob(job.taskId);
           setOfflineQueueCount(remaining.length);
           uploadedCount += 1;
+
+          const elapsedSeconds = stats?.elapsedSeconds ?? Math.max(0.1, (Date.now() - startedAt) / 1000);
+          const speedBytesPerSec =
+            stats?.speedBytesPerSec ?? (elapsedSeconds > 0 ? file.size / elapsedSeconds : undefined);
+
+          appendUploadHistory({
+            taskId: job.taskId,
+            filename,
+            size: file.size,
+            parentId: targetParent,
+            status: 'success',
+            speedBytesPerSec,
+            elapsedSeconds,
+            totalChunks: createdItem.chunks.length || stats?.totalChunks || 1,
+          });
 
           commitItems(
             (prev) => {
@@ -1530,8 +1634,18 @@ export default function App() {
           );
         } catch (err) {
           transferCancelMap.current.delete(job.taskId);
+          uploadStartedAtRef.current.delete(job.taskId);
+          uploadStatsRef.current.delete(job.taskId);
           const msg = err instanceof Error ? err.message : 'Gagal mengunggah antrean offline.';
           updateTransferTask(job.taskId, { status: 'error', errorMessage: msg });
+          appendUploadHistory({
+            taskId: job.taskId,
+            filename,
+            size: file.size,
+            parentId: targetParent,
+            status: msg === 'Dibatalkan' ? 'cancelled' : 'error',
+            errorMessage: msg,
+          });
         }
       }
     } finally {
@@ -1545,7 +1659,7 @@ export default function App() {
         });
       }
     }
-  }, [tgConfig, commitItems, updateTransferTask, pushNotification]);
+  }, [tgConfig, commitItems, updateTransferTask, pushNotification, appendUploadHistory]);
 
   // Google Drive calm background sync: startup, tab focus/visibility, online reconnect, and 30s delta check
   useEffect(() => {
@@ -2059,6 +2173,7 @@ export default function App() {
 
       activeUploadCountRef.current += 1;
       batchStartedCountRef.current += 1;
+      uploadStartedAtRef.current.set(nextJob.taskId, Date.now());
       updateTransferTask(nextJob.taskId, {
         status: 'active',
         statusLabel: undefined,
@@ -2080,6 +2195,28 @@ export default function App() {
         .then((createdItem) => {
           transferCancelMap.current.delete(nextJob.taskId);
           failedUploadJobsRef.current.delete(nextJob.taskId);
+          const startedAt = uploadStartedAtRef.current.get(nextJob.taskId) ?? Date.now();
+          const stats = uploadStatsRef.current.get(nextJob.taskId);
+          uploadStartedAtRef.current.delete(nextJob.taskId);
+          uploadStatsRef.current.delete(nextJob.taskId);
+
+          const elapsedSeconds =
+            stats?.elapsedSeconds ?? Math.max(0.1, (Date.now() - startedAt) / 1000);
+          const speedBytesPerSec =
+            stats?.speedBytesPerSec ??
+            (elapsedSeconds > 0 ? createdItem.size / elapsedSeconds : undefined);
+
+          appendUploadHistory({
+            taskId: nextJob.taskId,
+            filename: createdItem.name,
+            size: createdItem.size,
+            parentId: createdItem.parentId,
+            status: 'success',
+            speedBytesPerSec,
+            elapsedSeconds,
+            totalChunks: createdItem.chunks.length || stats?.totalChunks || 1,
+          });
+
           const hasMoreQueued = uploadQueueRef.current.length > 0;
           if (nextJob.isBatch) {
             batchSuccessCountRef.current += 1;
@@ -2105,6 +2242,8 @@ export default function App() {
         })
         .catch((err) => {
           transferCancelMap.current.delete(nextJob.taskId);
+          uploadStartedAtRef.current.delete(nextJob.taskId);
+          uploadStatsRef.current.delete(nextJob.taskId);
           const msg = err instanceof Error ? err.message : 'Unggahan gagal.';
           const canRetry = msg !== 'Dibatalkan';
           if (canRetry) {
@@ -2119,6 +2258,14 @@ export default function App() {
             statusLabel: undefined,
             errorMessage: msg,
             canRetry,
+          });
+          appendUploadHistory({
+            taskId: nextJob.taskId,
+            filename: nextJob.file.name,
+            size: nextJob.file.size,
+            parentId: nextJob.targetParent,
+            status: canRetry ? 'error' : 'cancelled',
+            errorMessage: msg,
           });
           if (canRetry) {
             pushNotification({
@@ -2151,7 +2298,7 @@ export default function App() {
           pumpUploadQueue();
         });
     }
-  }, [commitItems, pushNotification, updateTransferTask]);
+  }, [commitItems, pushNotification, updateTransferTask, appendUploadHistory]);
 
   const handleRetryFailedTasks = useCallback(
     (taskIds: string[]) => {
@@ -2176,6 +2323,7 @@ export default function App() {
           loadedBytes: 0,
           speedBytesPerSec: 0,
           etaSeconds: 0,
+          statusLabel: undefined,
           errorMessage: undefined,
           canRetry: false,
         });
@@ -2226,17 +2374,6 @@ export default function App() {
         (e) => e.file.size <= MAX_BROWSER_UPLOAD_BYTES,
       );
 
-      if (oversized.length > 0) {
-        pushNotification({
-          kind: 'error',
-          title: 'Upload ditolak: File melebihi batas aman browser (2 GB)',
-          detail:
-            oversized.length === 1
-              ? `"${oversized[0].file.name}" (${formatBytes(oversized[0].file.size)}) melebihi batas 2 GB/file.`
-              : `${oversized.length} file melebihi batas aman 2 GB/file (${oversized[0].file.name}, ...).`,
-        });
-      }
-
       const baseParentId =
         overrideParentId !== undefined
           ? overrideParentId
@@ -2246,6 +2383,31 @@ export default function App() {
       const destLabel = baseParentId
         ? itemsRef.current.find((i) => i.id === baseParentId)?.name || 'Folder tujuan'
         : 'Drive Saya';
+
+      if (oversized.length > 0) {
+        for (const item of oversized) {
+          const folderLabel =
+            item.folderPath.length > 0
+              ? `${resolveFolderPathLabel(baseParentId)} / ${item.folderPath.join(' / ')}`
+              : resolveFolderPathLabel(baseParentId);
+          appendUploadHistory({
+            filename: item.file.name,
+            size: item.file.size,
+            parentId: baseParentId,
+            folderPathLabel: folderLabel,
+            status: 'error',
+            errorMessage: 'Melebihi batas aman browser (2 GB/file)',
+          });
+        }
+        pushNotification({
+          kind: 'error',
+          title: 'Upload ditolak: File melebihi batas aman browser (2 GB)',
+          detail:
+            oversized.length === 1
+              ? `"${oversized[0].file.name}" (${formatBytes(oversized[0].file.size)}) melebihi batas 2 GB/file.`
+              : `${oversized.length} file melebihi batas aman 2 GB/file (${oversized[0].file.name}, ...).`,
+        });
+      }
 
       // Create folder hierarchy for uploadable files + empty folders
       const allFolderPaths = [
@@ -2348,6 +2510,15 @@ export default function App() {
             (e) => e.entry.file.size <= DIRECT_TELEGRAM_MAX_BYTES,
           );
           if (offlineSkippedLarge.length > 0) {
+            for (const skipped of offlineSkippedLarge) {
+              appendUploadHistory({
+                filename: skipped.entry.file.name,
+                size: skipped.entry.file.size,
+                parentId: skipped.targetParent,
+                status: 'error',
+                errorMessage: 'File > 20 MB hanya bisa diunggah saat online',
+              });
+            }
             pushNotification({
               kind: 'error',
               title: `${offlineSkippedLarge.length} file > 20 MB perlu diunggah saat online`,
@@ -2423,7 +2594,7 @@ export default function App() {
             dirtyFolderIds: Array.from(dirtyFolders),
             dirtyItemIds: offlineItems.map((i) => i.id),
           });
-          setTransfers((prev) => [...queuedTasks, ...prev].slice(0, 200));
+          setTransfers((prev) => [...queuedTasks, ...prev]);
           pushNotification({
             kind: 'info',
             title: `${offlineEntries.length} file masuk antrean offline`,
@@ -2486,7 +2657,7 @@ export default function App() {
           });
         }
 
-        setTransfers((prev) => [...createdTasks, ...prev].slice(0, 200));
+        setTransfers((prev) => [...createdTasks, ...prev]);
         pumpUploadQueue();
       })();
     },
@@ -2498,6 +2669,8 @@ export default function App() {
       tgConfig,
       pumpUploadQueue,
       pushNotification,
+      appendUploadHistory,
+      resolveFolderPathLabel,
     ],
   );
 
@@ -2542,7 +2715,7 @@ export default function App() {
           status: 'active',
           createdAt: Date.now(),
         };
-        setTransfers((prev) => [downloadTask, ...prev].slice(0, 200));
+        setTransfers((prev) => [downloadTask, ...prev]);
 
         const ctrl = startDirectDownload(targetItem, tgConfig, (progress) => {
           updateTransferTask(taskId, progress);
@@ -2609,7 +2782,7 @@ export default function App() {
         statusLabel: 'Menyiapkan arsip ZIP...',
         createdAt: Date.now(),
       };
-      setTransfers((prev) => [zipTask, ...prev].slice(0, 200));
+      setTransfers((prev) => [zipTask, ...prev]);
 
       const ctrl = startZipDownload({
         targets: validTargets,
@@ -2655,10 +2828,21 @@ export default function App() {
   );
 
   const handleCancelTransfer = (id: string) => {
+    const queuedJob = uploadQueueRef.current.find((job) => job.taskId === id);
     const cancelFn = transferCancelMap.current.get(id);
     if (cancelFn) {
       cancelFn();
       transferCancelMap.current.delete(id);
+    }
+    if (queuedJob) {
+      appendUploadHistory({
+        taskId: id,
+        filename: queuedJob.file.name,
+        size: queuedJob.file.size,
+        parentId: queuedJob.targetParent,
+        status: 'cancelled',
+        errorMessage: 'Dibatalkan pengguna',
+      });
     }
     const remainingOffline = removeOfflineUploadJob(id);
     setOfflineQueueCount(remainingOffline.length);
@@ -3186,6 +3370,31 @@ export default function App() {
     ? previewableFiles.findIndex((i) => i.id === activePreviewItem.id)
     : -1;
   const isTrashView = section === 'trash';
+  const retryableTaskIds = useMemo(
+    () =>
+      new Set(
+        transfers
+          .filter((t) => t.kind === 'upload' && t.status === 'error' && t.canRetry)
+          .map((t) => t.id),
+      ),
+    [transfers],
+  );
+  const retryingTaskIds = useMemo(
+    () =>
+      new Set(
+        transfers
+          .filter(
+            (t) =>
+              t.kind === 'upload' && (t.status === 'active' || t.status === 'queued'),
+          )
+          .map((t) => t.id),
+      ),
+    [transfers],
+  );
+  const failedHistoryCount = useMemo(
+    () => uploadHistory.filter((entry) => entry.status !== 'success').length,
+    [uploadHistory],
+  );
 
   if (!tgConfig.connected || !tgConfig.botToken || !tgConfig.chatId) {
     return (
@@ -3207,6 +3416,7 @@ export default function App() {
           lastSyncMsRef.current = 0;
           setOfflinePinnedIds(new Set(loadOfflinePinnedItemIds()));
           setOfflineQueueCount(loadOfflineUploadQueue().length);
+          setUploadHistory(loadTodayUploadHistory());
           setSyncState(opts?.offlineMode ? 'error' : 'synced');
           if (pulledItems.length > 0) {
             setItems(pulledItems);
@@ -3285,6 +3495,20 @@ export default function App() {
         }}
       />
 
+      <input
+        ref={reuploadInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files?.length) {
+            enqueueFilesUpload(e.target.files, reuploadParentIdRef.current);
+            e.target.value = '';
+            setActivityModalOpen(false);
+          }
+        }}
+      />
+
       <Sidebar
         activeSection={section}
         onSelectSection={handleSelectSection}
@@ -3301,6 +3525,8 @@ export default function App() {
           handleDropExternalPayload(payload, null);
         }}
         onOpenDuplicateFinder={() => setDuplicatesModalOpen(true)}
+        onOpenActivityHistory={() => setActivityModalOpen(true)}
+        failedHistoryCount={failedHistoryCount}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -3903,6 +4129,34 @@ export default function App() {
         onNavigateFolder={handleNavigateFolder}
         onTrashItems={(targetItems) => openTrashConfirmation(targetItems)}
         onDeletePermanentItems={(targetItems) => openPermanentDeleteConfirmation(targetItems)}
+      />
+
+      <ActivityHistoryModal
+        open={activityModalOpen}
+        entries={uploadHistory}
+        retryableTaskIds={retryableTaskIds}
+        retryingTaskIds={retryingTaskIds}
+        onClose={() => setActivityModalOpen(false)}
+        onRetryEntry={(entry) => {
+          if (entry.taskId) {
+            handleRetryFailedTasks([entry.taskId]);
+          }
+        }}
+        onRetryAllFailed={() => {
+          const ids = Array.from(retryableTaskIds);
+          if (ids.length > 0) {
+            handleRetryFailedTasks(ids);
+          }
+        }}
+        onReuploadToFolder={(entry) => {
+          reuploadParentIdRef.current = entry.parentId;
+          reuploadInputRef.current?.click();
+        }}
+        onNavigateFolder={handleNavigateFolder}
+        onClearHistory={() => {
+          clearTodayUploadHistory();
+          setUploadHistory([]);
+        }}
       />
 
       <ContextMenu

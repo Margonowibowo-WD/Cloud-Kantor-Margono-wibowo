@@ -43,8 +43,8 @@ export interface UploadController {
   promise: Promise<DriveItem>;
 }
 
-const MAX_RATE_LIMIT_RETRIES = 4;
-const MAX_TRANSIENT_RETRIES = 2;
+const MAX_RATE_LIMIT_RETRIES = 12;
+const MAX_TRANSIENT_RETRIES = 3;
 const CHUNK_UPLOAD_CONCURRENCY = 3;
 const CHUNK_DOWNLOAD_CONCURRENCY = 4;
 
@@ -206,8 +206,9 @@ export function startDirectUpload(
             if (!cancelled && !firstError && typedErr.retryAfterSeconds && rateLimitAttempts < MAX_RATE_LIMIT_RETRIES) {
               rateLimitAttempts += 1;
               const waitSec = Math.min(65, Math.max(1, typedErr.retryAfterSeconds));
+              const jitterMs = Math.floor(Math.random() * 1200);
               emitAggregateProgress(`Menunggu batas Telegram (${waitSec} dtk)...`);
-              await waitWithCancel(waitSec * 1000, () => cancelled || Boolean(firstError));
+              await waitWithCancel(waitSec * 1000 + jitterMs, () => cancelled || Boolean(firstError));
               continue;
             }
             if (
